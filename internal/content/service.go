@@ -831,8 +831,6 @@ func (s *Service) RenderArticleDetail(
 			}
 		}
 	}
-	tagsMap, _ := s.loadTagsForArticles(ctx, []domain.RawArticle{raw})
-	alts := s.listArticleTranslations(ctx, raw)
 	raw.ViewCount += s.views.PendingArticleViews(raw.ID)
 
 	_, isWholeProt := s.guard.DecryptArticlePassword(raw)
@@ -860,7 +858,7 @@ func (s *Service) RenderArticleDetail(
 				AuthorBio:        authorBio,
 				AuthorWebsiteURL: authorWeb,
 				CategoryID:       raw.CategoryID,
-				Tags:             tagsMap[raw.ID],
+				Tags:             cached.tags,
 				Title:            raw.Title,
 				Slug:             raw.Slug,
 				URL:              s.guard.ArticleURL(raw),
@@ -877,7 +875,7 @@ func (s *Service) RenderArticleDetail(
 				AudioMIME:        raw.AudioMIME,
 				Lang:             raw.Lang,
 				TranslationGroup: raw.TranslationGroup,
-				Translations:     alts,
+				Translations:     cached.translations,
 				LicenseText:      cached.licenseText,
 				TOC:              cached.toc,
 				WordCount:        cached.wordCount,
@@ -893,11 +891,12 @@ func (s *Service) RenderArticleDetail(
 				view.CategoryName = catPtr.Name
 				view.CategorySlug = catPtr.Slug
 			}
-			prev, next := s.getNeighbors(ctx, raw)
-			backlinks := s.ListInboundBacklinks(ctx, raw)
-			return view, prev, next, backlinks, nil
+			return view, cached.prev, cached.next, cached.backlinks, nil
 		}
 	}
+
+	tagsMap, _ := s.loadTagsForArticles(ctx, []domain.RawArticle{raw})
+	alts := s.listArticleTranslations(ctx, raw)
 
 	rawForRender := raw
 	if s.plugins != nil && strings.TrimSpace(raw.PasswordCiphertext) == "" && !raw.HasContentLock && !render.ContainsLockDirective(raw.ContentMD) {
@@ -966,6 +965,9 @@ func (s *Service) RenderArticleDetail(
 		}
 	}
 
+	prev, next := s.getNeighbors(ctx, raw)
+	backlinks := s.ListInboundBacklinks(ctx, raw)
+
 	if canCacheArticleHTML && detailKey != "" && !view.IsPasswordProtected && !view.RequiresPassword && !view.HasContentLock && !view.HasLockedSections {
 		s.caches.putArticleHTML(cachedArticleDetail{
 			key:            detailKey,
@@ -975,6 +977,11 @@ func (s *Service) RenderArticleDetail(
 			ogImageURL:     view.OGImageURL,
 			licenseText:    view.LicenseText,
 			toc:            view.TOC,
+			tags:           tagsMap[raw.ID],
+			translations:   alts,
+			prev:           prev,
+			next:           next,
+			backlinks:      backlinks,
 			wordCount:      view.WordCount,
 			readingMinutes: view.ReadingMinutes,
 			needsMath:      view.NeedsMath,
@@ -982,8 +989,6 @@ func (s *Service) RenderArticleDetail(
 		})
 	}
 
-	prev, next := s.getNeighbors(ctx, raw)
-	backlinks := s.ListInboundBacklinks(ctx, raw)
 	return view, prev, next, backlinks, nil
 }
 
@@ -1473,20 +1478,35 @@ func (s *Service) ListCategoriesWithCounts(ctx context.Context) ([]CategoryWithC
 
 // ListCategoriesWithCountsPage returns a SQL-paginated slice of categories ordered by sort_order with published article counts.
 func (s *Service) ListCategoriesWithCountsPage(ctx context.Context, page, perPage int) ([]CategoryWithCount, int, error) {
+	return s.ListCategoriesWithCountsSearchPage(ctx, "", page, perPage)
+}
+
+// ListCategoriesWithCountsSearchPage filters categories by optional query q in SQL and returns a paginated slice with published article counts.
+func (s *Service) ListCategoriesWithCountsSearchPage(ctx context.Context, q string, page, perPage int) ([]CategoryWithCount, int, error) {
 	limit, offset := dialect.NormalizePage(page, perPage, 24, 200)
+	cleanQ := strings.TrimSpace(q)
+
+	var whereSQL string
+	var whereArgs []any
+	if cleanQ != "" {
+		pat := "%" + escapeContentLikePattern(strings.ToLower(cleanQ)) + "%"
+		whereSQL = " WHERE (LOWER(name) LIKE ? ESCAPE '!' OR LOWER(slug) LIKE ? ESCAPE '!' OR LOWER(description) LIKE ? ESCAPE '!')"
+		whereArgs = []any{pat, pat, pat}
+	}
+
 	var total int
-	if err := s.store.QueryRowContext(ctx, `SELECT COUNT(*) FROM categories`).Scan(&total); err != nil {
+	if err := s.store.QueryRowContext(ctx, "SELECT COUNT(*) FROM categories"+whereSQL, whereArgs...).Scan(&total); err != nil {
 		return nil, 0, err
 	}
 	if total == 0 {
 		return []CategoryWithCount{}, 0, nil
 	}
-	pageSQL, pageArgs := s.store.Dialect().PaginateSQL(
-		`SELECT * FROM categories ORDER BY sort_order ASC, created_at ASC`,
-		limit, offset,
-	)
+	baseSQL := "SELECT * FROM categories" + whereSQL + " ORDER BY sort_order ASC, created_at ASC"
+	pageSQL, pageArgs := s.store.Dialect().PaginateSQL(baseSQL, limit, offset)
+	queryArgs := append(append([]any{}, whereArgs...), pageArgs...)
+
 	var cats []domain.Category
-	err := sqlx.SelectInto(ctx, s.store, &cats, pageSQL, pageArgs...)
+	err := sqlx.SelectInto(ctx, s.store, &cats, pageSQL, queryArgs...)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -1524,6 +1544,82 @@ func (s *Service) ListCategoriesWithCountsPage(ctx context.Context, page, perPag
 		})
 	}
 	return out, total, nil
+}
+
+// ListCategoryUsageSummary returns at most limit real positive categories ordered by published article count descending.
+func (s *Service) ListCategoryUsageSummary(ctx context.Context, limit int) ([]CategoryWithCount, error) {
+	items, _, err := s.ListCategoryUsageSummaryWithOthers(ctx, limit)
+	return items, err
+}
+
+// ListCategoryUsageSummaryWithOthers returns at most limit real positive categories ordered by published article count descending,
+// plus the aggregate count of published categorized articles beyond those limit categories.
+func (s *Service) ListCategoryUsageSummaryWithOthers(ctx context.Context, limit int) ([]CategoryWithCount, int, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	if limit > 200 {
+		limit = 200
+	}
+	type usageRow struct {
+		CategoryID string `db:"category_id"`
+		Cnt        int    `db:"cnt"`
+	}
+	baseSQL := `SELECT a.category_id, COUNT(*) AS cnt FROM articles a INNER JOIN categories c ON c.id = a.category_id WHERE a.status = ? GROUP BY a.category_id ORDER BY cnt DESC, a.category_id ASC`
+	pageSQL, pageArgs := s.store.Dialect().PaginateSQL(baseSQL, limit+1, 0)
+	args := make([]any, 0, 1+len(pageArgs))
+	args = append(args, domain.ArticleStatusPublished)
+	args = append(args, pageArgs...)
+	var rows []usageRow
+	if err := sqlx.SelectInto(ctx, s.store, &rows, pageSQL, args...); err != nil {
+		return nil, 0, err
+	}
+	if len(rows) == 0 {
+		return []CategoryWithCount{}, 0, nil
+	}
+
+	hasMore := len(rows) > limit
+	if hasMore {
+		rows = rows[:limit]
+	}
+
+	placeholders := make([]string, len(rows))
+	catArgs := make([]any, len(rows))
+	sumTop := 0
+	for i, r := range rows {
+		placeholders[i] = "?"
+		catArgs[i] = r.CategoryID
+		sumTop += r.Cnt
+	}
+	var cats []domain.Category
+	_ = sqlx.SelectInto(ctx, s.store, &cats,
+		`SELECT * FROM categories WHERE id IN (`+strings.Join(placeholders, ",")+`)`, catArgs...)
+	byID := make(map[string]domain.Category, len(cats))
+	for _, c := range cats {
+		byID[c.ID] = c
+	}
+
+	out := make([]CategoryWithCount, 0, len(rows))
+	for _, r := range rows {
+		if c, ok := byID[r.CategoryID]; ok {
+			out = append(out, CategoryWithCount{
+				Category:     c,
+				ArticleCount: r.Cnt,
+			})
+		}
+	}
+
+	othersCnt := 0
+	if hasMore {
+		var totalCategorized int
+		if err := s.store.QueryRowContext(ctx,
+			`SELECT COUNT(*) FROM articles a INNER JOIN categories c ON c.id = a.category_id WHERE a.status = ?`,
+			domain.ArticleStatusPublished,
+		).Scan(&totalCategorized); err == nil && totalCategorized > sumTop {
+			othersCnt = totalCategorized - sumTop
+		}
+	}
+	return out, othersCnt, nil
 }
 
 func (s *Service) queryCategoriesWithCounts(ctx context.Context) ([]CategoryWithCount, error) {
@@ -2002,6 +2098,201 @@ func (s *Service) ListPublicLinksPage(ctx context.Context, category string, page
 		return nil, nil, 0, err
 	}
 	return items, categories, total, nil
+}
+
+// LinkCategoryGroupData holds one deterministic ordered category group for paginated /links views.
+type LinkCategoryGroupData struct {
+	Category string        `json:"category"`
+	Items    []domain.Link `json:"items"`
+}
+
+// ListPublicLinkGroupsPage filters links by optional search query q and category in SQL, packs whole
+// categories cleanly up to maxPerPage links per page (chunking only single categories exceeding maxPerPage),
+// and loads only the rows for the requested page.
+func (s *Service) ListPublicLinkGroupsPage(
+	ctx context.Context,
+	q string,
+	category string,
+	uncategorizedLabel string,
+	page int,
+	maxPerPage int,
+) (groups []LinkCategoryGroupData, allCategories []string, totalLinks int, totalPages int, clampedPage int, err error) {
+	if maxPerPage <= 0 {
+		maxPerPage = 48
+	}
+	if maxPerPage > 200 {
+		maxPerPage = 200
+	}
+
+	type catRow struct {
+		CategoryName string `db:"category_name"`
+	}
+	var catRows []catRow
+	err = sqlx.SelectInto(ctx, s.store, &catRows,
+		`SELECT TRIM(category_name) AS category_name FROM links WHERE TRIM(category_name) <> '' GROUP BY TRIM(category_name) ORDER BY MIN(sort_order) ASC, TRIM(category_name) ASC`,
+	)
+	if err != nil {
+		return nil, nil, 0, 1, 1, err
+	}
+	allCategories = make([]string, 0, len(catRows))
+	for _, r := range catRows {
+		if r.CategoryName != "" {
+			allCategories = append(allCategories, r.CategoryName)
+		}
+	}
+
+	var whereParts []string
+	var whereArgs []any
+	if cleanCat := strings.TrimSpace(category); cleanCat != "" {
+		whereParts = append(whereParts, "TRIM(category_name) = ?")
+		whereArgs = append(whereArgs, cleanCat)
+	}
+	if cleanQ := strings.TrimSpace(q); cleanQ != "" {
+		pat := "%" + escapeContentLikePattern(strings.ToLower(cleanQ)) + "%"
+		whereParts = append(whereParts, "(LOWER(title) LIKE ? ESCAPE '!' OR LOWER(url) LIKE ? ESCAPE '!' OR LOWER(description) LIKE ? ESCAPE '!' OR LOWER(category_name) LIKE ? ESCAPE '!')")
+		whereArgs = append(whereArgs, pat, pat, pat, pat)
+	}
+	whereSQL := ""
+	if len(whereParts) > 0 {
+		whereSQL = " WHERE " + strings.Join(whereParts, " AND ")
+	}
+
+	type bucketRow struct {
+		CatKey     string `db:"cat_key"`
+		Cnt        int    `db:"cnt"`
+		MinSort    int    `db:"min_sort"`
+		MinCreated int64  `db:"min_created"`
+	}
+	var buckets []bucketRow
+	bucketSQL := "SELECT TRIM(category_name) AS cat_key, COUNT(*) AS cnt, MIN(sort_order) AS min_sort, MIN(created_at) AS min_created FROM links" +
+		whereSQL + " GROUP BY TRIM(category_name) ORDER BY min_sort ASC, min_created ASC, cat_key ASC"
+	if err := sqlx.SelectInto(ctx, s.store, &buckets, bucketSQL, whereArgs...); err != nil {
+		return nil, allCategories, 0, 1, 1, err
+	}
+	if len(buckets) == 0 {
+		return []LinkCategoryGroupData{}, allCategories, 0, 1, 1, nil
+	}
+
+	type pageChunk struct {
+		catKey    string
+		offset    int
+		limit     int
+		isPartial bool
+	}
+	var pages [][]pageChunk
+	var curPage []pageChunk
+	curCount := 0
+	for _, b := range buckets {
+		totalLinks += b.Cnt
+		if b.Cnt > maxPerPage {
+			if len(curPage) > 0 {
+				pages = append(pages, curPage)
+				curPage = nil
+				curCount = 0
+			}
+			for off := 0; off < b.Cnt; off += maxPerPage {
+				lim := maxPerPage
+				if off+lim > b.Cnt {
+					lim = b.Cnt - off
+				}
+				pages = append(pages, []pageChunk{{
+					catKey:    b.CatKey,
+					offset:    off,
+					limit:     lim,
+					isPartial: true,
+				}})
+			}
+			continue
+		}
+		if curCount > 0 && curCount+b.Cnt > maxPerPage {
+			pages = append(pages, curPage)
+			curPage = nil
+			curCount = 0
+		}
+		curPage = append(curPage, pageChunk{
+			catKey: b.CatKey,
+			offset: 0,
+			limit:  b.Cnt,
+		})
+		curCount += b.Cnt
+	}
+	if len(curPage) > 0 {
+		pages = append(pages, curPage)
+	}
+
+	totalPages = len(pages)
+	if totalPages < 1 {
+		totalPages = 1
+	}
+	clampedPage = page
+	if clampedPage < 1 {
+		clampedPage = 1
+	}
+	if clampedPage > totalPages {
+		clampedPage = totalPages
+	}
+	selected := pages[clampedPage-1]
+
+	displayCat := func(raw string) string {
+		if strings.TrimSpace(raw) == "" {
+			if strings.TrimSpace(uncategorizedLabel) != "" {
+				return uncategorizedLabel
+			}
+			return "Links"
+		}
+		return raw
+	}
+
+	if len(selected) == 1 && selected[0].isPartial {
+		chunk := selected[0]
+		subWhere := append(append([]string{}, whereParts...), "TRIM(category_name) = ?")
+		subArgs := append(append([]any{}, whereArgs...), chunk.catKey)
+		baseSQL := "SELECT * FROM links WHERE " + strings.Join(subWhere, " AND ") + " ORDER BY sort_order ASC, created_at ASC, id ASC"
+		pageSQL, pageArgs := s.store.Dialect().PaginateSQL(baseSQL, chunk.limit, chunk.offset)
+		queryArgs := append(subArgs, pageArgs...)
+		var rows []domain.Link
+		if err := sqlx.SelectInto(ctx, s.store, &rows, pageSQL, queryArgs...); err != nil {
+			return nil, allCategories, totalLinks, totalPages, clampedPage, err
+		}
+		if len(rows) == 0 {
+			return []LinkCategoryGroupData{}, allCategories, totalLinks, totalPages, clampedPage, nil
+		}
+		return []LinkCategoryGroupData{{
+			Category: displayCat(chunk.catKey),
+			Items:    rows,
+		}}, allCategories, totalLinks, totalPages, clampedPage, nil
+	}
+
+	placeholders := make([]string, len(selected))
+	catArgs := make([]any, len(selected))
+	for i, ch := range selected {
+		placeholders[i] = "?"
+		catArgs[i] = ch.catKey
+	}
+	subWhere := append(append([]string{}, whereParts...), "TRIM(category_name) IN ("+strings.Join(placeholders, ",")+")")
+	queryArgs := append(append([]any{}, whereArgs...), catArgs...)
+	var rows []domain.Link
+	if err := sqlx.SelectInto(ctx, s.store, &rows,
+		"SELECT * FROM links WHERE "+strings.Join(subWhere, " AND ")+" ORDER BY sort_order ASC, created_at ASC, id ASC",
+		queryArgs...); err != nil {
+		return nil, allCategories, totalLinks, totalPages, clampedPage, err
+	}
+
+	byCat := make(map[string][]domain.Link, len(selected))
+	for _, row := range rows {
+		k := strings.TrimSpace(row.CategoryName)
+		byCat[k] = append(byCat[k], row)
+	}
+	groups = make([]LinkCategoryGroupData, 0, len(selected))
+	for _, ch := range selected {
+		if items := byCat[ch.catKey]; len(items) > 0 {
+			groups = append(groups, LinkCategoryGroupData{
+				Category: displayCat(ch.catKey),
+				Items:    items,
+			})
+		}
+	}
+	return groups, allCategories, totalLinks, totalPages, clampedPage, nil
 }
 
 // ListFollowsWithItems returns RSS Follow subscriptions and their latest items using 2 bounded batch queries.

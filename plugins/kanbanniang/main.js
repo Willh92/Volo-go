@@ -1,4 +1,4 @@
-var PLUGIN_VERSION = "2.0.5";
+var PLUGIN_VERSION = "2.0.6";
 var MODEL_NAME_RE = /^[A-Za-z0-9_-]+\/[A-Za-z0-9_-]+$/;
 var ALLOWED_POSITIONS = { left: true, right: true };
 var RESOURCE_KEYS = {
@@ -12,18 +12,44 @@ var RESOURCE_KEYS = {
 
 var cachedManifestRaw = null;
 var cachedModelNames = null;
+var cachedModelLookup = null;
+var cachedExistingManifestRaw = null;
+var cachedExistingModelNames = null;
 var descriptorCache = {};
 var ASSET_VERIFY_TTL_MS = 300000;
+var KBN_TEX_SENTINEL = "__VOLO_KBN_TEX_SLOT__";
+var KBN_TEX_PLACEHOLDER = '["' + KBN_TEX_SENTINEL + '"]';
 var HTML_ESC_RE = /[&"<>]/;
+var PNG_EXT_RE = /\.png$/i;
 
 function escapeHtml(s) {
   var str = typeof s === "string" ? s : String(s || "");
   if (!HTML_ESC_RE.test(str)) return str;
-  return str
-    .replace(/&/g, "&amp;")
-    .replace(/"/g, "&quot;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
+  if (str.indexOf("&") >= 0) str = str.replace(/&/g, "&amp;");
+  if (str.indexOf('"') >= 0) str = str.replace(/"/g, "&quot;");
+  if (str.indexOf("<") >= 0) str = str.replace(/</g, "&lt;");
+  if (str.indexOf(">") >= 0) str = str.replace(/>/g, "&gt;");
+  return str;
+}
+
+function memoGet(key) {
+  if (volo.memo && typeof volo.memo.get === "function") {
+    return volo.memo.get(key);
+  }
+  return undefined;
+}
+
+function memoSet(key, val) {
+  if (volo.memo && typeof volo.memo.set === "function" && typeof val === "string") {
+    return volo.memo.set(key, val);
+  }
+  return false;
+}
+
+function memoDelete(key) {
+  if (volo.memo && typeof volo.memo.delete === "function") {
+    volo.memo.delete(key);
+  }
 }
 
 var LOCALE_STRINGS = {
@@ -106,18 +132,16 @@ function sanitizeProjectUrl(raw) {
 }
 
 function containsDotDotSegment(relPath) {
-  var parts = relPath.split("/");
-  for (var i = 0; i < parts.length; i++) {
-    if (parts[i] === "..") return true;
-  }
-  return false;
+  return (
+    relPath === ".." ||
+    relPath.indexOf("/../") >= 0 ||
+    relPath.indexOf("../") === 0 ||
+    (relPath.length >= 3 && relPath.slice(-3) === "/..")
+  );
 }
 
-function assertLocalAssetExists(relPath) {
-  if (typeof relPath !== "string") {
-    throw new Error("Invalid model resource");
-  }
-  if (relPath.trim() === "") {
+function validateLocalAssetPathSyntax(relPath) {
+  if (typeof relPath !== "string" || relPath.trim() === "") {
     throw new Error("Invalid model resource");
   }
   if (
@@ -131,15 +155,12 @@ function assertLocalAssetExists(relPath) {
   ) {
     throw new Error("Non-local model resource");
   }
-  if (!volo.assets || !volo.assets.exists("assets/" + relPath)) {
-    throw new Error("Missing bundled model resource");
-  }
 }
 
-function validateDescriptorValue(value, key, outPaths) {
+function collectDescriptorPaths(value, key, outPaths, seenPaths) {
   if (Array.isArray(value)) {
     for (var i = 0; i < value.length; i++) {
-      validateDescriptorValue(value[i], key, outPaths);
+      collectDescriptorPaths(value[i], key, outPaths, seenPaths);
     }
     return;
   }
@@ -147,13 +168,14 @@ function validateDescriptorValue(value, key, outPaths) {
     var keys = Object.keys(value);
     for (var k = 0; k < keys.length; k++) {
       var childKey = keys[k];
-      validateDescriptorValue(value[childKey], childKey, outPaths);
+      collectDescriptorPaths(value[childKey], childKey, outPaths, seenPaths);
     }
     return;
   }
   if (RESOURCE_KEYS[key]) {
-    assertLocalAssetExists(value);
-    if (outPaths) {
+    validateLocalAssetPathSyntax(value);
+    if (outPaths && (!seenPaths || !seenPaths[value])) {
+      if (seenPaths) seenPaths[value] = true;
       outPaths.push(value);
     }
   }
@@ -161,30 +183,54 @@ function validateDescriptorValue(value, key, outPaths) {
 
 function allAssetPathsExist(paths) {
   if (!volo.assets) return false;
-  for (var i = 0; i < paths.length; i++) {
-    if (!volo.assets.exists("assets/" + paths[i])) {
+  if (!paths || paths.length === 0) return true;
+  if (paths.length === 1) {
+    return volo.assets.exists("assets/" + paths[0]);
+  }
+  if (typeof volo.assets.existsAll === "function" && paths.length <= 4096) {
+    var prefixed = [];
+    for (var i = 0; i < paths.length; i++) {
+      prefixed.push("assets/" + paths[i]);
+    }
+    return volo.assets.existsAll(prefixed);
+  }
+  for (var j = 0; j < paths.length; j++) {
+    if (!volo.assets.exists("assets/" + paths[j])) {
       return false;
     }
   }
   return true;
 }
 
-function listBundledModels(verifyAll) {
+function validateDescriptorValue(value, key, outPaths) {
+  var paths = outPaths || [];
+  var seen = {};
+  collectDescriptorPaths(value, key, paths, seen);
+  if (!allAssetPathsExist(paths)) {
+    throw new Error("Missing bundled model resource");
+  }
+}
+
+function loadManifestEntry() {
   var rawManifest = volo.assets.readText("assets/model-list.json");
-  if (cachedModelNames && rawManifest === cachedManifestRaw) {
-    if (!verifyAll) {
-      return cachedModelNames;
-    }
-    var allStillPresent = true;
-    for (var c = 0; c < cachedModelNames.length; c++) {
-      if (!volo.assets.exists("assets/model/" + cachedModelNames[c] + "/index.json")) {
-        allStillPresent = false;
-        break;
+  if (cachedModelNames && cachedModelLookup && rawManifest === cachedManifestRaw) {
+    return { raw: rawManifest, names: cachedModelNames, lookup: cachedModelLookup };
+  }
+  var memoRaw = memoGet("kbn:manifest");
+  if (typeof memoRaw === "string" && memoRaw !== "") {
+    try {
+      var memoObj = JSON.parse(memoRaw);
+      if (memoObj && memoObj.raw === rawManifest && Array.isArray(memoObj.names)) {
+        var mLookup = {};
+        for (var m = 0; m < memoObj.names.length; m++) {
+          mLookup[memoObj.names[m]] = true;
+        }
+        cachedManifestRaw = rawManifest;
+        cachedModelNames = memoObj.names;
+        cachedModelLookup = mLookup;
+        return { raw: rawManifest, names: memoObj.names, lookup: mLookup };
       }
-    }
-    if (allStillPresent) {
-      return cachedModelNames;
-    }
+    } catch (e) {}
   }
 
   var parsed = JSON.parse(rawManifest);
@@ -192,18 +238,14 @@ function listBundledModels(verifyAll) {
     throw new Error("Invalid model-list.json");
   }
   var names = [];
-  var seen = {};
+  var lookup = {};
   for (var i = 0; i < parsed.length; i++) {
     var item = parsed[i];
     if (typeof item !== "string" || !MODEL_NAME_RE.test(item)) {
       throw new Error("Invalid model name");
     }
-    var indexRel = "model/" + item + "/index.json";
-    if (!volo.assets.exists("assets/" + indexRel)) {
-      continue;
-    }
-    if (!seen[item]) {
-      seen[item] = true;
+    if (!lookup[item]) {
+      lookup[item] = true;
       names.push(item);
     }
   }
@@ -212,7 +254,39 @@ function listBundledModels(verifyAll) {
   }
   cachedManifestRaw = rawManifest;
   cachedModelNames = names;
-  return names;
+  cachedModelLookup = lookup;
+  memoSet("kbn:manifest", JSON.stringify({ raw: rawManifest, names: names }));
+  return { raw: rawManifest, names: names, lookup: lookup };
+}
+
+function listBundledModels(verifyAll) {
+  var entry = loadManifestEntry();
+  if (cachedExistingModelNames && entry.raw === cachedExistingManifestRaw) {
+    if (!verifyAll) {
+      return cachedExistingModelNames;
+    }
+    var idxPaths = [];
+    for (var c = 0; c < cachedExistingModelNames.length; c++) {
+      idxPaths.push("model/" + cachedExistingModelNames[c] + "/index.json");
+    }
+    if (allAssetPathsExist(idxPaths)) {
+      return cachedExistingModelNames;
+    }
+  }
+
+  var existing = [];
+  for (var i = 0; i < entry.names.length; i++) {
+    var item = entry.names[i];
+    if (volo.assets.exists("assets/model/" + item + "/index.json")) {
+      existing.push(item);
+    }
+  }
+  if (existing.length === 0) {
+    throw new Error("No bundled models");
+  }
+  cachedExistingManifestRaw = entry.raw;
+  cachedExistingModelNames = existing;
+  return existing;
 }
 
 // Bundled models point directly to .webp in index.json/textures.json.
@@ -281,9 +355,77 @@ function pickModelName(names, requested, excludeName) {
   return names[Math.floor(Math.random() * names.length)];
 }
 
+function hasExplicitBundledModel(requested) {
+  if (
+    typeof requested !== "string" ||
+    requested === "" ||
+    requested === "random" ||
+    requested === "default" ||
+    !MODEL_NAME_RE.test(requested)
+  ) {
+    return false;
+  }
+  var entry = loadManifestEntry();
+  if (!entry.lookup[requested]) {
+    return false;
+  }
+  return volo.assets.exists("assets/model/" + requested + "/index.json");
+}
+
+function entryHasPng(textures) {
+  for (var i = 0; i < textures.length; i++) {
+    if (typeof textures[i] === "string" && PNG_EXT_RE.test(textures[i])) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function spliceSkeletonTextures(baseSkeleton, pickedTextures) {
+  if (!baseSkeleton) return "";
+  var idx = baseSkeleton.indexOf(KBN_TEX_PLACEHOLDER);
+  if (idx < 0) return "";
+  return (
+    baseSkeleton.slice(0, idx) +
+    JSON.stringify(pickedTextures) +
+    baseSkeleton.slice(idx + KBN_TEX_PLACEHOLDER.length)
+  );
+}
+
+function serializeVariantDescriptor(cached, chosenName, pickedTextures) {
+  var isPng = entryHasPng(pickedTextures);
+  if (!isPng && cached.baseSkeleton) {
+    var spliced = spliceSkeletonTextures(cached.baseSkeleton, pickedTextures);
+    if (spliced) {
+      return spliced;
+    }
+  }
+  var baseObj = cached.baseModel;
+  if (!baseObj) {
+    baseObj = JSON.parse(cached.rawIndex);
+    cached.baseModel = baseObj;
+  }
+  var outVar = shallowCopyObject(baseObj);
+  outVar.textures = pickedTextures;
+  outVar.name = chosenName;
+  outVar.asset_base = "/plugins/kanbanniang/assets/";
+  outVar.asset_version = PLUGIN_VERSION;
+  if (isPng) {
+    var varHints = buildWebpHints(pickedTextures);
+    if (varHints) outVar.textures_webp = varHints;
+  }
+  return JSON.stringify(outVar);
+}
+
 function selectModelDescriptorJson(requested, excludeName) {
-  var names = listBundledModels(false);
-  var chosenName = pickModelName(names, requested, excludeName);
+  var names = null;
+  var chosenName = "";
+  if (hasExplicitBundledModel(requested)) {
+    chosenName = requested;
+  } else {
+    names = listBundledModels(false);
+    chosenName = pickModelName(names, requested, excludeName);
+  }
   var dirRel = "model/" + chosenName + "/";
   var rawIndex;
   try {
@@ -301,7 +443,20 @@ function selectModelDescriptorJson(requested, excludeName) {
   }
 
   var nowMs = Date.now();
+  var memoKey = "kbn:model:" + chosenName;
   var cached = descriptorCache[chosenName];
+  if (!cached || cached.rawIndex !== rawIndex) {
+    var memoModelRaw = memoGet(memoKey);
+    if (typeof memoModelRaw === "string" && memoModelRaw !== "") {
+      try {
+        var memoModel = JSON.parse(memoModelRaw);
+        if (memoModel && memoModel.rawIndex === rawIndex) {
+          cached = memoModel;
+          descriptorCache[chosenName] = cached;
+        }
+      } catch (e) {}
+    }
+  }
 
   if (cached && cached.rawIndex === rawIndex) {
     if (!cached.variants) {
@@ -313,6 +468,7 @@ function selectModelDescriptorJson(requested, excludeName) {
         return cached.serializedStatic;
       }
       delete descriptorCache[chosenName];
+      memoDelete(memoKey);
       throw new Error("Missing bundled model resource");
     }
 
@@ -321,6 +477,7 @@ function selectModelDescriptorJson(requested, excludeName) {
       if (nowMs - cached.verifiedAtMs > ASSET_VERIFY_TTL_MS) {
         if (!allAssetPathsExist(cached.basePaths)) {
           delete descriptorCache[chosenName];
+          memoDelete(memoKey);
           throw new Error("Missing bundled model resource");
         }
         cached.verifiedAtMs = nowMs;
@@ -331,23 +488,21 @@ function selectModelDescriptorJson(requested, excludeName) {
         if (nowMs - cached.variantVerifiedAtMs[vIdx] <= ASSET_VERIFY_TTL_MS) {
           return cachedVarJson;
         }
-        if (allAssetPathsExist(cached.variants[vIdx])) {
+        var verifyPaths = Array.isArray(cached.variants[vIdx])
+          ? cached.variants[vIdx]
+          : [cached.variants[vIdx]];
+        if (allAssetPathsExist(verifyPaths)) {
           cached.variantVerifiedAtMs[vIdx] = nowMs;
           return cachedVarJson;
         }
         delete descriptorCache[chosenName];
+        memoDelete(memoKey);
         throw new Error("Missing bundled model resource");
       }
-      var chosenVar = cached.variants[vIdx];
+      var rawVar = cached.variants[vIdx];
+      var chosenVar = Array.isArray(rawVar) ? rawVar.slice() : [rawVar];
       validateDescriptorValue(chosenVar, "textures", null);
-      var fastVar = shallowCopyObject(cached.baseModel);
-      fastVar.textures = chosenVar;
-      fastVar.name = chosenName;
-      fastVar.asset_base = "/plugins/kanbanniang/assets/";
-      fastVar.asset_version = PLUGIN_VERSION;
-      var varHints = buildWebpHints(chosenVar);
-      if (varHints) fastVar.textures_webp = varHints;
-      var serializedVar = JSON.stringify(fastVar);
+      var serializedVar = serializeVariantDescriptor(cached, chosenName, chosenVar);
       cached.serializedVariants[vIdx] = serializedVar;
       cached.variantVerifiedAtMs[vIdx] = nowMs;
       return serializedVar;
@@ -369,7 +524,7 @@ function selectModelDescriptorJson(requested, excludeName) {
     var outStaticHints = buildWebpHints(outStatic.textures);
     if (outStaticHints) outStatic.textures_webp = outStaticHints;
     var serializedStatic = JSON.stringify(outStatic);
-    descriptorCache[chosenName] = {
+    var staticEntry = {
       rawIndex: rawIndex,
       rawTextures: null,
       basePaths: staticPaths,
@@ -377,6 +532,8 @@ function selectModelDescriptorJson(requested, excludeName) {
       serializedStatic: serializedStatic,
       variants: null,
     };
+    descriptorCache[chosenName] = staticEntry;
+    memoSet(memoKey, JSON.stringify(staticEntry));
     return serializedStatic;
   }
 
@@ -385,48 +542,57 @@ function selectModelDescriptorJson(requested, excludeName) {
   if (!Array.isArray(parsedVariants) || parsedVariants.length === 0) {
     throw new Error("Model has no textures");
   }
-  var normalizedVariants = [];
   for (var v = 0; v < parsedVariants.length; v++) {
     var entry = parsedVariants[v];
-    var arr = Array.isArray(entry) ? entry.slice() : [entry];
-    if (arr.length === 0) {
+    if (Array.isArray(entry) && entry.length === 0) {
       throw new Error("Model variant has empty textures");
     }
-    normalizedVariants.push(arr);
   }
 
   baseModel.textures = [];
   var basePaths = [];
   validateDescriptorValue(baseModel, "", basePaths);
 
-  var pickIdx = Math.floor(Math.random() * normalizedVariants.length);
-  var pickedTextures = normalizedVariants[pickIdx];
+  var pickIdx = Math.floor(Math.random() * parsedVariants.length);
+  var rawPicked = parsedVariants[pickIdx];
+  var pickedTextures = Array.isArray(rawPicked) ? rawPicked.slice() : [rawPicked];
   validateDescriptorValue(pickedTextures, "textures", null);
 
-  var outVar = shallowCopyObject(baseModel);
-  outVar.textures = pickedTextures;
-  outVar.name = chosenName;
-  outVar.asset_base = "/plugins/kanbanniang/assets/";
-  outVar.asset_version = PLUGIN_VERSION;
-  var outVarHints = buildWebpHints(pickedTextures);
-  if (outVarHints) outVar.textures_webp = outVarHints;
-  var firstSerialized = JSON.stringify(outVar);
+  var hasPngHint = rawTextures.indexOf(".png") >= 0 || rawTextures.indexOf(".PNG") >= 0;
+  var baseSkeleton = "";
+  if (
+    !hasPngHint &&
+    rawIndex.indexOf(KBN_TEX_SENTINEL) < 0 &&
+    rawTextures.indexOf(KBN_TEX_SENTINEL) < 0
+  ) {
+    var skelObj = shallowCopyObject(baseModel);
+    skelObj.textures = [KBN_TEX_SENTINEL];
+    skelObj.name = chosenName;
+    skelObj.asset_base = "/plugins/kanbanniang/assets/";
+    skelObj.asset_version = PLUGIN_VERSION;
+    var skelCandidate = JSON.stringify(skelObj);
+    if (skelCandidate.indexOf(KBN_TEX_PLACEHOLDER) >= 0) {
+      baseSkeleton = skelCandidate;
+    }
+  }
 
-  var serializedVariants = {};
-  var variantVerifiedAtMs = {};
-  serializedVariants[pickIdx] = firstSerialized;
-  variantVerifiedAtMs[pickIdx] = nowMs;
-
-  descriptorCache[chosenName] = {
+  var firstEntry = {
     rawIndex: rawIndex,
     rawTextures: rawTextures,
-    baseModel: baseModel,
+    baseModel: baseSkeleton ? null : baseModel,
+    baseSkeleton: baseSkeleton,
     basePaths: basePaths,
     verifiedAtMs: nowMs,
-    variants: normalizedVariants,
-    serializedVariants: serializedVariants,
-    variantVerifiedAtMs: variantVerifiedAtMs,
+    variants: parsedVariants,
+    serializedVariants: {},
+    variantVerifiedAtMs: {},
   };
+  var firstSerialized = serializeVariantDescriptor(firstEntry, chosenName, pickedTextures);
+  firstEntry.serializedVariants[pickIdx] = firstSerialized;
+  firstEntry.variantVerifiedAtMs[pickIdx] = nowMs;
+
+  descriptorCache[chosenName] = firstEntry;
+  memoSet(memoKey, JSON.stringify(firstEntry));
   return firstSerialized;
 }
 
@@ -475,14 +641,15 @@ function safeSettings(locale) {
   };
 }
 
-function renderToolbarButton(toolKey, svgId, titleText, viewBox, pathD) {
+// All static LOCALE_STRINGS tool labels are pre-verified HTML-attribute-safe literals.
+function renderToolbarButton(toolKey, svgId, safeTitleText, viewBox, pathD) {
   return (
     '<button type="button" data-kbn-tool="' +
     toolKey +
     '" title="' +
-    escapeHtml(titleText) +
+    safeTitleText +
     '" aria-label="' +
-    escapeHtml(titleText) +
+    safeTitleText +
     '"><svg id="' +
     svgId +
     '" viewBox="' +

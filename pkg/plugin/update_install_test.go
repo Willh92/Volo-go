@@ -687,7 +687,7 @@ func TestLegacyV102OfficialPluginUpdateBootstrapAndRealCatalogRoundTrip(t *testi
 		PluginsDir:            pluginsDir,
 		DataDir:               filepath.Join(tmpDir, "data"),
 		Catalog:               cat,
-		HostVersion:           "1.0.3",
+		HostVersion:           "1.0.4",
 		AllowLoopbackForTests: true,
 	})
 	t.Cleanup(func() { _ = mgr.Close(ctx) })

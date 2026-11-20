@@ -261,13 +261,13 @@
   {{if and .RawQuery (not (contains $base "?"))}}
     {{$base = printf "%s?%s" $base .RawQuery}}
   {{end}}
-  {{if and .SelectedArchiveYear (not (contains $base "year="))}}
+  {{if and .SelectedArchiveYear (not (contains $base "?year=")) (not (contains $base "&year="))}}
     {{if contains $base "?"}}{{$base = printf "%s&year=%s" $base (urlquery .SelectedArchiveYear)}}{{else}}{{$base = printf "%s?year=%s" $base (urlquery .SelectedArchiveYear)}}{{end}}
   {{end}}
-  {{if and .TagQuery (not (contains $base "q="))}}
+  {{if and .TagQuery (not (contains $base "?q=")) (not (contains $base "&q="))}}
     {{if contains $base "?"}}{{$base = printf "%s&q=%s" $base (urlquery .TagQuery)}}{{else}}{{$base = printf "%s?q=%s" $base (urlquery .TagQuery)}}{{end}}
   {{end}}
-  {{if and .TagSort (not (contains $base "sort="))}}
+  {{if and .TagSort (not (contains $base "?sort=")) (not (contains $base "&sort="))}}
     {{if contains $base "?"}}{{$base = printf "%s&sort=%s" $base (urlquery .TagSort)}}{{else}}{{$base = printf "%s?sort=%s" $base (urlquery .TagSort)}}{{end}}
   {{end}}
   <nav class="pagination" aria-label="Pagination">

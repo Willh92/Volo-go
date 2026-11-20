@@ -7,8 +7,8 @@
     "model/ShizukuTalk/shizuku-48/textures.512/03.webp",
     "model/ShizukuTalk/shizuku-48/textures.512/04.webp",
     "model/ShizukuTalk/shizuku-48/textures.512/05.webp",
-    "model/ShizukuTalk/shizuku-48/textures.512/06.webp",
-    "model/ShizukuTalk/shizuku-48/textures.512/07.webp"
+    "model/ShizukuTalk/shizuku-48/textures.512/00.webp",
+    "model/ShizukuTalk/shizuku-48/textures.512/00.webp"
   ],
   "physics": "model/ShizukuTalk/shizuku-48/physics.json",
   "pose": "model/ShizukuTalk/shizuku-48/pose.json",

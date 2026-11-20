@@ -1102,17 +1102,21 @@ func TestCronCircuitBreakerNoDeadlockConcurrentSlotsAPI413AndJSVMMemoryCaps(t *t
 			`,
 		},
 	}
+	maxMemCaseDuration := 200 * time.Millisecond
+	if isRaceBuild {
+		maxMemCaseDuration = 2 * time.Second
+	}
 	for _, tc := range memCases {
-		start := time.Now()
 		rt := newJSRuntime()
 		prog, err := compileJSProgram(tc.name+".js", tc.src)
 		if err != nil {
 			t.Fatalf("%s compile: %v", tc.name, err)
 		}
+		start := time.Now()
 		if _, err := rt.RunProgram(prog); err != nil {
 			t.Fatalf("%s RunProgram: %v", tc.name, err)
 		}
-		if elapsed := time.Since(start); elapsed > 200*time.Millisecond {
+		if elapsed := time.Since(start); elapsed > maxMemCaseDuration {
 			t.Fatalf("%s took too long (%v)", tc.name, elapsed)
 		}
 	}

@@ -2,6 +2,7 @@ package dialect
 
 import (
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"sync"
@@ -53,6 +54,9 @@ func NormalizePage(page int, pageSize int, defaultSize int, maxSize int) (limit 
 	if pageSize > maxSize {
 		pageSize = maxSize
 	}
+	if page-1 > math.MaxInt/pageSize {
+		return pageSize, math.MaxInt
+	}
 	return pageSize, (page - 1) * pageSize
 }
 
@@ -100,7 +104,18 @@ func (d sqliteDialect) UpsertSQL(table string, cols []string, conflictCols []str
 func (d sqliteDialect) UpsertIncrementSQL(table string, cols []string, conflictCols []string, incCols []string, overwriteCols []string) string {
 	return buildConflictUpsertIncrement(d, table, cols, conflictCols, incCols, overwriteCols)
 }
+func clampPaginateArgs(limit int, offset int) (int, int) {
+	if limit < 0 {
+		limit = 0
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	return limit, offset
+}
+
 func (d sqliteDialect) PaginateSQL(baseQuery string, limit int, offset int) (string, []any) {
+	limit, offset = clampPaginateArgs(limit, offset)
 	return strings.TrimRight(strings.TrimSpace(baseQuery), ";") + " LIMIT ? OFFSET ?", []any{limit, offset}
 }
 
@@ -307,6 +322,7 @@ func (d postgresDialect) UpsertIncrementSQL(table string, cols []string, conflic
 	return buildConflictUpsertIncrement(d, table, cols, conflictCols, incCols, overwriteCols)
 }
 func (d postgresDialect) PaginateSQL(baseQuery string, limit int, offset int) (string, []any) {
+	limit, offset = clampPaginateArgs(limit, offset)
 	q := strings.TrimRight(strings.TrimSpace(baseQuery), ";") + " LIMIT ? OFFSET ?"
 	return d.Rebind(q), []any{limit, offset}
 }
@@ -337,6 +353,7 @@ func (mysqlDialect) Types() TypeMap {
 }
 
 func (d mysqlDialect) PaginateSQL(baseQuery string, limit int, offset int) (string, []any) {
+	limit, offset = clampPaginateArgs(limit, offset)
 	return strings.TrimRight(strings.TrimSpace(baseQuery), ";") + " LIMIT ? OFFSET ?", []any{limit, offset}
 }
 

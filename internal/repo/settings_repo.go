@@ -242,6 +242,9 @@ func (m *SettingsManager) PatchDomain(ctx context.Context, domainName string, pa
 	if err := json.Unmarshal(patchJSON, &patchMap); err != nil {
 		return nil, 0, fmt.Errorf("settings: invalid JSON patch payload: %w", err)
 	}
+	if patchMap == nil {
+		return nil, 0, fmt.Errorf("settings: JSON patch payload must be an object")
+	}
 
 	m.writeMu.Lock()
 	defer m.writeMu.Unlock()

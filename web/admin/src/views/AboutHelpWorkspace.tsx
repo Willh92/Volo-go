@@ -1,5 +1,5 @@
 import { useEffect, useState } from "preact/hooks";
-import { apiFetch, resetConsoleScroll, showToast } from "../api";
+import { apiFetch, appVersion, resetConsoleScroll, safeHref, showToast } from "../api";
 import { ConsoleEmpty } from "../components/UIControls";
 import { t } from "../i18n";
 
@@ -42,6 +42,7 @@ export function AboutHelpWorkspace({
   const [sub, setSub] = useState<AboutHelpTab>(activeTab);
   const [info, setInfo] = useState<ProjectInfoPayload | null>(null);
   const [loading, setLoading] = useState(false);
+  const [loadErr, setLoadErr] = useState("");
   const [helpQuery, setHelpQuery] = useState("");
 
   useEffect(() => {
@@ -50,6 +51,7 @@ export function AboutHelpWorkspace({
 
   const loadInfo = async (forceRefresh = false) => {
     setLoading(true);
+    setLoadErr("");
     try {
       const url = forceRefresh
         ? "/api/admin/about/project-info?refresh=1"
@@ -60,7 +62,9 @@ export function AboutHelpWorkspace({
         showToast(t("about.refreshed_toast"), "ok");
       }
     } catch (err: any) {
-      showToast(err.message, "err");
+      const msg = String(err?.message || "").trim() || t("api.err_network");
+      setLoadErr(msg);
+      showToast(msg, "err");
     } finally {
       setLoading(false);
     }
@@ -181,10 +185,36 @@ export function AboutHelpWorkspace({
                   fontSize: "12.5px",
                 }}
               >
-                {t("about.cur_version")} {info?.version || "v1.0.0"}
+                {t("about.cur_version")} {info?.version || appVersion}
               </span>
             </div>
           </div>
+
+          {loadErr && (
+            <div
+              role="alert"
+              class="volo-draft-banner"
+              style={{
+                borderColor: "color-mix(in srgb, var(--volo-danger) 48%, var(--volo-line))",
+                background: "color-mix(in srgb, var(--volo-danger) 10%, var(--volo-surface))",
+                color: "var(--volo-danger)",
+                marginBottom: "16px",
+              }}
+            >
+              <span>
+                <strong>{t("about.load_err_title")}</strong>{" "}
+                {t("about.load_err_desc", { err: loadErr })}
+              </span>
+              <button
+                type="button"
+                class="volo-btn volo-btn-sm"
+                disabled={loading}
+                onClick={() => void loadInfo(true)}
+              >
+                {loading ? t("shell.loading") : t("about.retry_btn")}
+              </button>
+            </div>
+          )}
 
           <div class="volo-grid-2">
             <div class="volo-card">
@@ -193,7 +223,7 @@ export function AboutHelpWorkspace({
                   <h3 class="volo-card-title">{t("about.repo_head")}</h3>
                   <p class="volo-sec-desc" style={{ minWidth: 0, overflowWrap: "anywhere" }}>
                     <a
-                      href={info?.repo?.html_url || "https://github.com/Willh92/Volo-go"}
+                      href={safeHref(info?.repo?.html_url, { allowRelative: false }) || "https://github.com/Willh92/Volo-go"}
                       target="_blank"
                       rel="noreferrer"
                       style={{ color: "var(--volo-accent)", fontWeight: 600, textDecoration: "none", overflowWrap: "anywhere" }}
@@ -202,9 +232,15 @@ export function AboutHelpWorkspace({
                     </a>
                   </p>
                 </div>
-                <span class={`volo-status-pill ${info?.online ? "ok" : ""}`}>
+                <span class={`volo-status-pill ${info?.online ? "ok" : !info && loadErr ? "danger" : ""}`}>
                   <span class="volo-status-dot" />
-                  {info?.online ? t("about.online") : t("about.offline")}
+                  {info?.online
+                    ? t("about.online")
+                    : !info
+                    ? loadErr
+                      ? t("about.status_unavailable")
+                      : "—"
+                    : t("about.offline")}
                 </span>
               </div>
 
@@ -214,15 +250,15 @@ export function AboutHelpWorkspace({
 
               <div class="volo-repo-stats">
                 <div class="volo-repo-stat">
-                  <strong>{info?.repo?.stars ?? 0}</strong>
+                  <strong>{info?.repo?.stars ?? "—"}</strong>
                   <span>{t("about.stat_stars")}</span>
                 </div>
                 <div class="volo-repo-stat">
-                  <strong>{info?.repo?.forks ?? 0}</strong>
+                  <strong>{info?.repo?.forks ?? "—"}</strong>
                   <span>{t("about.stat_forks")}</span>
                 </div>
                 <div class="volo-repo-stat">
-                  <strong>{info?.repo?.open_issues ?? 0}</strong>
+                  <strong>{info?.repo?.open_issues ?? "—"}</strong>
                   <span>{t("about.stat_issues")}</span>
                 </div>
               </div>
@@ -230,19 +266,19 @@ export function AboutHelpWorkspace({
               <div class="volo-about-kv-grid">
                 <div class="volo-about-kv">
                   <small>{t("about.kv_lang")}</small>
-                  <span>{info?.go_version || "Go"}</span>
+                  <span>{info?.go_version || "—"}</span>
                 </div>
                 <div class="volo-about-kv">
                   <small>{t("about.kv_arch")}</small>
-                  <span>{info?.os_arch || "linux/amd64"}</span>
+                  <span>{info?.os_arch || "—"}</span>
                 </div>
                 <div class="volo-about-kv">
                   <small>{t("about.kv_db")}</small>
-                  <span>{(info?.db_dialect || "sqlite").toUpperCase()}</span>
+                  <span>{info?.db_dialect ? info.db_dialect.toUpperCase() : "—"}</span>
                 </div>
                 <div class="volo-about-kv">
                   <small>{t("about.kv_bundle")}</small>
-                  <span>{info?.admin_gzip_kb ? `${info.admin_gzip_kb} KB (gzip)` : "< 300 KB"}</span>
+                  <span>{info?.admin_gzip_kb ? `${info.admin_gzip_kb} KB (gzip)` : "—"}</span>
                 </div>
               </div>
 
@@ -257,7 +293,7 @@ export function AboutHelpWorkspace({
                 </button>
                 <a
                   class="volo-btn volo-btn-primary volo-btn-sm"
-                  href={info?.repo?.html_url || "https://github.com/Willh92/Volo-go"}
+                  href={safeHref(info?.repo?.html_url, { allowRelative: false }) || "https://github.com/Willh92/Volo-go"}
                   target="_blank"
                   rel="noreferrer"
                 >
@@ -273,21 +309,25 @@ export function AboutHelpWorkspace({
                     <h3 class="volo-card-title">{t("about.release_head")}</h3>
                     <p class="volo-sec-desc">{t("about.release_desc")}</p>
                   </div>
-                  <span class={`volo-badge ${info?.has_update ? "volo-badge-warn" : "volo-badge-ok"}`}>
-                    {info?.has_update ? t("about.update_avail") : t("about.up_to_date")}
-                  </span>
+                  {!info ? (
+                    <span class="volo-badge">{t("about.status_unavailable")}</span>
+                  ) : (
+                    <span class={`volo-badge ${info.has_update ? "volo-badge-warn" : "volo-badge-ok"}`}>
+                      {info.has_update ? t("about.update_avail") : t("about.up_to_date")}
+                    </span>
+                  )}
                 </div>
 
                 <div class="volo-subcard" style={{ margin: "6px 0 12px" }}>
                   <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: "8px", flexWrap: "wrap", minWidth: 0 }}>
                     <span class="volo-help">{t("about.latest_tag")}</span>
                     <span class="volo-code-chip" style={{ minWidth: 0, maxWidth: "100%", overflowWrap: "anywhere", whiteSpace: "normal" }}>
-                      {info?.latest_release?.tag_name || info?.version || "v1.0.0"}
+                      {info?.latest_release?.tag_name || info?.version || appVersion}
                     </span>
                   </div>
                   {info?.latest_release?.published_at && (
                     <div class="volo-help" style={{ marginTop: "6px" }}>
-                      {info.latest_release.published_at}
+                      {info.latest_release.published_at.slice(0, 10)}
                     </div>
                   )}
                 </div>
@@ -295,7 +335,7 @@ export function AboutHelpWorkspace({
                 <div class="volo-form-actions">
                   <a
                     class="volo-btn volo-btn-sm"
-                    href={info?.latest_release?.html_url || "https://github.com/Willh92/Volo-go/releases"}
+                    href={safeHref(info?.latest_release?.html_url, { allowRelative: false }) || "https://github.com/Willh92/Volo-go/releases"}
                     target="_blank"
                     rel="noreferrer"
                   >

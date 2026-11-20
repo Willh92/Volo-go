@@ -6,7 +6,6 @@ import (
 	"database/sql"
 	"encoding/base64"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"image"
@@ -81,6 +80,17 @@ func (s *AppServer) handleAdminSPA(w http.ResponseWriter, r *http.Request) {
 	s.serveAdminSPAAt(w, r, activePrefix)
 }
 
+const defaultAppVersion = "v1.0.4"
+
+func (s *AppServer) effectiveAppVersion() string {
+	if s != nil {
+		if v := strings.TrimSpace(s.deps.Version); v != "" {
+			return v
+		}
+	}
+	return defaultAppVersion
+}
+
 func (s *AppServer) serveAdminSPAAt(w http.ResponseWriter, r *http.Request, mountPrefix string) {
 	snap := s.deps.Settings.Snapshot()
 	customVendor := strings.TrimRight(strings.TrimSpace(snap.Reading.VendorCDNPrefix), "/")
@@ -90,6 +100,7 @@ func (s *AppServer) serveAdminSPAAt(w http.ResponseWriter, r *http.Request, moun
 	}
 	adminui.Default().ServeMount(w, r, mountPrefix, adminui.BootConfig{
 		Mode:            "console",
+		Version:         s.effectiveAppVersion(),
 		AdminPath:       mountPrefix,
 		BaseAdminPath:   s.staticAdminPrefix(),
 		PublicURL:       s.publicBaseURL(r),
@@ -935,13 +946,7 @@ func (s *AppServer) handleAdminSelfCredentials(w http.ResponseWriter, r *http.Re
 		if rows == nil {
 			rows = []domain.UserCredential{}
 		}
-		writeJSON(w, http.StatusOK, map[string]any{
-			"items":     rows,
-			"total":     total,
-			"page":      page,
-			"per_page":  perPage,
-			"page_size": perPage,
-		})
+		writePagedJSON(w, "", rows, total, page, perPage)
 
 	case sub == "passkeys/begin" && r.Method == http.MethodPost:
 		res, err := auth.BeginPasskeyCeremony(s.deps.Config.KeyRing, actor.ID, "register", s.publicBaseURL(r))
@@ -1005,15 +1010,15 @@ func (s *AppServer) handleAdminSelfCredentials(w http.ResponseWriter, r *http.Re
 			rows = []domain.UserSession{}
 		}
 		total := len(rows)
-		start := (page - 1) * perPage
-		if start > total {
-			start = total
+		paged := []domain.UserSession{}
+		if total > 0 && (page-1) <= (total-1)/perPage {
+			start := (page - 1) * perPage
+			end := start + perPage
+			if end > total || end < start {
+				end = total
+			}
+			paged = rows[start:end]
 		}
-		end := start + perPage
-		if end > total {
-			end = total
-		}
-		paged := rows[start:end]
 		curID := ""
 		if sess != nil {
 			curID = sess.ID
@@ -1068,13 +1073,7 @@ func (s *AppServer) handleAdminSelfCredentials(w http.ResponseWriter, r *http.Re
 		if rows == nil {
 			rows = []domain.APIToken{}
 		}
-		writeJSON(w, http.StatusOK, map[string]any{
-			"items":     rows,
-			"total":     total,
-			"page":      page,
-			"per_page":  perPage,
-			"page_size": perPage,
-		})
+		writePagedJSON(w, "", rows, total, page, perPage)
 
 	case sub == "tokens" && r.Method == http.MethodPost:
 		if sess == nil || sess.ID == "" {
@@ -1535,7 +1534,10 @@ func (s *AppServer) handleAdminOverview(w http.ResponseWriter, r *http.Request, 
 	}
 
 	monthlyArticles, monthlyHistory := s.queryOverviewMonthlyBuckets(ctx, actor, snap.Site.TimeZone, siteLoc, now)
-	catUsage, _ := s.deps.Content.ListCategoriesWithCounts(ctx)
+	catUsage, catUsageOthers, _ := s.deps.Content.ListCategoryUsageSummaryWithOthers(ctx, 50)
+	if catUsage == nil {
+		catUsage = []content.CategoryWithCount{}
+	}
 	topTags, _ := s.deps.Content.ListTagsWithCounts(ctx, 5)
 	recentComments := s.queryOverviewRecentComments(ctx, actor)
 
@@ -1572,10 +1574,11 @@ func (s *AppServer) handleAdminOverview(w http.ResponseWriter, r *http.Request, 
 		"top_articles":     topPosts,
 		"top_referers":     topReferers,
 		"top_countries":    topCountries,
-		"monthly_articles": monthlyArticles,
-		"monthly_history":  monthlyHistory,
-		"category_usage":   catUsage,
-		"top_tags":         topTags,
+		"monthly_articles":      monthlyArticles,
+		"monthly_history":       monthlyHistory,
+		"category_usage":        catUsage,
+		"category_usage_others": catUsageOthers,
+		"top_tags":              topTags,
 		"notice_board":     snap.Site.NoticeBoard,
 		"recent_comments":  recentComments,
 		"recent_logs":      recentLogs,
@@ -2166,7 +2169,9 @@ func (s *AppServer) handleAdminArticles(w http.ResponseWriter, r *http.Request, 
 		var req struct {
 			TTLHours int `json:"ttl_hours"`
 		}
-		_ = json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&req)
+		if !decodeOptJSONBody(w, r, 4096, &req) {
+			return
+		}
 		if req.TTLHours <= 0 {
 			req.TTLHours = 72
 		}
@@ -2761,14 +2766,7 @@ func (s *AppServer) handleAdminPages(w http.ResponseWriter, r *http.Request, act
 			if rows == nil {
 				rows = []domain.Page{}
 			}
-			writeJSON(w, http.StatusOK, map[string]any{
-				"items":     rows,
-				"pages":     rows,
-				"total":     total,
-				"page":      page,
-				"per_page":  perPage,
-				"page_size": perPage,
-			})
+			writePagedJSON(w, "pages", rows, total, page, perPage)
 
 		case http.MethodPost:
 			var in domain.Page
@@ -2956,37 +2954,13 @@ func (s *AppServer) handleAdminCategories(w http.ResponseWriter, r *http.Request
 	if rest == "" {
 		switch r.Method {
 		case http.MethodGet:
-			page, perPage := parseAdminPageParams(r, 100, 500)
-			q := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("q")))
-			rows, _ := s.deps.Content.ListCategoriesWithCounts(r.Context())
-			filtered := rows[:0:0]
-			for _, cat := range rows {
-				if q != "" &&
-					!strings.Contains(strings.ToLower(cat.Name), q) &&
-					!strings.Contains(strings.ToLower(cat.Slug), q) &&
-					!strings.Contains(strings.ToLower(cat.Description), q) {
-					continue
-				}
-				filtered = append(filtered, cat)
+			page, perPage := parseAdminPageParams(r, 100, 200)
+			q := strings.TrimSpace(r.URL.Query().Get("q"))
+			paged, total, _ := s.deps.Content.ListCategoriesWithCountsSearchPage(r.Context(), q, page, perPage)
+			if paged == nil {
+				paged = []content.CategoryWithCount{}
 			}
-			total := len(filtered)
-			start := (page - 1) * perPage
-			if start > total {
-				start = total
-			}
-			end := start + perPage
-			if end > total {
-				end = total
-			}
-			paged := filtered[start:end]
-			writeJSON(w, http.StatusOK, map[string]any{
-				"items":      paged,
-				"categories": paged,
-				"total":      total,
-				"page":       page,
-				"per_page":   perPage,
-				"page_size":  perPage,
-			})
+			writePagedJSON(w, "categories", paged, total, page, perPage)
 		case http.MethodPost:
 			if !requireAdminJSON(w, actor) {
 				return
@@ -3128,11 +3102,7 @@ func (s *AppServer) handleAdminTags(w http.ResponseWriter, r *http.Request, acto
 		}
 		merged := 0
 		reboundArticles := 0
-		ph := strings.TrimSuffix(strings.Repeat("?,", len(sourceIDs)), ",")
-		srcArgs := make([]any, len(sourceIDs))
-		for i, v := range sourceIDs {
-			srcArgs[i] = v
-		}
+		ph, srcArgs := sqlInPlaceholders(sourceIDs)
 		err := s.deps.Store.WithTx(r.Context(), func(tx *sqlx.Tx) error {
 			insSQL := `INSERT INTO article_tags (article_id, tag_id)
 				SELECT DISTINCT at.article_id, t.id FROM article_tags at
@@ -3228,14 +3198,7 @@ func (s *AppServer) handleAdminTags(w http.ResponseWriter, r *http.Request, acto
 			if paged == nil {
 				paged = []adminTagRow{}
 			}
-			writeJSON(w, http.StatusOK, map[string]any{
-				"items":     paged,
-				"tags":      paged,
-				"total":     total,
-				"page":      page,
-				"per_page":  perPage,
-				"page_size": perPage,
-			})
+			writePagedJSON(w, "tags", paged, total, page, perPage)
 		case http.MethodPost:
 			if !requireAdminJSON(w, actor) {
 				return
@@ -3378,12 +3341,11 @@ func (s *AppServer) handleAdminSeries(w http.ResponseWriter, r *http.Request, ac
 			bySeriesIDs := make(map[string][]string)
 			bySeriesArticles := make(map[string][]seriesArticleSummary)
 			if len(rows) > 0 {
-				placeholders := make([]string, len(rows))
-				relArgs := make([]any, len(rows))
+				seriesIDs := make([]string, len(rows))
 				for i, sr := range rows {
-					placeholders[i] = "?"
-					relArgs[i] = sr.ID
+					seriesIDs[i] = sr.ID
 				}
+				ph, relArgs := sqlInPlaceholders(seriesIDs)
 				var rels []struct {
 					SeriesID  string `db:"series_id"`
 					ArticleID string `db:"article_id"`
@@ -3397,7 +3359,7 @@ func (s *AppServer) handleAdminSeries(w http.ResponseWriter, r *http.Request, ac
 					        COALESCE(a.title, '') AS title, COALESCE(a.slug, '') AS slug, COALESCE(a.status, '') AS status
 					 FROM series_articles sa
 					 LEFT JOIN articles a ON a.id = sa.article_id
-					 WHERE sa.series_id IN (`+strings.Join(placeholders, ",")+`)
+					 WHERE sa.series_id IN (`+ph+`)
 					 ORDER BY sa.sort_order ASC`,
 					relArgs...,
 				)
@@ -3435,14 +3397,7 @@ func (s *AppServer) handleAdminSeries(w http.ResponseWriter, r *http.Request, ac
 					Articles:   arts,
 				})
 			}
-			writeJSON(w, http.StatusOK, map[string]any{
-				"items":     items,
-				"series":    items,
-				"total":     total,
-				"page":      page,
-				"per_page":  perPage,
-				"page_size": perPage,
-			})
+			writePagedJSON(w, "series", items, total, page, perPage)
 		case http.MethodPost:
 			if !requireAdminJSON(w, actor) {
 				return
@@ -3685,14 +3640,7 @@ func (s *AppServer) handleAdminBooks(w http.ResponseWriter, r *http.Request, act
 			if paged == nil {
 				paged = []domain.Book{}
 			}
-			writeJSON(w, http.StatusOK, map[string]any{
-				"items":     paged,
-				"books":     paged,
-				"total":     total,
-				"page":      page,
-				"per_page":  perPage,
-				"page_size": perPage,
-			})
+			writePagedJSON(w, "books", paged, total, page, perPage)
 		case http.MethodPost:
 			if !requireAdminJSON(w, actor) {
 				return
@@ -4012,41 +3960,40 @@ func (s *AppServer) handleAdminComments(w http.ResponseWriter, r *http.Request, 
 		}
 		artMeta := make(map[string]targetMeta)
 		pageMeta := make(map[string]targetMeta)
-		var artIDs, pageIDs []any
-		var artPH, pagePH []string
+		var artIDs, pageIDs []string
 		seenArt := make(map[string]bool)
 		seenPg := make(map[string]bool)
 		for _, c := range rows {
 			if c.TargetType == domain.TargetTypeArticle && c.TargetID != "" && !seenArt[c.TargetID] {
 				seenArt[c.TargetID] = true
 				artIDs = append(artIDs, c.TargetID)
-				artPH = append(artPH, "?")
 			} else if c.TargetType == domain.TargetTypePage && c.TargetID != "" && !seenPg[c.TargetID] {
 				seenPg[c.TargetID] = true
 				pageIDs = append(pageIDs, c.TargetID)
-				pagePH = append(pagePH, "?")
 			}
 		}
 		if len(artIDs) > 0 {
+			ph, args := sqlInPlaceholders(artIDs)
 			var aRows []struct {
 				ID       string `db:"id"`
 				AuthorID string `db:"author_id"`
 				Title    string `db:"title"`
 				Slug     string `db:"slug"`
 			}
-			_ = sqlx.SelectInto(r.Context(), s.deps.Store, &aRows, `SELECT id, author_id, title, slug FROM articles WHERE id IN (`+strings.Join(artPH, ",")+`)`, artIDs...)
+			_ = sqlx.SelectInto(r.Context(), s.deps.Store, &aRows, `SELECT id, author_id, title, slug FROM articles WHERE id IN (`+ph+`)`, args...)
 			for _, ar := range aRows {
 				artMeta[ar.ID] = targetMeta{AuthorID: ar.AuthorID, Title: ar.Title, Slug: ar.Slug}
 			}
 		}
 		if len(pageIDs) > 0 {
+			ph, args := sqlInPlaceholders(pageIDs)
 			var pRows []struct {
 				ID       string `db:"id"`
 				AuthorID string `db:"author_id"`
 				Title    string `db:"title"`
 				Slug     string `db:"slug"`
 			}
-			_ = sqlx.SelectInto(r.Context(), s.deps.Store, &pRows, `SELECT id, author_id, title, slug FROM pages WHERE id IN (`+strings.Join(pagePH, ",")+`)`, pageIDs...)
+			_ = sqlx.SelectInto(r.Context(), s.deps.Store, &pRows, `SELECT id, author_id, title, slug FROM pages WHERE id IN (`+ph+`)`, args...)
 			for _, pr := range pRows {
 				pageMeta[pr.ID] = targetMeta{AuthorID: pr.AuthorID, Title: pr.Title, Slug: pr.Slug}
 			}
@@ -4178,7 +4125,10 @@ func (s *AppServer) handleAdminComments(w http.ResponseWriter, r *http.Request, 
 		var req struct {
 			ContentMD string `json:"content_md"`
 		}
-		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 32768)).Decode(&req); err != nil || strings.TrimSpace(req.ContentMD) == "" {
+		if !decodeJSONBody(w, r, 32768, &req) {
+			return
+		}
+		if strings.TrimSpace(req.ContentMD) == "" {
 			writeErrJSON(w, http.StatusBadRequest, "content_md required")
 			return
 		}
@@ -4228,7 +4178,9 @@ func (s *AppServer) handleAdminComments(w http.ResponseWriter, r *http.Request, 
 			RejectComment   bool   `json:"reject_comment"`
 			RejectPending   bool   `json:"reject_pending"`
 		}
-		_ = json.NewDecoder(http.MaxBytesReader(w, r.Body, 8192)).Decode(&req)
+		if !decodeOptJSONBody(w, r, 8192, &req) {
+			return
+		}
 		note := strings.TrimSpace(req.Note)
 		if note == "" {
 			note = strings.TrimSpace(req.Reason)

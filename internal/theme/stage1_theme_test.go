@@ -46,14 +46,14 @@ func TestStage1_ThemeJaJPCoverage_HomepageSanitize_PreviewCache_And_RedactSecret
 		t.Fatalf("NewEngine: %v", err)
 	}
 
-	// 1. Verify ja-JP localization for built-in volo-studio & external volo-journal v1.1.1
+	// 1. Verify ja-JP localization for built-in volo-studio & external volo-journal v1.1.2
 	for _, id := range []string{DefaultThemeID, "volo-journal"} {
 		lt, ok := eng.GetLocalized(id, "ja-JP")
 		if !ok {
 			t.Fatalf("expected theme %q to be loaded", id)
 		}
-		if id == "volo-journal" && lt.Version != "1.1.1" {
-			t.Fatalf("expected volo-journal version 1.1.1, got %s", lt.Version)
+		if id == "volo-journal" && lt.Version != "1.1.2" {
+			t.Fatalf("expected volo-journal version 1.1.2, got %s", lt.Version)
 		}
 		if !strings.Contains(lt.PreviewURL, "?v="+lt.Version) {
 			t.Fatalf("expected PreviewURL to include ?v=%s, got %s", lt.Version, lt.PreviewURL)

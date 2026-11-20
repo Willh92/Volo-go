@@ -7,7 +7,6 @@
   --volo-text: light-dark(#1c2420, #d6dfda);
   --volo-muted: light-dark(#65716b, #a1b1a8);
   --volo-accent: light-dark(#246b51, #9bcab1);
-  --volo-accent-hover: light-dark(#1b5741, #b4dbc6);
   --volo-accent-soft: light-dark(rgba(36, 107, 81, 0.11), rgba(155, 202, 177, 0.14));
   --volo-btn-bg: light-dark(#246b51, #476e59);
   --volo-btn-hover: light-dark(#1b5741, #537f67);
@@ -53,7 +52,6 @@
 
 [data-accent="ocean"] {
   --volo-accent: light-dark(#2d6583, #a2c5dd);
-  --volo-accent-hover: light-dark(#23516b, #bad6ea);
   --volo-accent-soft: light-dark(rgba(45, 101, 131, 0.12), rgba(162, 197, 221, 0.14));
   --volo-btn-bg: light-dark(#2d6583, #476b85);
   --volo-btn-hover: light-dark(#23516b, #537b98);
@@ -63,7 +61,6 @@
 }
 [data-accent="teal"] {
   --volo-accent: light-dark(#286c70, #9acbcc);
-  --volo-accent-hover: light-dark(#20575a, #b4dcdd);
   --volo-accent-soft: light-dark(rgba(40, 108, 112, 0.12), rgba(154, 203, 204, 0.14));
   --volo-btn-bg: light-dark(#286c70, #416e71);
   --volo-btn-hover: light-dark(#20575a, #4d7f82);
@@ -73,7 +70,6 @@
 }
 [data-accent="amber"] {
   --volo-accent: light-dark(#855c27, #d6bd91);
-  --volo-accent-hover: light-dark(#6e4a20, #e4cfa9);
   --volo-accent-soft: light-dark(rgba(133, 92, 39, 0.12), rgba(214, 189, 145, 0.14));
   --volo-btn-bg: light-dark(#855c27, #70522b);
   --volo-btn-hover: light-dark(#6e4a20, #826034);
@@ -83,7 +79,6 @@
 }
 [data-accent="plum"] {
   --volo-accent: light-dark(#70517d, #c8b5d7);
-  --volo-accent-hover: light-dark(#5a4167, #dacbe6);
   --volo-accent-soft: light-dark(rgba(112, 81, 125, 0.12), rgba(200, 181, 215, 0.14));
   --volo-btn-bg: light-dark(#70517d, #6d567d);
   --volo-btn-hover: light-dark(#5a4167, #7d648f);
@@ -93,7 +88,6 @@
 }
 [data-accent="rose"] {
   --volo-accent: light-dark(#87525f, #d6b1bd);
-  --volo-accent-hover: light-dark(#714450, #e5c6d0);
   --volo-accent-soft: light-dark(rgba(135, 82, 95, 0.12), rgba(214, 177, 189, 0.14));
   --volo-btn-bg: light-dark(#87525f, #754957);
   --volo-btn-hover: light-dark(#714450, #875565);
@@ -1671,8 +1665,7 @@ input[type="checkbox"] {
 }
 
 .volo-act-btn:disabled,
-.volo-ed-btn:disabled,
-.volo-pg-btn:disabled {
+.volo-ed-btn:disabled {
   opacity: 0.38;
   cursor: not-allowed;
   box-shadow: none;
@@ -1805,6 +1798,7 @@ tr.is-flip-moving,
   height: 480px;
   overflow-y: auto;
   min-inline-size: 0;
+  overflow-wrap: break-word;
 }
 
 /* Setup & Auth Centered Card */
@@ -2183,6 +2177,7 @@ tr.is-flip-moving,
   top: calc(100% + 5px);
   left: 0;
   min-width: 100%;
+  max-width: calc(100dvw - 24px);
   max-height: 260px;
   overflow-y: auto;
   z-index: 85;
@@ -2843,6 +2838,7 @@ body.volo-is-sorting * {
 .volo-pg-btn:disabled {
   opacity: 0.45;
   cursor: not-allowed;
+  box-shadow: none;
 }
 
 .volo-pg-dots {
@@ -3507,7 +3503,7 @@ body.volo-is-sorting * {
   transform: translate3d(-50%, -100%, 0);
   padding: 6px 10px;
   border-radius: 7px;
-  border: 1px solid var(--volo-line);
+  border: 1px solid light-dark(var(--volo-line), rgba(255, 255, 255, 0.16));
   background: #17211d;
   color: #f4f7f5;
   font-family: var(--volo-font);
@@ -3516,7 +3512,7 @@ body.volo-is-sorting * {
   line-height: 1.3;
   white-space: nowrap;
   pointer-events: none;
-  box-shadow: 0 8px 22px rgba(0, 0, 0, 0.26);
+  box-shadow: light-dark(0 8px 22px rgba(0, 0, 0, 0.26), 0 10px 26px rgba(0, 0, 0, 0.52));
 }
 .volo-ed-tooltip::after {
   content: "";
@@ -3542,6 +3538,8 @@ body.volo-is-sorting * {
 .volo-wysiwyg-surface {
   height: 520px;
   overflow-y: auto;
+  min-inline-size: 0;
+  overflow-wrap: break-word;
   padding: 20px 28px;
   outline: none;
   font-size: 15px;
@@ -3586,13 +3584,21 @@ body.volo-is-sorting * {
     &[data-copied="true"] { border-color: var(--volo-accent); color: var(--volo-accent); background: var(--volo-accent-soft); }
   }
   & .volo-code-block pre { margin: 0; border: 0; border-radius: 0; background: transparent; }
-  & .chroma { color: var(--volo-text); background: var(--volo-code-bg); }
-  & .chroma .line { display: flex; }
-  & .chroma .cl { flex: 1; min-width: 0; }
+  & pre:has(> code > .line) { padding-left: 0; }
+  & pre > code { display: block; min-inline-size: 100%; inline-size: max-content; }
+  & .chroma { color: var(--volo-text); background: var(--volo-code-bg); white-space: pre; }
+  & .chroma .line { display: flex; align-items: baseline; inline-size: 100%; min-block-size: 1.6em; }
+  & .chroma .cl { flex: 1 0 auto; white-space: pre; }
   & .chroma .hl { background: color-mix(in srgb, var(--volo-accent) 14%, transparent); }
+  & .chroma .line.hl :is(.ln, .lnt) {
+    background: color-mix(in srgb, var(--volo-accent) 14%, var(--volo-code-bg));
+  }
   & :is(.chroma .ln, .chroma .lnt) {
-    user-select: none; -webkit-user-select: none; margin-right: 14px; padding-right: 10px; min-width: 2.1em;
-    text-align: right; color: var(--volo-muted); opacity: 0.72; border-right: 1px solid var(--volo-line);
+    position: sticky; left: 0; z-index: 2;
+    user-select: none; -webkit-user-select: none; margin-right: 14px; padding: 0 10px 0 14px; min-width: 3.1em;
+    text-align: right; background: var(--volo-code-bg);
+    color: color-mix(in srgb, var(--volo-muted) 72%, transparent);
+    border-right: 1px solid var(--volo-line);
     font-variant-numeric: tabular-nums; flex-shrink: 0;
   }
   & :is(.volo-lock-card, .volo-lock-block) {
@@ -3603,23 +3609,23 @@ body.volo-is-sorting * {
   & .volo-lock-block--unlocked { background: color-mix(in srgb, var(--volo-accent-soft) 24%, var(--volo-surface)); }
   & .volo-lock-title { margin: 0 0 4px; font-weight: 650; font-size: 13.5px; }
   & .volo-lock-hint { margin: 0; font-size: 12.5px; color: var(--volo-muted); }
-  & :is(.volo-embed-book, .volo-github-repos-card, .volo-book-tile) {
+  & :is(.volo-embed-book, .volo-book-tile) {
     margin: 0.9em 0; padding: 14px 16px; border-radius: 12px; border: 1px solid var(--volo-line);
     background: var(--volo-raised); color: var(--volo-text); text-decoration: none;
     transition: border-color 0.16s ease, box-shadow 0.16s ease, transform 0.16s ease;
   }
   & :is(a.volo-embed-book, a.volo-book-tile) { display: flex; gap: 14px; align-items: center; cursor: pointer; }
-  & :is(.volo-embed-bookshelf, .volo-embed-bookshelf-grid) :is(.volo-embed-book, .volo-book-tile) { margin: 0; }
+  & .volo-embed-bookshelf :is(.volo-embed-book, .volo-book-tile) { margin: 0; }
   & :is(a.volo-embed-book:hover, a.volo-book-tile:hover) {
     border-color: color-mix(in srgb, var(--volo-accent) 48%, var(--volo-line)); box-shadow: var(--volo-shadow); transform: translate3d(0, -1px, 0);
   }
-  & :is(.volo-embed-book__body, .volo-embed-book-body) { display: flex; flex-direction: column; gap: 4px; flex: 1; min-width: 0; }
+  & .volo-embed-book__body { display: flex; flex-direction: column; gap: 4px; flex: 1; min-width: 0; }
   & .volo-embed-book__head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
   & .volo-embed-book__title { font-size: 14.5px; color: var(--volo-text); line-height: 1.35; }
   & .volo-embed-book__chapters {
     font-size: 11.5px; font-weight: 600; padding: 1px 7px; border-radius: 999px; background: var(--volo-accent-soft); color: var(--volo-accent);
   }
-  & :is(.volo-embed-book__desc, .volo-embed-book-desc, .volo-github-repo-desc) {
+  & :is(.volo-embed-book__desc, .volo-github-repo-desc) {
     font-size: 12.5px; color: var(--volo-muted); line-height: 1.45; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
   }
   & .volo-callout {
@@ -3635,10 +3641,10 @@ body.volo-is-sorting * {
   & .volo-callout__title { display: flex; align-items: center; gap: 6px; font-size: 13px; font-weight: 700; color: var(--callout-color); margin: 0 0 4px; line-height: 1.35; }
   & .volo-callout__body > :first-child { margin-top: 0; }
   & .volo-callout__body > :last-child { margin-bottom: 0; }
-  & :is(.volo-embed-book__arrow, .volo-book-card-arrow) { color: var(--volo-muted); font-size: 16px; flex-shrink: 0; transition: transform 0.16s ease, color 0.16s ease; }
-  & :is(a.volo-embed-book:hover, a.volo-book-tile:hover) :is(.volo-embed-book__arrow, .volo-book-card-arrow) { color: var(--volo-accent); transform: translate3d(3px, 0, 0); }
+  & .volo-embed-book__arrow { color: var(--volo-muted); font-size: 16px; flex-shrink: 0; transition: transform 0.16s ease, color 0.16s ease; }
+  & :is(a.volo-embed-book:hover, a.volo-book-tile:hover) .volo-embed-book__arrow { color: var(--volo-accent); transform: translate3d(3px, 0, 0); }
   & .volo-embed-book__cover-link { display: inline-flex; flex-shrink: 0; }
-  & :is(.volo-embed-book__cover, .volo-embed-book-cover) {
+  & .volo-embed-book__cover {
     width: 64px; height: 88px; object-fit: cover; border-radius: 6px; flex-shrink: 0;
     display: inline-flex; align-items: center; justify-content: center; background: var(--volo-code-bg);
     font-weight: 700; position: relative; overflow: clip;
@@ -3648,7 +3654,7 @@ body.volo-is-sorting * {
   }
   & .volo-embed-book__spine { position: absolute; left: 0; top: 0; bottom: 0; width: 5px; background: color-mix(in srgb, var(--volo-accent) 45%, transparent); }
   & .volo-embed-book__monogram { font-size: 18px; font-weight: 750; letter-spacing: 0.02em; }
-  & :is(.volo-embed-bookshelf, .volo-embed-bookshelf-grid, .volo-github-repos-grid) { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 12px; margin: 0.9em 0; }
+  & .volo-embed-bookshelf { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 12px; margin: 0.9em 0; }
   & .volo-embed-bookshelf--empty { display: block; padding: 14px 16px; border-radius: 10px; border: 1px dashed var(--volo-line); background: var(--volo-raised); text-align: center; }
   & .volo-embed-bookshelf__empty { margin: 0; font-size: 13px; color: var(--volo-muted); }
   & .volo-audio-ts {
@@ -4483,7 +4489,9 @@ body.volo-is-sorting * {
     padding: 4px 6px 8px;
     margin: -4px -6px 18px;
   }
-  .volo-subtabs::-webkit-scrollbar {
+  .volo-subtabs::-webkit-scrollbar,
+  .volo-filter-pills::-webkit-scrollbar,
+  .volo-ed-tools::-webkit-scrollbar {
     display: none;
   }
   .volo-filter-bar,
@@ -4509,9 +4517,6 @@ body.volo-is-sorting * {
     padding: 3px;
     margin: -3px;
   }
-  .volo-filter-pills::-webkit-scrollbar {
-    display: none;
-  }
   .volo-ed-tools {
     flex-wrap: nowrap;
     overflow-x: auto;
@@ -4530,9 +4535,6 @@ body.volo-is-sorting * {
     flex-wrap: wrap;
     gap: 6px 10px;
   }
-  .volo-ed-tools::-webkit-scrollbar {
-    display: none;
-  }
   @supports not selector(::-webkit-scrollbar) {
     .volo-subtabs,
     .volo-filter-pills,
@@ -4542,7 +4544,8 @@ body.volo-is-sorting * {
   }
   @supports (animation-timeline: scroll()) {
     .volo-subtabs,
-    .volo-filter-pills {
+    .volo-filter-pills,
+    .volo-ed-toolbar > .volo-ed-tools {
       scroll-padding-inline: 20px;
       mask-image: linear-gradient(
         to right,
@@ -4661,6 +4664,9 @@ body.volo-is-sorting * {
 @media (max-width: 520px) {
   .volo-topbar-actions {
     gap: 4px;
+  }
+  .volo-ed-findbar-row {
+    flex-wrap: wrap;
   }
   .volo-ed-right {
     width: 100%;
@@ -5398,8 +5404,7 @@ html[data-theme="dark"] .volo-auth-story {
   color: #ffffff;
 }
 
-.volo-media-body,
-.volo-media-card-body {
+.volo-media-body {
   padding: 8px 10px 9px;
   display: flex;
   flex-direction: column;
@@ -5427,22 +5432,13 @@ html[data-theme="dark"] .volo-auth-story {
   gap: 4px;
 }
 
-.volo-media-actions,
-.volo-media-card-foot {
-  display: flex;
-  align-items: center;
-  justify-content: flex-end;
-  flex-wrap: wrap;
-  gap: 4px;
-  padding-top: 5px;
-  margin-top: auto;
-  border-top: 1px solid var(--volo-line);
-}
-
 .volo-media-actions {
   display: grid;
   grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) 26px;
   gap: 4px;
+  padding-top: 5px;
+  margin-top: auto;
+  border-top: 1px solid var(--volo-line);
 }
 
 .volo-media-actions .volo-act-btn {
@@ -5949,10 +5945,6 @@ html[data-theme="dark"] .volo-auth-story {
   }
 }
 
-.volo-cselect-menu {
-  max-width: calc(100dvw - 24px);
-}
-
 .volo-ed-mobile-tabs {
   display: none;
   gap: 4px;
@@ -6418,11 +6410,6 @@ html[data-theme="dark"] .volo-auth-story {
 .volo-table-compact {
   min-width: 0 !important;
   width: 100%;
-}
-
-.volo-break-any {
-  overflow-wrap: anywhere;
-  word-break: break-word;
 }
 
 .volo-label-row {
@@ -7606,8 +7593,7 @@ html[data-theme="dark"] .volo-auth-story {
     aspect-ratio: 4 / 3;
   }
 
-  .volo-media-body,
-  .volo-media-card-body {
+  .volo-media-body {
     padding: 6px 8px 7px;
     gap: 3px;
   }
@@ -7620,8 +7606,7 @@ html[data-theme="dark"] .volo-auth-story {
     font-size: 10px;
   }
 
-  .volo-media-actions .volo-act-btn,
-  .volo-media-card-actions .volo-act-btn {
+  .volo-media-actions .volo-act-btn {
     padding: 0 3px;
     font-size: 10.5px;
     height: 28px;
@@ -7870,36 +7855,37 @@ html[data-theme="dark"] .volo-auth-story {
    open (.is-kb-open). */
 @media (max-width: 768px) {
   .volo-ed-toolbar {
-    flex-wrap: nowrap;
+    flex-wrap: wrap;
     gap: 6px;
-    padding: 5px 8px;
+    padding: 6px 8px;
+  }
+  .volo-ed-toolbar > .volo-ed-tools {
+    flex: 1 1 100%;
+    flex-wrap: nowrap;
+    max-width: 100%;
     overflow-x: auto;
     overflow-y: hidden;
     overscroll-behavior-x: contain;
     scrollbar-width: none;
-  }
-  .volo-ed-toolbar::-webkit-scrollbar {
-    display: none;
-  }
-  .volo-ed-toolbar > .volo-ed-tools,
-  .volo-ed-toolbar > .volo-ed-right {
-    flex: 0 0 auto;
-    flex-wrap: nowrap;
-    width: auto;
-    max-width: none;
-    overflow: visible;
-    padding-bottom: 0;
+    scroll-snap-type: x proximity;
+    scroll-padding-inline: 20px;
+    padding-bottom: 2px;
   }
   .volo-ed-toolbar > .volo-ed-right {
+    width: 100%;
     margin-left: 0;
-    justify-content: flex-start;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 6px;
   }
 }
 
 @media (pointer: coarse) and (max-width: 1024px) {
   .volo-ed-btn {
-    width: 34px;
-    height: 34px;
+    min-inline-size: 34px;
+    min-block-size: 34px;
+    width: auto;
+    height: auto;
   }
   .volo-ed-btn,
   .volo-ed-chip,
@@ -8005,11 +7991,6 @@ dialog.volo-native-dialog {
   transition-timing-function: cubic-bezier(0.16, 1, 0.3, 1);
   transition-behavior: allow-discrete;
 }
-@media (prefers-reduced-motion: no-preference) {
-  dialog.volo-native-dialog {
-    transform: scale(0.96);
-  }
-}
 dialog.volo-native-dialog::backdrop {
   background-color: rgb(8 14 12 / 0);
   backdrop-filter: blur(0px);
@@ -8031,6 +8012,9 @@ dialog.volo-native-dialog[open]:where(:not([data-closing])) {
   }
 }
 @media (prefers-reduced-motion: no-preference) {
+  dialog.volo-native-dialog {
+    transform: scale(0.96);
+  }
   dialog.volo-native-dialog[open]:where(:not([data-closing])) {
     transform: scale(1);
   }

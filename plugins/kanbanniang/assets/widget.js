@@ -11,7 +11,7 @@
   var ANIM_WEBP_URI =
     "data:image/webp;base64,UklGRoQAAABXRUJQVlA4WAoAAAASAAAAAQAAAQAAQU5JTQYAAAD/////AABBTk1GKAAAAAAAAAAAAAEAAAEAAGQAAAJWUDhMDwAAAC8BQAAQBxD9jwIGIqL/AQBBTk1GKAAAAAAAAAAAAAEAAAEAAGQAAAJWUDhMDwAAAC8BQAAQBxDR/wIGIqL/AQA=";
   var OVERLAY_OPEN_SELECTOR =
-    "[data-book-reader], .lightbox-overlay.is-open, #volo-lightbox.is-open, [data-search-modal]:not([hidden]), #volo-search-modal:not([hidden]), #volo-toc-drawer:not([hidden]), .studio-reader-drawer.is-open, .volo-comment-composer.is-open, dialog[open], body.modal-open";
+    "[data-book-reader], .lightbox-overlay.is-open, #volo-lightbox.is-open, [data-search-modal]:not([hidden]):not(.is-closing), #volo-search-modal:not([hidden]):not(.is-closing), #volo-reader-modal:not([hidden]):not(.is-closing), .studio-reader-drawer.is-open:not(.is-closing), .volo-comment-composer.is-open:not(.is-closing), dialog[open], body.modal-open";
 
   var host =
     (typeof document.getElementById === "function" &&
@@ -56,7 +56,7 @@
     return "/" + parts.map(encodeURIComponent).join("/");
   }
 
-  var version = host.getAttribute("data-version") || "2.0.5";
+  var version = host.getAttribute("data-version") || "2.0.6";
   var CLOSED_KEY = "volo.kanban.closed";
   var staticBase = safeSameOriginMountPath(
     host.getAttribute("data-static-base"),
@@ -96,6 +96,7 @@
   var idleHandle = 0;
   var idleIsRaf = false;
   var overlaySyncRaf = 0;
+  var resizeRaf = 0;
   var dragState = null;
   var lastHoverTarget = null;
   var sakuraPreImg = null;
@@ -187,7 +188,27 @@
       if (document.body && document.body.classList.contains("modal-open")) {
         return true;
       }
-      return !!document.querySelector(OVERLAY_OPEN_SELECTOR);
+      if (document.querySelector(OVERLAY_OPEN_SELECTOR)) {
+        return true;
+      }
+      var tocDrawer =
+        typeof document.getElementById === "function"
+          ? document.getElementById("volo-toc-drawer")
+          : document.querySelector("#volo-toc-drawer");
+      if (
+        tocDrawer &&
+        !tocDrawer.hidden &&
+        !(tocDrawer.classList && tocDrawer.classList.contains("is-closing"))
+      ) {
+        var pe =
+          typeof window.getComputedStyle === "function"
+            ? window.getComputedStyle(tocDrawer).pointerEvents
+            : "";
+        if (pe !== "none") {
+          return true;
+        }
+      }
+      return false;
     } catch (err) {
       return false;
     }
@@ -197,24 +218,33 @@
     if (!tipEl || !host) return;
     tipEl.classList.remove("is-flipped-below", "is-clamped-viewport");
     tipEl.style.removeProperty("--kbn-tip-top");
+    tipEl.style.removeProperty("--kbn-tip-shift-x");
     var hostRect = host.getBoundingClientRect();
     if (!hostRect || (hostRect.width === 0 && hostRect.height === 0)) return;
     var tipHeight = tipEl.offsetHeight || 72;
     var neededSpace = tipHeight + 14;
-    if (hostRect.top >= neededSpace) {
-      return;
+    if (hostRect.top < neededSpace) {
+      var spaceBelow = viewportHeight() - hostRect.bottom;
+      if (spaceBelow >= neededSpace) {
+        tipEl.classList.add("is-flipped-below");
+      } else {
+        var safeTop = Math.round(8 - hostRect.top);
+        if (hostRect.height > tipHeight + 8) {
+          safeTop = Math.min(safeTop, Math.round(hostRect.height - tipHeight - 4));
+        }
+        tipEl.style.setProperty("--kbn-tip-top", safeTop + "px");
+        tipEl.classList.add("is-clamped-viewport");
+      }
     }
-    var spaceBelow = viewportHeight() - hostRect.bottom;
-    if (spaceBelow >= neededSpace) {
-      tipEl.classList.add("is-flipped-below");
-      return;
+    var tipRect = tipEl.getBoundingClientRect();
+    if (tipRect && tipRect.width > 0) {
+      var vw = viewportWidth();
+      if (tipRect.left < 8) {
+        tipEl.style.setProperty("--kbn-tip-shift-x", Math.round(8 - tipRect.left) + "px");
+      } else if (tipRect.right > vw - 8) {
+        tipEl.style.setProperty("--kbn-tip-shift-x", Math.round(vw - 8 - tipRect.right) + "px");
+      }
     }
-    var safeTop = Math.round(8 - hostRect.top);
-    if (hostRect.height > tipHeight + 8) {
-      safeTop = Math.min(safeTop, Math.round(hostRect.height - tipHeight - 4));
-    }
-    tipEl.style.setProperty("--kbn-tip-top", safeTop + "px");
-    tipEl.classList.add("is-clamped-viewport");
   }
 
   function listen(target, type, fn, opts) {
@@ -356,6 +386,42 @@
     return "left";
   }
 
+  function syncDockAttributes() {
+    var root = document.documentElement;
+    if (!root) return;
+    var pos = resolveDockPosition();
+    var dockRight = !!(
+      alive &&
+      host &&
+      pos === "right" &&
+      !host.hidden &&
+      !host.classList.contains("is-closed") &&
+      !host.classList.contains("is-closing") &&
+      host.getAttribute("data-dragged") !== "1" &&
+      !shouldPauseForMobile()
+    );
+    var summonRight = !!(
+      alive &&
+      summonBtn &&
+      !summonBtn.hidden &&
+      pos === "right" &&
+      !shouldPauseForMobile()
+    );
+    if (dockRight) {
+      root.dataset.kbnDock = "right";
+      var reserveW = (host.offsetWidth || 284) + 16;
+      root.style.setProperty("--kbn-dock-reserve-right", reserveW + "px");
+    } else {
+      delete root.dataset.kbnDock;
+      root.style.removeProperty("--kbn-dock-reserve-right");
+    }
+    if (summonRight) {
+      root.dataset.kbnSummonDock = "right";
+    } else {
+      delete root.dataset.kbnSummonDock;
+    }
+  }
+
   function restoreFromSummon() {
     if (!alive || !host) return;
     window.clearTimeout(closeTimer);
@@ -427,6 +493,7 @@
     );
     btn.classList.toggle("is-book-fab-offset", fabOnScreen);
     btn.hidden = !closed || shouldPauseForMobile();
+    syncDockAttributes();
   }
 
   function syncLocale() {
@@ -995,14 +1062,17 @@
       var x = Number(rawX);
       var y = Number(rawY);
       if (isFinite(x) && isFinite(y)) {
-        var clampedX = Math.max(0, Math.min(x, viewportWidth() - 284));
-        var clampedY = Math.max(0, Math.min(y, viewportHeight() - 254));
+        var hostW = host.offsetWidth || 284;
+        var hostH = host.offsetHeight || 254;
+        var clampedX = Math.max(0, Math.min(x, Math.max(0, viewportWidth() - hostW)));
+        var clampedY = Math.max(0, Math.min(y, Math.max(0, viewportHeight() - hostH)));
         host.setAttribute("data-dragged", "1");
         host.style.left = clampedX + "px";
         host.style.top = clampedY + "px";
         host.style.right = "auto";
         host.style.bottom = "auto";
         clampTipToViewport();
+        syncDockAttributes();
         return;
       }
     }
@@ -1033,6 +1103,7 @@
       host.style.removeProperty("bottom");
     }
     clampTipToViewport();
+    syncDockAttributes();
   }
 
   function clearCanvasRemovers() {
@@ -1062,6 +1133,9 @@
     failedModel = "";
     started = false;
     lastHoverTarget = null;
+    if (typeof detachDragListeners === "function") {
+      detachDragListeners();
+    }
     dragState = null;
     clearPreload();
     clearSakuraPreload();
@@ -1085,6 +1159,7 @@
       canvasTainted = true;
       window.loadlive2d.dispose();
     }
+    syncDockAttributes();
   }
 
   function enterLoadError(targetModelName) {
@@ -1208,6 +1283,14 @@
       }
       overlaySyncRaf = 0;
     }
+    if (resizeRaf) {
+      if (typeof window.cancelAnimationFrame === "function") {
+        window.cancelAnimationFrame(resizeRaf);
+      } else {
+        window.clearTimeout(resizeRaf);
+      }
+      resizeRaf = 0;
+    }
     if (abortCtrl) {
       try {
         abortCtrl.abort();
@@ -1216,6 +1299,10 @@
     window.clearTimeout(closeTimer);
     window.clearTimeout(seasonTimer);
     window.clearInterval(chatTimer);
+    if (typeof detachDragListeners === "function") {
+      detachDragListeners();
+    }
+    dragState = null;
     clearCanvasRemovers();
     var list = removers.splice(0);
     for (var i = 0; i < list.length; i++) {
@@ -1324,6 +1411,7 @@
     host.classList.remove("is-closed", "is-closing");
     host.classList.add("is-loading");
     host.hidden = false;
+    syncDockAttributes();
     window.clearTimeout(loadTimer);
     loadTimer = window.setTimeout(function () {
       if (seq === loadSeq) enterLoadError("");
@@ -1502,6 +1590,8 @@
     sSet(CLOSED_KEY, "1");
     sSet("soloKanbanniang", "close");
     host.classList.add("is-closing");
+    syncDockAttributes();
+    var delay = prefersReducedMotion() ? 0 : 180;
     closeTimer = window.setTimeout(function () {
       if (!alive || !host) return;
       host.classList.remove("is-closing");
@@ -1513,7 +1603,7 @@
           summonBtn.focus();
         } catch (err) {}
       }
-    }, 180);
+    }, delay);
   });
 
   listen(window, "volo:kanban-ready", function (ev) {
@@ -1569,21 +1659,44 @@
 
   bindCanvasContextRecovery(host.querySelector("#soloKanbanniang"));
 
+  function handleResize() {
+    resizeRaf = 0;
+    if (!alive) return;
+    scheduleOverlaySync();
+    if (shouldPauseForMobile()) {
+      if (started) pause();
+      syncSummonButton();
+    } else {
+      syncOffsetsAndPosition();
+      syncSummonButton();
+      start();
+    }
+  }
+
   listen(
     window,
     "resize",
     function () {
-      if (shouldPauseForMobile()) {
-        if (started) pause();
-        syncSummonButton();
+      if (resizeRaf) return;
+      if (typeof window.requestAnimationFrame === "function") {
+        resizeRaf = window.requestAnimationFrame(handleResize);
       } else {
-        syncOffsetsAndPosition();
-        syncSummonButton();
-        start();
+        resizeRaf = window.setTimeout(handleResize, 16);
       }
     },
     { passive: true }
   );
+
+  if (typeof window.matchMedia === "function") {
+    try {
+      var rmMedia = window.matchMedia("(prefers-reduced-motion: reduce)");
+      if (rmMedia && typeof rmMedia.addEventListener === "function") {
+        listen(rmMedia, "change", function () {
+          refreshSakuraBackground();
+        });
+      }
+    } catch (err) {}
+  }
 
   listen(document, "volo:pjax:after", function () {
     syncLocale();
@@ -1596,18 +1709,60 @@
   listen(document, "click", scheduleOverlaySync, { passive: true });
   listen(document, "close", scheduleOverlaySync, true);
 
+  function isOverlayMutationTarget(target) {
+    if (!target) return false;
+    if (target === document.documentElement || target === document.body) {
+      return true;
+    }
+    if (host && (target === host || (typeof host.contains === "function" && host.contains(target)))) {
+      return false;
+    }
+    if (summonBtn && (target === summonBtn || (typeof summonBtn.contains === "function" && summonBtn.contains(target)))) {
+      return false;
+    }
+    if (
+      target.id === "volo-search-modal" ||
+      target.id === "volo-toc-drawer" ||
+      target.id === "volo-reader-modal" ||
+      target.id === "volo-lightbox" ||
+      (target.tagName && String(target.tagName).toLowerCase() === "dialog") ||
+      (typeof target.hasAttribute === "function" &&
+        (target.hasAttribute("data-search-modal") ||
+          target.hasAttribute("data-book-reader")))
+    ) {
+      return true;
+    }
+    if (target.classList) {
+      return (
+        target.classList.contains("lightbox-overlay") ||
+        target.classList.contains("volo-modal") ||
+        target.classList.contains("studio-reader-drawer") ||
+        target.classList.contains("volo-comment-composer")
+      );
+    }
+    return false;
+  }
+
   if (typeof MutationObserver === "function") {
-    var rootObserver = new MutationObserver(scheduleOverlaySync);
+    var rootObserver = new MutationObserver(function (mutations) {
+      for (var i = 0; i < mutations.length; i++) {
+        if (isOverlayMutationTarget(mutations[i].target)) {
+          scheduleOverlaySync();
+          return;
+        }
+      }
+    });
     if (document.documentElement) {
       rootObserver.observe(document.documentElement, {
         attributes: true,
-        attributeFilter: ["class", "data-podcast-open"]
+        attributeFilter: ["class", "data-podcast-open", "data-book-reader"]
       });
     }
     if (document.body) {
       rootObserver.observe(document.body, {
+        subtree: true,
         attributes: true,
-        attributeFilter: ["class"]
+        attributeFilter: ["hidden", "open", "class"]
       });
     }
     removers.push(function () {
@@ -1692,6 +1847,69 @@
     { passive: true }
   );
 
+  var dragListenersActive = false;
+
+  function handleDragMove(ev) {
+    if (!dragState || dragState.id !== ev.pointerId) return;
+    var rawDx = ev.clientX - dragState.startX;
+    var rawDy = ev.clientY - dragState.startY;
+    if (!dragState.moved && rawDx * rawDx + rawDy * rawDy <= 25) {
+      return;
+    }
+    if (!dragState.moved) {
+      dragState.moved = true;
+      if (typeof host.setPointerCapture === "function") {
+        try {
+          host.setPointerCapture(ev.pointerId);
+        } catch (err) {}
+      }
+      host.setAttribute("data-dragged", "1");
+      syncDockAttributes();
+      host.style.left = dragState.startLeft + "px";
+      host.style.top = dragState.startTop + "px";
+      host.style.right = "auto";
+      host.style.bottom = "auto";
+      host.style.willChange = "transform";
+    }
+    var clampedX = Math.max(
+      0,
+      Math.min(dragState.startLeft + rawDx, dragState.maxW)
+    );
+    var clampedY = Math.max(
+      0,
+      Math.min(dragState.startTop + rawDy, dragState.maxH)
+    );
+    dragState.nextX = clampedX;
+    dragState.nextY = clampedY;
+    var tx = clampedX - dragState.startLeft;
+    var ty = clampedY - dragState.startTop;
+    host.style.transform = "translate3d(" + tx + "px," + ty + "px,0)";
+  }
+
+  function handleDragUp(ev) {
+    finishPointer(ev, false);
+  }
+
+  function handleDragCancel(ev) {
+    finishPointer(ev, true);
+  }
+
+  function attachDragListeners() {
+    if (dragListenersActive) return;
+    dragListenersActive = true;
+    window.addEventListener("pointermove", handleDragMove, false);
+    window.addEventListener("pointerup", handleDragUp, false);
+    window.addEventListener("pointercancel", handleDragCancel, false);
+  }
+
+  function detachDragListeners() {
+    if (!dragListenersActive) return;
+    dragListenersActive = false;
+    window.removeEventListener("pointermove", handleDragMove, false);
+    window.removeEventListener("pointerup", handleDragUp, false);
+    window.removeEventListener("pointercancel", handleDragCancel, false);
+  }
+
   listen(host, "pointerdown", function (ev) {
     if (ev.button !== 0 && ev.pointerType === "mouse") return;
     if (ev.target && typeof ev.target.closest === "function") {
@@ -1713,48 +1931,14 @@
       moved: false,
       isCanvas: !!(ev.target && ev.target.id === "soloKanbanniang")
     };
-  });
-
-  listen(host, "pointermove", function (ev) {
-    if (!dragState || dragState.id !== ev.pointerId) return;
-    var rawDx = ev.clientX - dragState.startX;
-    var rawDy = ev.clientY - dragState.startY;
-    if (!dragState.moved && rawDx * rawDx + rawDy * rawDy <= 25) {
-      return;
-    }
-    if (!dragState.moved) {
-      dragState.moved = true;
-      if (typeof host.setPointerCapture === "function") {
-        try {
-          host.setPointerCapture(ev.pointerId);
-        } catch (err) {}
-      }
-      host.setAttribute("data-dragged", "1");
-      host.style.left = dragState.startLeft + "px";
-      host.style.top = dragState.startTop + "px";
-      host.style.right = "auto";
-      host.style.bottom = "auto";
-      host.style.willChange = "transform";
-    }
-    var clampedX = Math.max(
-      0,
-      Math.min(dragState.startLeft + rawDx, dragState.maxW)
-    );
-    var clampedY = Math.max(
-      0,
-      Math.min(dragState.startTop + rawDy, dragState.maxH)
-    );
-    dragState.nextX = clampedX;
-    dragState.nextY = clampedY;
-    var tx = clampedX - dragState.startLeft;
-    var ty = clampedY - dragState.startTop;
-    host.style.transform = "translate3d(" + tx + "px," + ty + "px,0)";
+    attachDragListeners();
   });
 
   function finishPointer(ev, isCancel) {
     if (!dragState || dragState.id !== ev.pointerId) return;
     var state = dragState;
     dragState = null;
+    detachDragListeners();
     if (
       typeof host.hasPointerCapture === "function" &&
       typeof host.releasePointerCapture === "function"
@@ -1802,12 +1986,6 @@
     }
   }
 
-  listen(host, "pointerup", function (ev) {
-    finishPointer(ev, false);
-  });
-  listen(host, "pointercancel", function (ev) {
-    finishPointer(ev, true);
-  });
   listen(host, "lostpointercapture", function (ev) {
     finishPointer(ev, true);
   });

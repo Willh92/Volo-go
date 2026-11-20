@@ -32,17 +32,22 @@ import (
 )
 
 const (
-	defaultVMStackLimit      = 512
-	defaultVMPoolCap         = 4
-	defaultVMMaxConcurrency  = 8
-	maxPooledVMUses          = 1000
-	maxPluginFetchBodyBytes  = 4 << 20  // 4 MiB cap on default text outbound HTTP responses (supports full houbb dict sync)
-	maxPluginBinaryBodyBytes = 32 << 20 // 32 MiB cap on binary base64 outbound HTTP request/response bodies
-	maxPluginAssetReadBytes  = 4 << 20  // 4 MiB cap on read-only decompressed plugin asset reads
-	maxPluginRateLimitKeys   = 2048
-	maxCachedWordMatcherSigs = 2
-	remoteDictRawChunkBytes  = 36_000 // Encodes to exactly 48,000 base64 chars (< 64 KiB & < 512 KiB plugin_kv cap)
-	remoteDictBase64ChunkLen = 48_000
+	defaultVMStackLimit        = 512
+	defaultVMPoolCap           = 4
+	defaultVMMaxConcurrency    = defaultVMPoolCap
+	maxPooledVMUses            = 1000
+	maxPluginFetchBodyBytes    = 4 << 20                 // 4 MiB cap on default text outbound HTTP responses (supports full houbb dict sync)
+	maxPluginBinaryBodyBytes   = (maxJSStringBytes / 4) * 3 // 3 MiB cap on binary base64 outbound HTTP bodies (Base64 <= 4 MiB maxJSStringBytes)
+	maxPluginAssetReadBytes    = 4 << 20                 // 4 MiB cap on read-only decompressed plugin asset reads
+	maxPluginAssetsExistsBatch = 4096
+	maxPluginMemoEntries       = 64
+	maxPluginMemoKeyBytes      = 256
+	maxPluginMemoValueBytes    = 512 << 10 // 512 KiB per memo value
+	maxPluginMemoTotalBytes    = 2 << 20   // 2 MiB total memo budget per runtime
+	maxPluginRateLimitKeys     = 2048
+	maxCachedWordMatcherSigs   = 2
+	remoteDictRawChunkBytes    = 36_000 // Encodes to exactly 48,000 base64 chars (< 64 KiB & < 512 KiB plugin_kv cap)
+	remoteDictBase64ChunkLen   = 48_000
 )
 
 // ErrExecutionTimeout is returned when a plugin hook, route, slot, or cron exceeds its time budget.
@@ -67,8 +72,9 @@ type pooledVM struct {
 	federationDeliver *jsFunc
 	hooksFrozen       bool
 	uses              int
+	poolGen           uint64
 	reqCtx            context.Context
-	setNativeBudget   func(time.Duration)
+	setNativeBudget   func(time.Duration) context.Context
 }
 
 type pluginRateBucket struct {
@@ -84,6 +90,13 @@ type runtimeSanitizerConfig struct {
 	contentSig    string
 	nicknameSig   string
 	checkNickname bool
+}
+
+type assetFlightCall struct {
+	wg   sync.WaitGroup
+	data []byte
+	ok   bool
+	err  error
 }
 
 type gojaPluginRuntime struct {
@@ -119,8 +132,17 @@ type gojaPluginRuntime struct {
 	rateMu      sync.Mutex
 	rateBuckets map[string]pluginRateBucket
 
-	pool chan *pooledVM
-	sem  chan struct{}
+	assetFlightMu sync.Mutex
+	assetFlights  map[string]*assetFlightCall
+
+	memoMu    sync.RWMutex
+	memo      map[string]string
+	memoOrder []string
+	memoBytes int
+
+	poolGen atomic.Uint64
+	pool    chan *pooledVM
+	sem     chan struct{}
 }
 
 type gojaRuntimeOptions struct {
@@ -268,6 +290,7 @@ func (r *gojaPluginRuntime) resolveRuntimeConfigValue(v any) any {
 
 func (r *gojaPluginRuntime) createVM() (pvm *pooledVM, err error) {
 	r.vmCreatedCount.Add(1)
+	curPoolGen := r.poolGen.Load()
 	vm := newJSRuntime()
 	vm.SetMaxCallStackSize(defaultVMStackLimit)
 
@@ -275,6 +298,7 @@ func (r *gojaPluginRuntime) createVM() (pvm *pooledVM, err error) {
 		vm:                vm,
 		hookHandlers:      make(map[string][]*jsFunc),
 		directiveHandlers: make(map[string]*jsFunc),
+		poolGen:           curPoolGen,
 	}
 
 	// Inject safe console object wired to isolated JSONL plugin logger.
@@ -391,22 +415,54 @@ func (r *gojaPluginRuntime) createVM() (pvm *pooledVM, err error) {
 	}
 
 	cfgObj := vm.NewObject()
-	cfgObj.Set("get", func(key string) any {
+	cfgObj.setVal("get", nativeVal(func(_ *jsRuntime, _ jsValue, args []jsValue) (jsValue, error) {
+		key := ""
+		if len(args) >= 1 && args[0].kind != valUndefined && args[0].kind != valNull {
+			key = args[0].toString()
+		}
 		cfg := r.getConfig()
 		if cfg == nil {
-			return nil
+			return jsNullVal, nil
 		}
-		return r.resolveRuntimeConfigValue(cfg[key])
-	})
-	cfgObj.Set("all", func() map[string]any {
+		return goToJSValue(r.resolveRuntimeConfigValue(cfg[key])), nil
+	}))
+	cfgObj.setVal("all", nativeVal(func(_ *jsRuntime, _ jsValue, _ []jsValue) (jsValue, error) {
 		cfg := r.getConfig()
-		out := make(map[string]any, len(cfg))
-		for k, v := range cfg {
-			out[k] = r.resolveRuntimeConfigValue(v)
+		if len(cfg) > maxJSObjectKeys {
+			throwConversionRangeError("Maximum converted JS object keys exceeded")
 		}
-		return out
-	})
-	voloObj.Set("config", cfgObj)
+		props := make(map[string]jsValue, len(cfg))
+		nodes := 0
+		for k, v := range cfg {
+			props[k] = goToJSValueBounded(r.resolveRuntimeConfigValue(v), 1, &nodes)
+		}
+		return jsValue{kind: valObject, obj: &jsObject{props: props}}, nil
+	}))
+	voloObj.setVal("config", jsValue{kind: valObject, obj: cfgObj})
+
+	memoBridge := vm.NewObject()
+	memoBridge.setVal("get", nativeVal(func(_ *jsRuntime, _ jsValue, args []jsValue) (jsValue, error) {
+		if len(args) < 1 || args[0].kind == valUndefined || args[0].kind == valNull {
+			return jsUndefinedVal, nil
+		}
+		if v, ok := r.getMemo(args[0].toString()); ok {
+			return jsValue{kind: valString, str: v}, nil
+		}
+		return jsUndefinedVal, nil
+	}))
+	memoBridge.setVal("set", nativeVal(func(_ *jsRuntime, _ jsValue, args []jsValue) (jsValue, error) {
+		if len(args) < 2 || args[0].kind == valUndefined || args[0].kind == valNull || args[1].kind != valString {
+			return jsFalseVal, nil
+		}
+		return boolVal(r.setMemo(args[0].toString(), args[1].str)), nil
+	}))
+	memoBridge.setVal("delete", nativeVal(func(_ *jsRuntime, _ jsValue, args []jsValue) (jsValue, error) {
+		if len(args) >= 1 && args[0].kind != valUndefined && args[0].kind != valNull {
+			r.deleteMemo(args[0].toString())
+		}
+		return jsUndefinedVal, nil
+	}))
+	voloObj.setVal("memo", jsValue{kind: valObject, obj: memoBridge})
 
 	logBridge := vm.NewObject()
 	logBridge.setVal("info", nativeVal(logFn("info")))
@@ -500,24 +556,41 @@ func (r *gojaPluginRuntime) createVM() (pvm *pooledVM, err error) {
 	// Capability 1: plugin_kv (ONLY injected if manifest declares kv / kv:rw / kv:read).
 	if r.manifest.CanReadKV() && r.kv != nil {
 		kvBridge := vm.NewObject()
-		kvBridge.Set("get", func(key string) (any, error) {
+		kvBridge.setVal("get", nativeVal(func(callRT *jsRuntime, _ jsValue, args []jsValue) (jsValue, error) {
+			key := ""
+			if len(args) >= 1 && args[0].kind != valUndefined && args[0].kind != valNull {
+				key = args[0].toString()
+			}
 			val, ok, gErr := r.kv.Get(wrapper.activeCtx(), key)
 			if gErr != nil {
-				return nil, gErr
+				return nativeBridgeErr(callRT, gErr)
+			}
+			if callRT != nil && callRT.interrupted.Load() {
+				return jsUndefinedVal, &jsInterruptedError{cause: callRT.loadInterruptCause()}
 			}
 			if !ok {
-				return nil, nil
+				return jsNullVal, nil
 			}
-			return val, nil
-		})
-		kvBridge.Set("getInt", func(key string) (int64, error) {
+			return jsValue{kind: valString, str: val}, nil
+		}))
+		kvBridge.setVal("getInt", nativeVal(func(callRT *jsRuntime, _ jsValue, args []jsValue) (jsValue, error) {
+			key := ""
+			if len(args) >= 1 && args[0].kind != valUndefined && args[0].kind != valNull {
+				key = args[0].toString()
+			}
 			val, ok, gErr := r.kv.Get(wrapper.activeCtx(), key)
-			if gErr != nil || !ok {
-				return 0, gErr
+			if gErr != nil {
+				return nativeBridgeErr(callRT, gErr)
+			}
+			if callRT != nil && callRT.interrupted.Load() {
+				return jsUndefinedVal, &jsInterruptedError{cause: callRT.loadInterruptCause()}
+			}
+			if !ok {
+				return jsValue{kind: valNumber, num: 0}, nil
 			}
 			n, _ := strconv.ParseInt(strings.TrimSpace(val), 10, 64)
-			return n, nil
-		})
+			return jsValue{kind: valNumber, num: float64(n)}, nil
+		}))
 		kvBridge.Set("list", func(prefix string, limit int, afterKey string) ([]KVItem, error) {
 			return r.kv.ListPrefix(wrapper.activeCtx(), prefix, limit, afterKey)
 		})
@@ -579,22 +652,40 @@ func (r *gojaPluginRuntime) createVM() (pvm *pooledVM, err error) {
 
 	// Sandboxed read-only package asset bridge confined strictly to r.pluginDir (supports transparent .gz decompression).
 	if r.pluginDir != "" {
-		readTextFn := func(relPath string) (string, error) {
-			return r.readAssetText(relPath)
-		}
+		readTextNative := nativeVal(func(callRT *jsRuntime, _ jsValue, args []jsValue) (jsValue, error) {
+			relPath := ""
+			if len(args) >= 1 && args[0].kind != valUndefined && args[0].kind != valNull {
+				relPath = args[0].toString()
+			}
+			txt, rErr := r.readAssetText(relPath)
+			if rErr != nil {
+				return nativeBridgeErr(callRT, rErr)
+			}
+			if callRT != nil && callRT.interrupted.Load() {
+				return jsUndefinedVal, &jsInterruptedError{cause: callRT.loadInterruptCause()}
+			}
+			return jsValue{kind: valString, str: txt}, nil
+		})
 		assetsBridge := vm.NewObject()
-		assetsBridge.Set("readText", readTextFn)
-		assetsBridge.Set("readJSON", func(relPath string) (any, error) {
+		assetsBridge.setVal("readText", readTextNative)
+		assetsBridge.setVal("readJSON", nativeVal(func(callRT *jsRuntime, _ jsValue, args []jsValue) (jsValue, error) {
+			relPath := ""
+			if len(args) >= 1 && args[0].kind != valUndefined && args[0].kind != valNull {
+				relPath = args[0].toString()
+			}
 			raw, rErr := r.readAssetBytes(relPath)
 			if rErr != nil {
-				return nil, rErr
+				return nativeBridgeErr(callRT, rErr)
+			}
+			if callRT != nil && callRT.interrupted.Load() {
+				return jsUndefinedVal, &jsInterruptedError{cause: callRT.loadInterruptCause()}
 			}
 			var parsed any
 			if uErr := json.Unmarshal(raw, &parsed); uErr != nil {
-				return nil, fmt.Errorf("plugin asset %q: invalid JSON: %w", relPath, uErr)
+				return nativeBridgeErr(callRT, fmt.Errorf("plugin asset %q: invalid JSON: %w", relPath, uErr))
 			}
-			return parsed, nil
-		})
+			return goToJSValue(parsed), nil
+		}))
 		assetsBridge.setVal("exists", nativeVal(func(_ *jsRuntime, _ jsValue, args []jsValue) (jsValue, error) {
 			if len(args) < 1 || args[0].kind == valUndefined || args[0].kind == valNull {
 				return jsFalseVal, nil
@@ -604,13 +695,41 @@ func (r *gojaPluginRuntime) createVM() (pvm *pooledVM, err error) {
 			}
 			return jsFalseVal, nil
 		}))
-		voloObj.Set("readAsset", readTextFn)
-		voloObj.Set("assets", assetsBridge)
+		assetsBridge.setVal("existsAll", nativeVal(func(_ *jsRuntime, _ jsValue, args []jsValue) (jsValue, error) {
+			if len(args) < 1 || args[0].kind != valArray || args[0].arr == nil {
+				return jsFalseVal, nil
+			}
+			items := args[0].arr.items
+			if len(items) == 0 {
+				return jsTrueVal, nil
+			}
+			if len(items) > maxPluginAssetsExistsBatch {
+				return jsFalseVal, nil
+			}
+			seen := make(map[string]struct{}, len(items))
+			for _, item := range items {
+				if item.kind == valUndefined || item.kind == valNull {
+					return jsFalseVal, nil
+				}
+				p := item.toString()
+				if _, dup := seen[p]; dup {
+					continue
+				}
+				seen[p] = struct{}{}
+				if !r.pluginAssetExists(p) {
+					return jsFalseVal, nil
+				}
+			}
+			return jsTrueVal, nil
+		}))
+		voloObj.setVal("readAsset", readTextNative)
+		voloObj.setVal("assets", jsValue{kind: valObject, obj: assetsBridge})
 	}
 
 	// Cross-VM shared native Aho-Corasick wordFilter bridge (zero per-VM trie duplication & zero reflection on hot path).
 	wfBridge := vm.NewObject()
 	noMatchObj := &jsObject{
+		frozen: true,
 		props: map[string]jsValue{
 			"matched":  jsFalseVal,
 			"word":     {kind: valString},
@@ -663,6 +782,7 @@ func (r *gojaPluginRuntime) createVM() (pvm *pooledVM, err error) {
 				noMatchObj.props["word"].kind != valString || noMatchObj.props["word"].str != "" ||
 				noMatchObj.props["category"].kind != valString || noMatchObj.props["category"].str != "" {
 				noMatchObj = &jsObject{
+					frozen: true,
 					props: map[string]jsValue{
 						"matched":  jsFalseVal,
 						"word":     {kind: valString},
@@ -800,21 +920,24 @@ func (r *gojaPluginRuntime) createVM() (pvm *pooledVM, err error) {
 	if _, runErr := vm.RunProgram(r.program); runErr != nil {
 		return nil, normalizeJSError(r.manifest.ID, "init", runErr)
 	}
+	timer.Stop()
+	vm.ClearInterrupt()
 	wrapper.hooksFrozen = true
 
-	// Shallow-freeze host bridge namespaces and builtin prototypes, and snapshot post-init globals
-	// so pooled VMs cannot leak prototype or globalThis mutations across invocations.
-	for _, pv := range voloObj.props {
-		if pv.kind == valObject && pv.obj != nil && pv.obj.scope == nil {
-			pv.obj.frozen = true
-		} else if pv.kind == valFunc && pv.fn != nil {
-			pv.fn.frozenProps = true
-		}
-	}
+	// Recursively freeze host bridge namespaces, console, module, and builtin prototypes,
+	// and snapshot post-init globals so pooled VMs cannot leak mutations across invocations.
+	seenObj := make(map[*jsObject]bool, 16)
+	seenFn := make(map[*jsFunc]bool, 48)
+	seenArr := make(map[*jsArray]bool, 8)
+	freezeBuiltinValue(jsValue{kind: valObject, obj: voloObj}, seenObj, seenFn, seenArr)
+	freezeBuiltinValue(jsValue{kind: valObject, obj: consoleObj}, seenObj, seenFn, seenArr)
+	freezeBuiltinValue(jsValue{kind: valObject, obj: moduleObj}, seenObj, seenFn, seenArr)
 	if vm.builtinGlobals != nil {
 		vm.builtinGlobals["console"] = jsValue{kind: valObject, obj: consoleObj}
 		vm.builtinGlobals["volo"] = jsValue{kind: valObject, obj: voloObj}
 		vm.builtinGlobals["ctx"] = jsValue{kind: valObject, obj: voloObj}
+		vm.builtinGlobals["module"] = jsValue{kind: valObject, obj: moduleObj}
+		vm.builtinGlobals["exports"] = vm.Get("exports")
 	}
 	vm.snapshotPostInit()
 
@@ -910,6 +1033,31 @@ func (r *gojaPluginRuntime) openConfinedAssetFile(relPath string) (*os.File, err
 	return f, nil
 }
 
+func (r *gojaPluginRuntime) coalesceAssetCall(key string, fn func() ([]byte, bool, error)) ([]byte, bool, error) {
+	r.assetFlightMu.Lock()
+	if c, exists := r.assetFlights[key]; exists {
+		r.assetFlightMu.Unlock()
+		c.wg.Wait()
+		return c.data, c.ok, c.err
+	}
+	c := &assetFlightCall{}
+	c.wg.Add(1)
+	if r.assetFlights == nil {
+		r.assetFlights = make(map[string]*assetFlightCall)
+	}
+	r.assetFlights[key] = c
+	r.assetFlightMu.Unlock()
+
+	defer func() {
+		r.assetFlightMu.Lock()
+		delete(r.assetFlights, key)
+		r.assetFlightMu.Unlock()
+		c.wg.Done()
+	}()
+	c.data, c.ok, c.err = fn()
+	return c.data, c.ok, c.err
+}
+
 func (r *gojaPluginRuntime) pluginAssetExists(relPath string) bool {
 	if r.pluginDir == "" {
 		return false
@@ -919,13 +1067,16 @@ func (r *gojaPluginRuntime) pluginAssetExists(relPath string) bool {
 	if err != nil {
 		return false
 	}
-	f, err := os.OpenInRoot(r.pluginDir, filepath.FromSlash(cleanRel))
-	if err != nil {
-		return false
-	}
-	st, sErr := f.Stat()
-	_ = f.Close()
-	return sErr == nil && st.Mode().IsRegular() && st.Size() <= MaxZipSingleBytes
+	_, ok, _ := r.coalesceAssetCall("exists:"+cleanRel, func() ([]byte, bool, error) {
+		f, err := os.OpenInRoot(r.pluginDir, filepath.FromSlash(cleanRel))
+		if err != nil {
+			return nil, false, nil
+		}
+		st, sErr := f.Stat()
+		_ = f.Close()
+		return nil, sErr == nil && st.Mode().IsRegular() && st.Size() <= MaxZipSingleBytes, nil
+	})
+	return ok
 }
 
 func (r *gojaPluginRuntime) resolvePluginAssetPath(relPath string) (string, error) {
@@ -962,20 +1113,34 @@ func (r *gojaPluginRuntime) openConfinedAssetReader(relPath string) (io.ReadClos
 }
 
 func (r *gojaPluginRuntime) readAssetBytes(relPath string) ([]byte, error) {
-	rc, err := r.openConfinedAssetReader(relPath)
-	if err != nil {
-		return nil, err
+	if r.pluginDir == "" {
+		return nil, errors.New("plugin directory unavailable")
 	}
-	defer rc.Close()
+	trimmed := strings.TrimPrefix(strings.TrimSpace(relPath), "./")
+	cleanRel, err := sanitizeRelativeAssetPath(trimmed)
+	if err != nil {
+		return nil, fmt.Errorf("plugin asset %q: %w", relPath, err)
+	}
+	data, _, err := r.coalesceAssetCall("read:"+cleanRel, func() ([]byte, bool, error) {
+		rc, err := r.openConfinedAssetReader(relPath)
+		if err != nil {
+			return nil, false, err
+		}
+		defer rc.Close()
 
-	data, err := io.ReadAll(rc)
+		raw, err := io.ReadAll(rc)
+		if err != nil {
+			return nil, false, err
+		}
+		if len(raw) > maxPluginAssetReadBytes {
+			return nil, false, fmt.Errorf("plugin asset %q: exceeds %d MiB decompressed limit", relPath, maxPluginAssetReadBytes>>20)
+		}
+		return raw, true, nil
+	})
 	if err != nil {
 		return nil, err
 	}
-	if len(data) > maxPluginAssetReadBytes {
-		return nil, fmt.Errorf("plugin asset %q: exceeds %d MiB decompressed limit", relPath, maxPluginAssetReadBytes>>20)
-	}
-	return data, nil
+	return bytes.Clone(data), nil
 }
 
 func (r *gojaPluginRuntime) readAssetText(relPath string) (string, error) {
@@ -1120,15 +1285,18 @@ func (r *gojaPluginRuntime) loadRemoteGzipReader(ctx context.Context, kvPrefix s
 	return &meta, io.NopCloser(bytes.NewReader(plainBuf.Bytes())), nil
 }
 
-func (r *gojaPluginRuntime) compileWordMatcher(ctx context.Context, sig string, spec map[string]any, setBudget func(time.Duration)) (map[string]any, error) {
+func (r *gojaPluginRuntime) compileWordMatcher(ctx context.Context, sig string, spec map[string]any, setBudget func(time.Duration) context.Context) (map[string]any, error) {
 	key := strings.TrimSpace(sig)
 	if key == "" || len(key) > 256 {
 		return nil, errors.New("volo.wordFilter.compile: signature must be 1..256 characters")
 	}
 
 	if setBudget != nil {
-		setBudget(3 * time.Second)
+		ctx = setBudget(3 * time.Second)
 		defer setBudget(0)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 
 	r.wordCompileMu.Lock()
@@ -1262,6 +1430,9 @@ func (r *gojaPluginRuntime) compileWordMatcher(ctx context.Context, sig string, 
 		}
 	}
 
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	compiled := bld.Build()
 	nsPrefix := wordSigNamespace(key)
 
@@ -1301,13 +1472,16 @@ func wordSigNamespace(sig string) string {
 // syncRemoteWordDict fetches an upstream dictionary (such as houbb/sensitive-word-data's
 // sensitive_word_dict.txt), streams & sanitizes/deduplicates/tag-enriches it natively in Go without
 // allocating huge JS strings, persists compressed base64 chunks in plugin_kv, and bumps wordRev.
-func (r *gojaPluginRuntime) syncRemoteWordDict(ctx context.Context, opts map[string]any, setBudget func(time.Duration)) (map[string]any, error) {
+func (r *gojaPluginRuntime) syncRemoteWordDict(ctx context.Context, opts map[string]any, setBudget func(time.Duration) context.Context) (map[string]any, error) {
 	if !r.httpEnabled || !r.manifest.CanWriteKV() || r.kv == nil {
 		return nil, errors.New("volo.wordFilter.syncRemote requires outbound HTTP and KV write permissions")
 	}
 	if setBudget != nil {
-		setBudget(12 * time.Second)
+		ctx = setBudget(12 * time.Second)
 		defer setBudget(0)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	rawURL, _ := opts["url"].(string)
 	rawURL = strings.TrimSpace(rawURL)
@@ -1627,6 +1801,7 @@ func (r *gojaPluginRuntime) resetPool() {
 	if r == nil {
 		return
 	}
+	r.poolGen.Add(1)
 	for {
 		select {
 		case <-r.pool:
@@ -1636,11 +1811,134 @@ func (r *gojaPluginRuntime) resetPool() {
 	}
 }
 
+func (r *gojaPluginRuntime) warmPool(ctx context.Context, target int) {
+	if r == nil || target <= 0 {
+		return
+	}
+	if capPool := cap(r.pool); target > capPool {
+		target = capPool
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	curGen := r.poolGen.Load()
+	for i := 0; i < target; i++ {
+		if ctx.Err() != nil || r.poolGen.Load() != curGen {
+			return
+		}
+		pvm, err := r.createVM()
+		if err != nil {
+			return
+		}
+		if ctx.Err() != nil || pvm.poolGen != r.poolGen.Load() {
+			return
+		}
+		select {
+		case r.pool <- pvm:
+		default:
+			return
+		}
+	}
+}
+
+func (r *gojaPluginRuntime) getMemo(key string) (string, bool) {
+	if r == nil || key == "" || len(key) > maxPluginMemoKeyBytes {
+		return "", false
+	}
+	r.memoMu.RLock()
+	val, ok := r.memo[key]
+	r.memoMu.RUnlock()
+	return val, ok
+}
+
+func (r *gojaPluginRuntime) setMemo(key string, val string) bool {
+	if r == nil || key == "" || len(key) > maxPluginMemoKeyBytes || len(val) > maxPluginMemoValueBytes {
+		return false
+	}
+	entryBytes := len(key) + len(val)
+	if entryBytes > maxPluginMemoTotalBytes {
+		return false
+	}
+	r.memoMu.Lock()
+	defer r.memoMu.Unlock()
+	if r.memo == nil {
+		r.memo = make(map[string]string)
+	}
+	if old, exists := r.memo[key]; exists {
+		if old == val {
+			return true
+		}
+		delete(r.memo, key)
+		r.memoBytes -= len(key) + len(old)
+		for i, k := range r.memoOrder {
+			if k == key {
+				r.memoOrder = append(r.memoOrder[:i], r.memoOrder[i+1:]...)
+				break
+			}
+		}
+	}
+	for (len(r.memo) >= maxPluginMemoEntries || r.memoBytes+entryBytes > maxPluginMemoTotalBytes) && len(r.memoOrder) > 0 {
+		oldest := r.memoOrder[0]
+		r.memoOrder = r.memoOrder[1:]
+		if ov, ok := r.memo[oldest]; ok {
+			delete(r.memo, oldest)
+			r.memoBytes -= len(oldest) + len(ov)
+		}
+	}
+	if len(r.memo) >= maxPluginMemoEntries || r.memoBytes+entryBytes > maxPluginMemoTotalBytes {
+		return false
+	}
+	r.memo[key] = val
+	r.memoOrder = append(r.memoOrder, key)
+	r.memoBytes += entryBytes
+	return true
+}
+
+func (r *gojaPluginRuntime) deleteMemo(key string) {
+	if r == nil || key == "" {
+		return
+	}
+	r.memoMu.Lock()
+	defer r.memoMu.Unlock()
+	if old, ok := r.memo[key]; ok {
+		delete(r.memo, key)
+		r.memoBytes -= len(key) + len(old)
+		for i, k := range r.memoOrder {
+			if k == key {
+				r.memoOrder = append(r.memoOrder[:i], r.memoOrder[i+1:]...)
+				break
+			}
+		}
+	}
+}
+
+func (r *gojaPluginRuntime) clearMemo() {
+	if r == nil {
+		return
+	}
+	r.memoMu.Lock()
+	r.memo = nil
+	r.memoOrder = nil
+	r.memoBytes = 0
+	r.memoMu.Unlock()
+}
+
+func nativeBridgeErr(callRT *jsRuntime, err error) (jsValue, error) {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, ErrExecutionTimeout) {
+		if callRT != nil {
+			callRT.Interrupt(err)
+		}
+		return jsUndefinedVal, &jsInterruptedError{cause: err}
+	}
+	return jsUndefinedVal, &jsThrownError{val: callRT.newErrorVal("Error", err.Error())}
+}
+
 func (r *gojaPluginRuntime) closeRuntime() {
 	if r == nil {
 		return
 	}
 	r.clearWordMatchers()
+	r.clearMemo()
 	r.resetHTTPClient()
 	r.resetPool()
 }
@@ -1895,10 +2193,21 @@ func (r *gojaPluginRuntime) hasCallable(fnName string) bool {
 	if r == nil {
 		return false
 	}
+	curGen := r.poolGen.Load()
 	var pvm *pooledVM
-	select {
-	case pvm = <-r.pool:
-	default:
+	for {
+		select {
+		case cand := <-r.pool:
+			if cand != nil && cand.poolGen == curGen {
+				pvm = cand
+			} else {
+				continue
+			}
+		default:
+		}
+		break
+	}
+	if pvm == nil {
 		created, err := r.createVM()
 		if err != nil {
 			return false
@@ -1906,7 +2215,7 @@ func (r *gojaPluginRuntime) hasCallable(fnName string) bool {
 		pvm = created
 	}
 	defer func() {
-		if pvm.uses < maxPooledVMUses {
+		if pvm.uses < maxPooledVMUses && pvm.poolGen == r.poolGen.Load() {
 			pvm.vm.restorePostInit()
 			select {
 			case r.pool <- pvm:
@@ -1927,24 +2236,134 @@ func (r *gojaPluginRuntime) withPooledVM(
 	if timeout <= 0 {
 		timeout = 500 * time.Millisecond
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if cErr := ctx.Err(); cErr != nil {
+		return nil, false, cErr
+	}
+	semTimeout := timeout * 2
+	if semTimeout < timeout {
+		semTimeout = timeout
+	}
+	semCtx, semCancel := context.WithTimeout(ctx, semTimeout)
 	select {
 	case r.sem <- struct{}{}:
+		semCancel()
 		defer func() { <-r.sem }()
-	case <-ctx.Done():
-		return nil, false, ctx.Err()
+	case <-semCtx.Done():
+		semCancel()
+		if cErr := ctx.Err(); cErr != nil {
+			return nil, false, cErr
+		}
+		return nil, false, semCtx.Err()
+	}
+	if cErr := ctx.Err(); cErr != nil {
+		return nil, false, cErr
 	}
 
+	curGen := r.poolGen.Load()
 	var pvm *pooledVM
-	select {
-	case pvm = <-r.pool:
-	default:
+	for {
+		select {
+		case cand := <-r.pool:
+			if cand != nil && cand.poolGen == curGen {
+				pvm = cand
+			} else {
+				continue
+			}
+		default:
+		}
+		break
+	}
+	if pvm == nil {
 		created, cErr := r.createVM()
 		if cErr != nil {
 			return nil, false, cErr
 		}
 		pvm = created
+		if cErr := ctx.Err(); cErr != nil {
+			if pvm.uses < maxPooledVMUses && pvm.poolGen == r.poolGen.Load() {
+				select {
+				case r.pool <- pvm:
+				default:
+				}
+			}
+			return nil, false, cErr
+		}
 	}
 	pvm.uses++
+
+	baseCtx := ctx
+	baseDeadline := time.Now().Add(timeout)
+	execCtx, execCancel := context.WithDeadline(baseCtx, baseDeadline)
+
+	vm := pvm.vm
+	vm.ClearInterrupt()
+	vm.setExecBudget(baseCtx, execCtx, baseDeadline)
+	pvm.reqCtx = execCtx
+
+	var nativeCancel context.CancelFunc
+	var tailGranted bool
+	pvm.setNativeBudget = func(d time.Duration) context.Context {
+		if nativeCancel != nil {
+			nativeCancel()
+			nativeCancel = nil
+		}
+		if d > 0 {
+			if tailGranted || execCtx.Err() != nil {
+				pvm.reqCtx = execCtx
+				return execCtx
+			}
+			if d > timeout {
+				nativeDeadline := time.Now().Add(d)
+				nativeCtx, nCancel := context.WithDeadline(baseCtx, nativeDeadline)
+				nativeCancel = nCancel
+				pvm.reqCtx = nativeCtx
+				vm.setExecBudget(baseCtx, nativeCtx, nativeDeadline)
+				return nativeCtx
+			}
+			pvm.reqCtx = execCtx
+			return execCtx
+		}
+		// d <= 0: restore baseline budget after native call completes.
+		if execCtx.Err() == nil {
+			if rem := time.Until(baseDeadline); rem > 0 {
+				pvm.reqCtx = execCtx
+				vm.setExecBudget(baseCtx, execCtx, baseDeadline)
+				return execCtx
+			}
+		}
+		// Grant at most one small bounded tail from baseCtx if a legitimate first
+		// native operation (e.g. 64k word compile) outlasted a short hookTimeout.
+		if !tailGranted && baseCtx.Err() == nil {
+			tailGranted = true
+			tail := timeout
+			if tail > 250*time.Millisecond {
+				tail = 250 * time.Millisecond
+			}
+			tailDeadline := time.Now().Add(tail)
+			tailCtx, tCancel := context.WithDeadline(baseCtx, tailDeadline)
+			if execCancel != nil {
+				execCancel()
+			}
+			execCtx = tailCtx
+			execCancel = tCancel
+			baseDeadline = tailDeadline
+			pvm.reqCtx = execCtx
+			vm.setExecBudget(baseCtx, execCtx, tailDeadline)
+			return execCtx
+		}
+		pvm.reqCtx = execCtx
+		if err := baseCtx.Err(); err != nil {
+			vm.Interrupt(err)
+		} else if err := execCtx.Err(); err != nil && !errors.Is(err, context.DeadlineExceeded) {
+			vm.Interrupt(err)
+		} else {
+			vm.Interrupt(ErrExecutionTimeout)
+		}
+		return execCtx
+	}
 
 	tainted := false
 	defer func() {
@@ -1952,61 +2371,25 @@ func (r *gojaPluginRuntime) withPooledVM(
 			tainted = true
 			err = fmt.Errorf("plugin %q: panic in %s: %v", r.manifest.ID, stage, rec)
 		}
+		if nativeCancel != nil {
+			nativeCancel()
+			nativeCancel = nil
+		}
+		if execCancel != nil {
+			execCancel()
+			execCancel = nil
+		}
+		vm.clearExecBudget()
+		vm.ClearInterrupt()
 		pvm.reqCtx = nil
 		pvm.setNativeBudget = nil
-		if !tainted && err == nil && pvm.uses < maxPooledVMUses {
-			pvm.vm.restorePostInit()
+		if !tainted && err == nil && pvm.uses < maxPooledVMUses && pvm.poolGen == r.poolGen.Load() {
+			vm.restorePostInit()
 			select {
 			case r.pool <- pvm:
 			default:
 			}
 		}
-	}()
-
-	vm := pvm.vm
-	vm.ClearInterrupt()
-	pvm.reqCtx = ctx
-
-	var intMu sync.Mutex
-	finished := false
-	interruptVM := func(cause error) {
-		intMu.Lock()
-		if !finished {
-			vm.Interrupt(cause)
-		}
-		intMu.Unlock()
-	}
-
-	done := make(chan struct{})
-	timer := time.AfterFunc(timeout, func() {
-		interruptVM(ErrExecutionTimeout)
-	})
-	pvm.setNativeBudget = func(d time.Duration) {
-		intMu.Lock()
-		if !finished {
-			next := timeout
-			if d > next {
-				next = d
-			}
-			timer.Reset(next)
-		}
-		intMu.Unlock()
-	}
-	if ctx.Done() != nil {
-		go func() {
-			select {
-			case <-ctx.Done():
-				interruptVM(ctx.Err())
-			case <-done:
-			}
-		}()
-	}
-	defer func() {
-		timer.Stop()
-		intMu.Lock()
-		finished = true
-		intMu.Unlock()
-		close(done)
 	}()
 
 	out, found, tainted, err = run(pvm)
@@ -2420,6 +2803,9 @@ func normalizeJSError(pluginID string, stage string, err error) error {
 		valStr := fmt.Sprint(interrupted.Value())
 		if strings.Contains(valStr, ErrExecutionTimeout.Error()) {
 			return fmt.Errorf("plugin %q (%s): %w", pluginID, stage, ErrExecutionTimeout)
+		}
+		if causeErr, ok := interrupted.Value().(error); ok {
+			return fmt.Errorf("plugin %q (%s): interrupted: %w", pluginID, stage, causeErr)
 		}
 		return fmt.Errorf("plugin %q (%s): interrupted: %s", pluginID, stage, valStr)
 	}

@@ -369,11 +369,11 @@ function renderSlot(slotName) {
 | 类型 / ID | 最新版本 | 分发策略 | 核心包 / Docker 默认内置 | 核心特性说明 |
 | :--- | :---: | :--- | :---: | :--- |
 | 插件 [`sensitive-words`](../../plugins/sensitive-words/) | **`v1.1.0`** | `bundled` + `plugin-sensitive-words-v1.1.0.zip` | 是 | 6.4 万级分类敏感词库 + 宿主 16B/状态 BFS-CSR Aho-Corasick 自动机，支持一键在线热更新。 |
-| 插件 [`kanbanniang`](../../plugins/kanbanniang/) | **`v2.0.5`** | `standalone-release`（`plugin-kanbanniang-v2.0.5.zip`） | 否（按需直装） | 完整内置 26 套离线 Live2D 模型、Pio/Tia 150 套随机换装、7 键工具栏、边角最小化/召唤胶囊、加载失败手动重试卡片与摸头计数（纯 `.webp` 轻量化归档约 `35.5 MiB`）。 |
-| 主题 [`volo-journal`](../../themes/volo-journal/) | **`v1.1.1`** | `bundled` + `theme-volo-journal-v1.1.1.zip` | 是 | 经典纸刊杂志双栏主题，支持独立热更新与桌面/手机双主题分流。 |
-| 语言包 [`zh-TW`](../../locales/zh-TW.json) / [`ja-JP`](../../locales/ja-JP.json) | **`v1.0.0+`** | `locales/catalog.json`（一键在线直装） | 随仓提供 + 官方源直装 | 完整繁體中文与日本語前台 + 后台双层全量词典，支持 `POST /api/admin/locales/install-url` 免重启即时热激活。 |
+| 插件 [`kanbanniang`](../../plugins/kanbanniang/) | **`v2.0.6`** | `standalone-release`（`plugin-kanbanniang-v2.0.6.zip`） | 否（按需直装） | 完整内置 26 套离线 Live2D 模型、Pio/Tia 150 套随机换装、7 键工具栏、边角最小化/召唤胶囊、桌面端目录抽屉无遮挡协同、加载失败手动重试卡片与摸头计数（纯 `.webp` 无损去重归档约 `34.94 MiB`）。 |
+| 主题 [`volo-journal`](../../themes/volo-journal/) | **`v1.1.2`** | `bundled` + `theme-volo-journal-v1.1.2.zip` | 是 | 经典纸刊杂志双栏主题，支持独立热更新、`.chroma .line` 横向全宽高亮滚动与桌面/手机双主题分流。 |
+| 语言包 [`zh-TW`](../../locales/zh-TW.json) / [`ja-JP`](../../locales/ja-JP.json) | **`v1.0.1`** | `locales/catalog.json`（一键在线直装） | 随仓提供 + 官方源直装 | 完整繁體中文与日本語前台 + 后台双层全量词典（`locale-zh-TW-v1.0.1.zip` / `locale-ja-JP-v1.0.1.zip`），支持 `POST /api/admin/locales/install-url` 免重启即时热激活。 |
 
-- **GitHub Actions 版本不变不重复打包**：由 [`.github/workflows/plugin-kanbanniang.yml`](../../.github/workflows/plugin-kanbanniang.yml) 与 [`.github/workflows/release.yml`](../../.github/workflows/release.yml) 逐项比对 `plugin-<id>-v<version>` / `theme-<id>-v<version>` Release 是否已存在；版本号未变时直接跳过压缩与上传，且扩展 Release 始终设置 `make_latest: false` 不抢占主程序 `latest` 指针。
+- **GitHub Actions 统一合集校验与防重复打包**：由 [`.github/workflows/plugin-kanbanniang.yml`](../../.github/workflows/plugin-kanbanniang.yml) 与 [`.github/workflows/release.yml`](../../.github/workflows/release.yml) 校验统一的 `extensions-v<version>` 合集标签（当前为 `extensions-v1.0.4`，将全部 16 项官方扩展资产与 `SHA256SUMS.txt` 聚合在同一 Release 中）；预期资产齐全时直接跳过压缩与上传，且扩展 Release 始终设置 `make_latest: false` 不抢占主程序 `latest` 指针。
 
 ---
 

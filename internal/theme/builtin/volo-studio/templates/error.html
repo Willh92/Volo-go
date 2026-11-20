@@ -33,7 +33,7 @@
       --volo-surface: #ffffff;
       --volo-raised: #f0f3ee;
       --volo-text: #293d36;
-      --volo-muted: #60756a;
+      --volo-muted: #55695f;
       --volo-line: #dfe6de;
       --volo-shadow: 0 12px 36px rgba(23, 63, 59, 0.055);
       --volo-accent: #246b51;
@@ -506,7 +506,9 @@
         animation-duration: 0.01ms !important;
         animation-iteration-count: 1 !important;
         transition-duration: 0.01ms !important;
+        scroll-behavior: auto !important;
       }
+      .err-btn:active { transform: none !important; }
     }
   </style>
   {{block "head_extra" .}}{{if eq .ThemeID "volo-journal"}}<link rel="stylesheet" href="{{assetURL .ThemeID "volo-journal.css"}}">{{end}}{{end}}

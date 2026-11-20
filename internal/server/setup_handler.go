@@ -270,6 +270,11 @@ func extractSetupSQLTargets(driver, dsn string) ([]struct {
 		if err != nil {
 			return nil, fmt.Errorf("invalid postgres DSN: %w", err)
 		}
+		for k := range pgCfg.Params {
+			if strings.EqualFold(strings.TrimSpace(k), "hostaddr") {
+				return nil, fmt.Errorf("forbidden postgres DSN parameter %q", "hostaddr")
+			}
+		}
 		primaryHost := strings.TrimSpace(pgCfg.Host)
 		if primaryHost == "" || strings.HasPrefix(primaryHost, "/") {
 			return nil, fmt.Errorf("postgres DSN requires an explicit TCP host (unix sockets are forbidden)")
@@ -386,6 +391,11 @@ func confineSQLitePathInDataDir(dataDir string, rawPath string, createParent boo
 }
 
 func (s *AppServer) validateAndNormalizeSetupDB(ctx context.Context, rawDriver, rawDSN string) (string, string, error) {
+	driver, dsn, _, err := s.validateNormalizeAndPinSetupDB(ctx, rawDriver, rawDSN)
+	return driver, dsn, err
+}
+
+func (s *AppServer) validateNormalizeAndPinSetupDB(ctx context.Context, rawDriver, rawDSN string) (string, string, string, error) {
 	driver := strings.ToLower(strings.TrimSpace(rawDriver))
 	switch driver {
 	case "", "sqlite", "sqlite3":
@@ -395,12 +405,12 @@ func (s *AppServer) validateAndNormalizeSetupDB(ctx context.Context, rawDriver, 
 	case "mysql", "mariadb":
 		driver = "mysql"
 	default:
-		return "", "", fmt.Errorf("unsupported database driver %q", rawDriver)
+		return "", "", "", fmt.Errorf("unsupported database driver %q", rawDriver)
 	}
 
 	dsn := strings.TrimSpace(rawDSN)
 	if strings.ContainsRune(dsn, 0) {
-		return "", "", fmt.Errorf("invalid database DSN")
+		return "", "", "", fmt.Errorf("invalid database DSN")
 	}
 
 	if driver == "sqlite" {
@@ -409,9 +419,9 @@ func (s *AppServer) validateAndNormalizeSetupDB(ctx context.Context, rawDriver, 
 		}
 		if dsn == ":memory:" {
 			if s.deps.OutboundDialer != nil && !s.deps.OutboundDialer.AllowLoopbackForTests {
-				return "", "", fmt.Errorf("in-memory sqlite is disabled in production setup")
+				return "", "", "", fmt.Errorf("in-memory sqlite is disabled in production setup")
 			}
-			return "sqlite", ":memory:", nil
+			return "sqlite", ":memory:", ":memory:", nil
 		}
 		// Allow existing data/ subfolder shorthand like "./data/volo.db" when DataDir already ends in "/data".
 		if normRel := trimRedundantDataPrefix(s.deps.Config.DataDir, dsn); normRel != "" {
@@ -419,24 +429,35 @@ func (s *AppServer) validateAndNormalizeSetupDB(ctx context.Context, rawDriver, 
 		}
 		cand, err := confineSQLitePathInDataDir(s.deps.Config.DataDir, dsn, true)
 		if err != nil {
-			return "", "", err
+			return "", "", "", err
 		}
-		return "sqlite", cand, nil
+		return "sqlite", cand, cand, nil
 	}
 
 	if dsn == "" {
-		return "", "", fmt.Errorf("database DSN is required for %s", driver)
+		return "", "", "", fmt.Errorf("database DSN is required for %s", driver)
 	}
 	targets, err := extractSetupSQLTargets(driver, dsn)
 	if err != nil {
-		return "", "", err
+		return "", "", "", err
 	}
-	for _, t := range targets {
-		if _, err := validateSetupDBEndpoint(ctx, t.host, t.port); err != nil {
-			return "", "", err
+	if len(targets) == 0 {
+		return "", "", "", fmt.Errorf("database DSN has no target host for %s", driver)
+	}
+	var primaryIP netip.Addr
+	var primaryPort int
+	for i, t := range targets {
+		validIP, err := validateSetupDBEndpoint(ctx, t.host, t.port)
+		if err != nil {
+			return "", "", "", err
+		}
+		if i == 0 {
+			primaryIP = validIP
+			primaryPort = t.port
 		}
 	}
-	return driver, dsn, nil
+	pinnedDSN := pinSetupDSNToValidatedIP(driver, dsn, primaryIP, primaryPort)
+	return driver, dsn, pinnedDSN, nil
 }
 
 func trimRedundantDataPrefix(dataDir, rawPath string) string {
@@ -464,16 +485,83 @@ func pinSetupDSNToValidatedIP(driver, dsn string, validIP netip.Addr, port int) 
 		if strings.HasPrefix(lower, "postgres://") || strings.HasPrefix(lower, "postgresql://") {
 			if u, err := url.Parse(dsn); err == nil {
 				q := u.Query()
+				for k := range q {
+					if strings.EqualFold(strings.TrimSpace(k), "hostaddr") {
+						q.Del(k)
+					}
+				}
 				q.Set("hostaddr", ipStr)
 				u.RawQuery = q.Encode()
 				return u.String()
 			}
 		}
-		if !strings.Contains(lower, "hostaddr=") {
-			return strings.TrimSpace(dsn) + " hostaddr=" + ipStr
+		stripped := stripPostgresKeywordParam(dsn, "hostaddr")
+		if stripped == "" {
+			return "hostaddr=" + ipStr
 		}
+		return stripped + " hostaddr=" + ipStr
 	}
 	return dsn
+}
+
+func stripPostgresKeywordParam(dsn, targetKey string) string {
+	var kept []string
+	i := 0
+	n := len(dsn)
+	isSpace := func(b byte) bool {
+		return b == ' ' || b == '\t' || b == '\r' || b == '\n' || b == '\v' || b == '\f'
+	}
+	for i < n {
+		for i < n && isSpace(dsn[i]) {
+			i++
+		}
+		if i >= n {
+			break
+		}
+		pairStart := i
+		keyStart := i
+		for i < n && dsn[i] != '=' && !isSpace(dsn[i]) {
+			i++
+		}
+		key := dsn[keyStart:i]
+		for i < n && isSpace(dsn[i]) {
+			i++
+		}
+		if i >= n || dsn[i] != '=' {
+			kept = append(kept, dsn[pairStart:])
+			break
+		}
+		i++ // consume '='
+		for i < n && isSpace(dsn[i]) {
+			i++
+		}
+		if i < n && dsn[i] == '\'' {
+			i++
+			for i < n {
+				if dsn[i] == '\\' && i+1 < n {
+					i += 2
+					continue
+				}
+				if dsn[i] == '\'' {
+					i++
+					break
+				}
+				i++
+			}
+		} else {
+			for i < n && !isSpace(dsn[i]) {
+				if dsn[i] == '\\' && i+1 < n {
+					i += 2
+					continue
+				}
+				i++
+			}
+		}
+		if !strings.EqualFold(key, targetKey) {
+			kept = append(kept, dsn[pairStart:i])
+		}
+	}
+	return strings.Join(kept, " ")
 }
 
 func (s *AppServer) isSameCurrentDB(driver, dsn string, simpleProto bool) bool {
@@ -584,21 +672,12 @@ func (s *AppServer) applySetupDatabaseSelection(ctx context.Context, rawDriver, 
 	if strings.TrimSpace(rawDriver) == "" {
 		rawDriver = cfgDriver
 	}
-	driver, dsn, err := s.validateAndNormalizeSetupDB(ctx, rawDriver, rawDSN)
+	driver, dsn, openDSN, err := s.validateNormalizeAndPinSetupDB(ctx, rawDriver, rawDSN)
 	if err != nil {
 		return err
 	}
 	if s.isSameCurrentDB(driver, dsn, simpleProto) {
 		return nil
-	}
-
-	openDSN := dsn
-	if driver == "postgres" || driver == "mysql" {
-		if targets, tErr := extractSetupSQLTargets(driver, dsn); tErr == nil && len(targets) > 0 {
-			if validIP, vErr := validateSetupDBEndpoint(ctx, targets[0].host, targets[0].port); vErr == nil {
-				openDSN = pinSetupDSNToValidatedIP(driver, dsn, validIP, targets[0].port)
-			}
-		}
 	}
 
 	newStore, err := sqlx.Open(ctx, sqlx.Options{
@@ -720,6 +799,7 @@ func (s *AppServer) handleSetupSPA(w http.ResponseWriter, r *http.Request) {
 	snap := s.deps.Settings.Snapshot()
 	adminui.Default().ServeMount(w, r, "/setup", adminui.BootConfig{
 		Mode:          "setup",
+		Version:       s.effectiveAppVersion(),
 		AdminPath:     s.deps.Config.AdminPath,
 		PublicURL:     s.publicBaseURL(r),
 		DefaultLocale: snap.Site.DefaultLocale,
@@ -740,6 +820,7 @@ func (s *AppServer) handleSetupStatus(w http.ResponseWriter, r *http.Request) {
 	snap := s.deps.Settings.Snapshot()
 	writeJSON(w, http.StatusOK, map[string]any{
 		"initialized":       false,
+		"version":           s.effectiveAppVersion(),
 		"current_driver":    s.deps.Store.Dialect().Name(),
 		"default_locale":    snap.Site.DefaultLocale,
 		"supported_locales": s.deps.Catalog.Locales(),

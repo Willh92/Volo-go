@@ -657,12 +657,21 @@ func (m *Manager) isClosed() bool {
 
 // RegisterBuiltin registers a compiled-in Go plugin prior to or after DiscoverAndStart.
 func (m *Manager) RegisterBuiltin(ctx context.Context, bp BuiltinPlugin) error {
+	if bp == nil {
+		return errors.New("plugin: builtin plugin is nil")
+	}
 	m.lifecycleMu.RLock()
 	defer m.lifecycleMu.RUnlock()
 	if m.isClosed() {
 		return errors.New("plugin: manager is closed")
 	}
-	manifest := bp.Manifest()
+	var manifest Manifest
+	if err := safeCallBuiltin("builtin", "Manifest", func() error {
+		manifest = bp.Manifest()
+		return nil
+	}); err != nil {
+		return err
+	}
 	manifest.Runtime = RuntimeBuiltin
 	if err := manifest.Validate(); err != nil {
 		return err
@@ -908,8 +917,16 @@ func (m *Manager) ClearPluginKV(ctx context.Context, pluginID string) (int64, er
 	if !ok {
 		return 0, fmt.Errorf("plugin %q not found", idClean)
 	}
-	if hub := lookupKVHub(m.store); hub != nil {
+	hub := lookupKVHub(m.store)
+	if hub != nil {
 		hub.flushMu.Lock()
+		defer hub.flushMu.Unlock()
+	}
+	res, err := m.store.ExecBgContext(ctx, `DELETE FROM plugin_kv WHERE plugin_id = ?`, idClean)
+	if err != nil {
+		return 0, err
+	}
+	if hub != nil {
 		hub.mu.Lock()
 		hub.gen++
 		for pk := range hub.entries {
@@ -919,11 +936,6 @@ func (m *Manager) ClearPluginKV(ctx context.Context, pluginID string) (int64, er
 			}
 		}
 		hub.mu.Unlock()
-		defer hub.flushMu.Unlock()
-	}
-	res, err := m.store.ExecBgContext(ctx, `DELETE FROM plugin_kv WHERE plugin_id = ?`, idClean)
-	if err != nil {
-		return 0, err
 	}
 	mp.mu.Lock()
 	rt := mp.gojaRT
@@ -1440,30 +1452,42 @@ func (m *Manager) enableLocked(ctx context.Context, pluginID string) error {
 		mp.mu.Unlock()
 		return nil
 	}
+	mp.mu.Unlock()
+
+	now := time.Now().Unix()
+	if _, err := m.store.ExecContext(
+		ctx,
+		`UPDATE plugins SET is_enabled = ?, last_error = '', updated_at = ? WHERE id = ?`,
+		true, now, pluginID,
+	); err != nil {
+		return err
+	}
+
+	mp.mu.Lock()
 	mp.enabled = true
-	mp.updatedAt = time.Now().Unix()
+	mp.lastError = ""
+	mp.updatedAt = now
 	mp.mu.Unlock()
 
 	if err := m.activateRuntime(ctx, mp); err != nil {
+		rbCtx, rbCancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer rbCancel()
+		rbNow := time.Now().Unix()
+		_, _ = m.store.ExecBgContext(
+			rbCtx,
+			`UPDATE plugins SET is_enabled = ?, last_error = ?, updated_at = ? WHERE id = ?`,
+			false, err.Error(), rbNow, pluginID,
+		)
 		mp.mu.Lock()
 		mp.enabled = false
 		mp.runtimeActive = false
 		mp.lastError = err.Error()
+		mp.updatedAt = rbNow
 		mp.mu.Unlock()
-		_, _ = m.store.ExecContext(
-			ctx,
-			`UPDATE plugins SET is_enabled = ?, last_error = ?, updated_at = ? WHERE id = ?`,
-			false, err.Error(), time.Now().Unix(), pluginID,
-		)
 		return err
 	}
 
-	_, err := m.store.ExecContext(
-		ctx,
-		`UPDATE plugins SET is_enabled = ?, last_error = '', updated_at = ? WHERE id = ?`,
-		true, time.Now().Unix(), pluginID,
-	)
-	return err
+	return nil
 }
 
 // Disable hot-stops a plugin immediately without restarting Volo-go.
@@ -1482,19 +1506,22 @@ func (m *Manager) disableLocked(ctx context.Context, pluginID string) error {
 	if !ok {
 		return fmt.Errorf("plugin: %q not found", pluginID)
 	}
+	now := time.Now().Unix()
+	if _, err := m.store.ExecContext(
+		ctx,
+		`UPDATE plugins SET is_enabled = ?, updated_at = ? WHERE id = ?`,
+		false, now, pluginID,
+	); err != nil {
+		return err
+	}
+
 	mp.mu.Lock()
 	mp.enabled = false
-	mp.updatedAt = time.Now().Unix()
+	mp.updatedAt = now
 	mp.mu.Unlock()
 
 	m.deactivateRuntime(ctx, mp)
-
-	_, err := m.store.ExecContext(
-		ctx,
-		`UPDATE plugins SET is_enabled = ?, updated_at = ? WHERE id = ?`,
-		false, time.Now().Unix(), pluginID,
-	)
-	return err
+	return nil
 }
 
 // ResetCircuit clears CIRCUIT_OPEN state and failure counters so an administrator can re-enable a repaired plugin.
@@ -1513,6 +1540,14 @@ func (m *Manager) ResetCircuit(ctx context.Context, pluginID string) error {
 		return fmt.Errorf("plugin: %q not found", pluginID)
 	}
 	now := time.Now().Unix()
+	if _, err := m.store.ExecContext(
+		ctx,
+		`UPDATE plugins SET circuit_state = ?, failure_count = 0, last_error = '', updated_at = ? WHERE id = ?`,
+		CircuitClosed, now, idClean,
+	); err != nil {
+		return err
+	}
+
 	mp.mu.Lock()
 	mp.circuitState = CircuitClosed
 	mp.failureCount = 0
@@ -1521,12 +1556,7 @@ func (m *Manager) ResetCircuit(ctx context.Context, pluginID string) error {
 	mp.mu.Unlock()
 
 	m.logger.Write(idClean, "info", "circuit", "circuit breaker manually reset to CLOSED")
-	_, err := m.store.ExecContext(
-		ctx,
-		`UPDATE plugins SET circuit_state = ?, failure_count = 0, last_error = '', updated_at = ? WHERE id = ?`,
-		CircuitClosed, now, idClean,
-	)
-	return err
+	return nil
 }
 
 func invalidateOIDCDiscoveryKV(ctx context.Context, kv *KVStore) {
@@ -1624,6 +1654,17 @@ func (m *Manager) UpdateConfig(ctx context.Context, pluginID string, patch map[s
 		return PluginSummary{}, err
 	}
 	now := time.Now().Unix()
+	mp.mu.Unlock()
+
+	if _, err := m.store.ExecContext(
+		ctx,
+		`UPDATE plugins SET config_json = ?, secret_ciphertext = ?, updated_at = ? WHERE id = ?`,
+		string(cfgBytes), secCipher, now, pluginID,
+	); err != nil {
+		return PluginSummary{}, err
+	}
+
+	mp.mu.Lock()
 	mp.publicConfig = nextPub
 	mp.secretConfig = nextSec
 	mp.setPriorityLocked(nextPriority, nextCustomPrio)
@@ -1641,16 +1682,9 @@ func (m *Manager) UpdateConfig(ctx context.Context, pluginID string, patch map[s
 		m.providers.SetPluginPriority(pluginID, nextPriority)
 	}
 
-	if _, err := m.store.ExecContext(
-		ctx,
-		`UPDATE plugins SET config_json = ?, secret_ciphertext = ?, updated_at = ? WHERE id = ?`,
-		string(cfgBytes), secCipher, now, pluginID,
-	); err != nil {
-		return PluginSummary{}, err
-	}
-
 	if rt != nil {
 		rt.resetHTTPClient()
+		rt.resetPool()
 	}
 
 	var activeOIDCProvs []OIDCProvider
@@ -1670,11 +1704,11 @@ func (m *Manager) UpdateConfig(ctx context.Context, pluginID string, patch map[s
 		}
 		for _, prov := range activeOIDCProvs {
 			if inv, ok := prov.(OIDCDiscoveryInvalidator); ok {
-				inv.InvalidateOIDCDiscovery()
+				_ = safeCallBuiltin(pluginID, "InvalidateOIDCDiscovery", func() error {
+					inv.InvalidateOIDCDiscovery()
+					return nil
+				})
 			}
-		}
-		if rt != nil {
-			rt.resetPool()
 		}
 	}
 
@@ -1704,11 +1738,14 @@ func (m *Manager) UpdateConfig(ctx context.Context, pluginID string, patch map[s
 					m.recordFailure(ctx, mp, "config_change", aErr)
 				}
 			}
-		} else if rt != nil && rt.hasCallable("onConfigChange") {
-			if _, _, cErr := rt.invoke(ctx, m.hookTimeout, "onConfigChange", cfgCopy); cErr != nil {
-				m.recordFailure(ctx, mp, "config_change", cErr)
-			} else {
-				m.recordSuccess(ctx, mp)
+		} else if rt != nil {
+			rt.warmPool(ctx, defaultVMPoolCap)
+			if rt.hasCallable("onConfigChange") {
+				if _, _, cErr := rt.invoke(ctx, m.hookTimeout, "onConfigChange", cfgCopy); cErr != nil {
+					m.recordFailure(ctx, mp, "config_change", cErr)
+				} else {
+					m.recordSuccess(ctx, mp)
+				}
 			}
 		}
 		if isOIDCPlugin && rt != nil && m.providers != nil && rt.hasCallable("oidcAuthURL") && rt.hasCallable("oidcExchange") {
@@ -2681,23 +2718,26 @@ func (m *Manager) SetPriority(ctx context.Context, pluginID string, priority int
 
 	mp.mu.Lock()
 	cfgBytes, err := marshalPluginConfigJSON(mp.publicConfig, clamped, true)
+	mp.mu.Unlock()
 	if err != nil {
-		mp.mu.Unlock()
 		return PluginSummary{}, err
 	}
-	mp.setPriorityLocked(clamped, true)
-	mp.updatedAt = now
-	mp.mu.Unlock()
 
-	if m.providers != nil {
-		m.providers.SetPluginPriority(pluginID, clamped)
-	}
 	if _, err := m.store.ExecContext(
 		ctx,
 		`UPDATE plugins SET config_json = ?, updated_at = ? WHERE id = ?`,
 		string(cfgBytes), now, pluginID,
 	); err != nil {
 		return PluginSummary{}, err
+	}
+
+	mp.mu.Lock()
+	mp.setPriorityLocked(clamped, true)
+	mp.updatedAt = now
+	mp.mu.Unlock()
+
+	if m.providers != nil {
+		m.providers.SetPluginPriority(pluginID, clamped)
 	}
 	return m.toSummary(mp, locale), nil
 }
@@ -3011,13 +3051,21 @@ func (m *Manager) DispatchRenderDirective(ctx context.Context, name string, attr
 			for k, v := range attrs {
 				attrsCopy[k] = v
 			}
-			res, err := bp.OnHook(dCtx, HookRenderDirective, map[string]any{
-				"name":  normName,
-				"attrs": attrsCopy,
-				"body":  body,
+			var res any
+			err := safeCallBuiltin(mp.manifest.ID, "OnHook:"+HookRenderDirective, func() error {
+				var hErr error
+				res, hErr = bp.OnHook(dCtx, HookRenderDirective, map[string]any{
+					"name":  normName,
+					"attrs": attrsCopy,
+					"body":  body,
+				})
+				return hErr
 			})
 			cancel()
 			if err != nil {
+				if isCallerCanceled(ctx, err) {
+					return "", false
+				}
 				m.recordFailure(ctx, mp, "directive:"+normName, err)
 				continue
 			}
@@ -3039,6 +3087,9 @@ func (m *Manager) DispatchRenderDirective(ctx context.Context, name string, attr
 		if rt != nil {
 			htmlOut, handled, err := rt.invokeDirective(ctx, m.hookTimeout, normName, attrs, body)
 			if err != nil {
+				if isCallerCanceled(ctx, err) {
+					return "", false
+				}
 				m.recordFailure(ctx, mp, "directive:"+normName, err)
 				continue
 			}
@@ -3149,8 +3200,14 @@ func (m *Manager) DispatchArticleHookWithError(ctx context.Context, hookName str
 		if !mp.manifest.CanUseHook(hookName) {
 			continue
 		}
-		trustedProtected := mp.kind == "builtin" && mp.builtin != nil &&
-			mp.builtin.AllowProtectedArticles() && mp.manifest.HasPermission("articles:read_protected")
+		allowProtected := false
+		if mp.kind == "builtin" && mp.builtin != nil && mp.manifest.HasPermission("articles:read_protected") {
+			_ = safeCallBuiltin(mp.manifest.ID, "AllowProtectedArticles", func() error {
+				allowProtected = mp.builtin.AllowProtectedArticles()
+				return nil
+			})
+		}
+		trustedProtected := allowProtected
 
 		// 10th Privacy Surface Redaction: untrusted / external plugins NEVER receive protected plaintext!
 		if !trustedProtected && cur.IsPasswordProtected && (hookName == HookRenderPostHTML || hookName == HookRenderPreMarkdown) {
@@ -3170,6 +3227,9 @@ func (m *Manager) DispatchArticleHookWithError(ctx context.Context, hookName str
 				}
 				m.recordSuccess(ctx, mp)
 				return cur, rej
+			}
+			if isCallerCanceled(ctx, err) {
+				return cur, err
 			}
 			m.recordFailure(ctx, mp, "hook:"+hookName, err)
 			continue
@@ -3296,6 +3356,9 @@ func (m *Manager) DispatchHook(ctx context.Context, hookName string, payload any
 				}
 				m.recordSuccess(ctx, mp)
 				return cur, rej
+			}
+			if isCallerCanceled(ctx, err) {
+				return cur, err
 			}
 			m.recordFailure(ctx, mp, "hook:"+hookName, err)
 			continue
@@ -3427,15 +3490,20 @@ func (m *Manager) invokeHook(ctx context.Context, mp *managedPlugin, hookName st
 	if !enabled {
 		return nil, false, nil
 	}
-	hookCtx, cancel := context.WithTimeout(ctx, m.hookTimeout)
-	defer cancel()
 
 	if runtimeKind == RuntimeBuiltin && bp != nil {
-		out, err := bp.OnHook(hookCtx, hookName, payload)
+		hookCtx, cancel := context.WithTimeout(ctx, m.hookTimeout)
+		defer cancel()
+		var out any
+		err := safeCallBuiltin(mp.manifest.ID, "OnHook:"+hookName, func() error {
+			var hErr error
+			out, hErr = bp.OnHook(hookCtx, hookName, payload)
+			return hErr
+		})
 		return out, true, err
 	}
 	if rt != nil {
-		return rt.invoke(hookCtx, m.hookTimeout, "onHook", hookName, payload)
+		return rt.invoke(ctx, m.hookTimeout, "onHook", hookName, payload)
 	}
 	return nil, false, nil
 }
@@ -3552,6 +3620,9 @@ func (m *Manager) RenderSlots(ctx context.Context, slotName string, slotCtx Slot
 			if spec.Dynamic {
 				dynHTML, invoked, err := m.invokeSlot(ctx, mp, slotName, slotCtx)
 				if err != nil {
+					if isCallerCanceled(ctx, err) {
+						return out
+					}
 					m.recordFailure(ctx, mp, "slot:"+slotName, err)
 					continue
 				}
@@ -3603,15 +3674,20 @@ func (m *Manager) invokeSlot(ctx context.Context, mp *managedPlugin, slotName st
 	if !enabled {
 		return "", false, nil
 	}
-	sCtx, cancel := context.WithTimeout(ctx, m.hookTimeout)
-	defer cancel()
 
 	if runtimeKind == RuntimeBuiltin && bp != nil {
-		s, err := bp.RenderSlot(sCtx, slotName, slotCtx)
+		sCtx, cancel := context.WithTimeout(ctx, m.hookTimeout)
+		defer cancel()
+		var s string
+		err := safeCallBuiltin(mp.manifest.ID, "RenderSlot:"+slotName, func() error {
+			var rErr error
+			s, rErr = bp.RenderSlot(sCtx, slotName, slotCtx)
+			return rErr
+		})
 		return s, true, err
 	}
 	if rt != nil {
-		res, found, err := rt.invoke(sCtx, m.hookTimeout, "renderSlot", slotName, slotCtx)
+		res, found, err := rt.invoke(ctx, m.hookTimeout, "renderSlot", slotName, slotCtx)
 		if err != nil || !found || res == nil {
 			return "", found, err
 		}
@@ -3657,8 +3733,7 @@ func (m *Manager) invokeDynamicQuickInserts(mp *managedPlugin, locale string) []
 		return nil
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), m.hookTimeout)
-	defer cancel()
+	ctx := context.Background()
 
 	var (
 		res   any
@@ -3666,8 +3741,14 @@ func (m *Manager) invokeDynamicQuickInserts(mp *managedPlugin, locale string) []
 		err   error
 	)
 	if runtimeKind == RuntimeBuiltin && bp != nil {
-		rawStr, bErr := bp.RenderSlot(ctx, SlotEditorQuickInsert, SlotRenderContext{Locale: locale})
-		err = bErr
+		bCtx, cancel := context.WithTimeout(ctx, m.hookTimeout)
+		defer cancel()
+		var rawStr string
+		err = safeCallBuiltin(mp.manifest.ID, "RenderSlot:"+SlotEditorQuickInsert, func() error {
+			var rErr error
+			rawStr, rErr = bp.RenderSlot(bCtx, SlotEditorQuickInsert, SlotRenderContext{Locale: locale})
+			return rErr
+		})
 		if err == nil && strings.TrimSpace(rawStr) != "" {
 			res = rawStr
 			found = true
@@ -3860,15 +3941,18 @@ func (m *Manager) servePluginAPI(w http.ResponseWriter, r *http.Request, mp *man
 		return
 	}
 
-	reqCtx, cancel := context.WithTimeout(r.Context(), m.routeTimeout)
-	defer cancel()
-
 	var resp APIResponse
 	var invokeErr error
 	if runtimeKind == RuntimeBuiltin && bp != nil {
-		resp, invokeErr = bp.ServeAPI(reqCtx, apiReq)
+		reqCtx, cancel := context.WithTimeout(r.Context(), m.routeTimeout)
+		defer cancel()
+		invokeErr = safeCallBuiltin(mp.manifest.ID, "ServeAPI:"+subPath, func() error {
+			var sErr error
+			resp, sErr = bp.ServeAPI(reqCtx, apiReq)
+			return sErr
+		})
 	} else if rt != nil {
-		raw, found, iErr := rt.invoke(reqCtx, m.routeTimeout, "onRequest", apiReq)
+		raw, found, iErr := rt.invoke(r.Context(), m.routeTimeout, "onRequest", apiReq)
 		if iErr != nil {
 			invokeErr = iErr
 		} else if !found {
@@ -3883,7 +3967,9 @@ func (m *Manager) servePluginAPI(w http.ResponseWriter, r *http.Request, mp *man
 	}
 
 	if invokeErr != nil {
-		m.recordFailure(r.Context(), mp, "route:"+subPath, invokeErr)
+		if !isCallerCanceled(r.Context(), invokeErr) {
+			m.recordFailure(r.Context(), mp, "route:"+subPath, invokeErr)
+		}
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		w.WriteHeader(http.StatusServiceUnavailable)
 		_, _ = w.Write([]byte(`{"error":"plugin execution failed"}`))
@@ -4426,11 +4512,18 @@ func isNonStandardExecutableOrMarkupAssetExt(ext string) bool {
 	}
 }
 
+func isCallerCanceled(ctx context.Context, err error) bool {
+	return errors.Is(err, context.Canceled) || (ctx != nil && errors.Is(ctx.Err(), context.Canceled))
+}
+
 func (m *Manager) recordFailure(ctx context.Context, mp *managedPlugin, stage string, err error) {
 	m.recordFailureWithOrigin(ctx, mp, stage, err, false)
 }
 
 func (m *Manager) recordFailureWithOrigin(ctx context.Context, mp *managedPlugin, stage string, err error, fromCron bool) {
+	if err == nil || isCallerCanceled(ctx, err) {
+		return
+	}
 	now := time.Now().Unix()
 	errMsg := err.Error()
 
@@ -4451,13 +4544,16 @@ func (m *Manager) recordFailureWithOrigin(ctx context.Context, mp *managedPlugin
 
 	m.logger.Write(mp.manifest.ID, "error", stage, fmt.Sprintf("failure #%d: %s", count, errMsg))
 
+	dbCtx, dbCancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer dbCancel()
+
 	if tripped {
-		m.deactivateRuntimeOpts(ctx, mp, !fromCron)
+		m.deactivateRuntimeOpts(dbCtx, mp, !fromCron)
 		m.logger.Write(mp.manifest.ID, "error", "circuit", fmt.Sprintf("CIRCUIT_OPEN after %d consecutive failures; plugin auto-disabled", count))
 	}
 
 	_, _ = m.store.ExecBgContext(
-		ctx,
+		dbCtx,
 		`UPDATE plugins SET is_enabled = ?, circuit_state = ?, failure_count = ?, last_error = ?, updated_at = ? WHERE id = ?`,
 		enabled, state, count, errMsg, now, mp.manifest.ID,
 	)
@@ -4475,8 +4571,11 @@ func (m *Manager) recordSuccess(ctx context.Context, mp *managedPlugin) {
 	now := mp.updatedAt
 	mp.mu.Unlock()
 
+	dbCtx, dbCancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer dbCancel()
+
 	_, _ = m.store.ExecBgContext(
-		ctx,
+		dbCtx,
 		`UPDATE plugins SET failure_count = 0, last_error = '', updated_at = ? WHERE id = ?`,
 		now, mp.manifest.ID,
 	)
@@ -4675,8 +4774,7 @@ func (a *gojaOIDCAdapter) AuthCodeURLWithParams(params OIDCAuthParams) (string, 
 	if !enabled || rt == nil {
 		return "", errors.New("plugin oidc provider inactive")
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), a.manager.routeTimeout)
-	defer cancel()
+	ctx := context.Background()
 
 	opts := make(map[string]any, 3)
 	if params.Nonce != "" {
@@ -5043,16 +5141,16 @@ func (a *gojaStorageAdapter) Put(ctx context.Context, objectKey string, r io.Rea
 	if !enabled || rt == nil {
 		return "", errors.New("plugin storage inactive")
 	}
-	const maxPluginStorageBytes = 64 << 20
+	const maxPluginStorageBytes = (maxJSStringBytes / 4) * 3
 	if size > maxPluginStorageBytes {
-		return "", errors.New("plugin storage: payload exceeds 64 MiB limit")
+		return "", errors.New("plugin storage: payload exceeds 3 MiB limit")
 	}
 	rawBytes, err := io.ReadAll(io.LimitReader(r, maxPluginStorageBytes+1))
 	if err != nil {
 		return "", err
 	}
 	if len(rawBytes) > maxPluginStorageBytes {
-		return "", errors.New("plugin storage: payload exceeds 64 MiB limit")
+		return "", errors.New("plugin storage: payload exceeds 3 MiB limit")
 	}
 	b64 := base64.StdEncoding.EncodeToString(rawBytes)
 	timeout := a.manager.cronTimeout

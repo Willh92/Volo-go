@@ -523,3 +523,86 @@ func TestW1C_TaxonomiesLinksPagination_JumpPillsCap_And_LayoutCSRF(t *testing.T)
 		}
 	}
 }
+
+func TestW1C_CategoriesAndLinksServerFilter_JumpPills_And_ZeroMatch(t *testing.T) {
+	cat, err := i18n.NewCatalog("en-US", "")
+	if err != nil {
+		t.Fatalf("NewCatalog: %v", err)
+	}
+	eng, err := NewEngine(cat, t.TempDir())
+	if err != nil {
+		t.Fatalf("NewEngine: %v", err)
+	}
+
+	// 1. /categories with >18 items renders +N jump pills toggle and server-side q form.
+	cats := make([]content.CategoryWithCount, 22)
+	for i := 0; i < 22; i++ {
+		idxStr := strconv.Itoa(i + 1)
+		cats[i] = content.CategoryWithCount{
+			Category:     domain.Category{ID: "c_" + idxStr, Name: "Cat " + idxStr, Slug: "cat-" + idxStr},
+			ArticleCount: i + 1,
+		}
+	}
+	recCat := httptest.NewRecorder()
+	if err := eng.Render(recCat, http.StatusOK, DefaultThemeID, "taxonomies.html", PageContext{
+		Locale:       "en-US",
+		CurrentPath:  "/categories",
+		TaxonomyKind: "categories",
+		TagQuery:     "cat",
+		Page:         1,
+		TotalPages:   2,
+		Pagination:   BuildPagination(1, 2, 36, 40, 5),
+		Categories:   cats,
+	}); err != nil {
+		t.Fatalf("Render /categories: %v", err)
+	}
+	outCat := recCat.Body.String()
+	for _, needle := range []string{
+		`action="/categories"`,
+		`name="q" value="cat"`,
+		`data-server-filter="1"`,
+		`js-collection-filter-clear`,
+		`js-jump-pills-toggle`,
+		`data-more-label="+4"`,
+		`class="pagination"`,
+	} {
+		if !strings.Contains(outCat, needle) {
+			t.Fatalf("expected /categories output to contain %q", needle)
+		}
+	}
+
+	// 2. /categories with 0 matches & non-empty TagQuery preserves search toolbar & shows filter_empty.
+	recCatEmpty := httptest.NewRecorder()
+	if err := eng.Render(recCatEmpty, http.StatusOK, DefaultThemeID, "taxonomies.html", PageContext{
+		Locale:       "en-US",
+		CurrentPath:  "/categories",
+		TaxonomyKind: "categories",
+		TagQuery:     "no-such-cat",
+	}); err != nil {
+		t.Fatalf("Render /categories zero-match: %v", err)
+	}
+	outCatEmpty := recCatEmpty.Body.String()
+	if !strings.Contains(outCatEmpty, `action="/categories"`) || !strings.Contains(outCatEmpty, `value="no-such-cat"`) {
+		t.Fatalf("expected 0-match /categories query to preserve search form")
+	}
+	if strings.Contains(outCatEmpty, `studio-empty`) {
+		t.Fatalf("expected 0-match /categories query NOT to fall back to full empty_state")
+	}
+
+	// 3. /links with 0 matches & non-empty TagQuery preserves search toolbar & shows filter_empty.
+	recLinksEmpty := httptest.NewRecorder()
+	if err := eng.Render(recLinksEmpty, http.StatusOK, DefaultThemeID, "links.html", PageContext{
+		Locale:      "en-US",
+		CurrentPath: "/links",
+		TagQuery:    "no-such-link",
+	}); err != nil {
+		t.Fatalf("Render /links zero-match: %v", err)
+	}
+	outLinksEmpty := recLinksEmpty.Body.String()
+	if !strings.Contains(outLinksEmpty, `action="/links"`) || !strings.Contains(outLinksEmpty, `value="no-such-link"`) {
+		t.Fatalf("expected 0-match /links query to preserve search form")
+	}
+	if strings.Contains(outLinksEmpty, `studio-empty`) {
+		t.Fatalf("expected 0-match /links query NOT to fall back to full empty_state")
+	}
+}

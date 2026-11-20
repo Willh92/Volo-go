@@ -76,11 +76,12 @@ function compactLocalesPlugin(): Plugin {
       let out = code;
       if (!cleanId.endsWith("/src/i18n.ts")) {
         out = out
-          .replace(/(?<![A-Za-z0-9_$?.])t\(\s*(["'])([A-Za-z0-9_.-]+)\1(?=\s*[,)])/g, (full, _q, key: string) => {
+          .replace(/(?<![A-Za-z0-9_$?.])t(?:Opt)?\(\s*(["'])([A-Za-z0-9_.-]+)\1(?=\s*[,)])/g, (full, _q, key: string) => {
             const idx = keyMap.get(key);
             if (idx === undefined) return full;
             changed = true;
-            return `t(${idx}`;
+            const fn = full.startsWith("tOpt") ? "tOpt" : "t";
+            return `${fn}(${idx}`;
           })
           .replace(
             /(?<![A-Za-z0-9_$?.])t\(\s*([^?()\n]+?\?)\s*(["'])([A-Za-z0-9_.-]+)\2\s*:\s*(["'])([A-Za-z0-9_.-]+)\4(?=\s*[,)])/g,
@@ -93,12 +94,13 @@ function compactLocalesPlugin(): Plugin {
             }
           )
           .replace(
-            /(?<![A-Za-z0-9_$?.])tFor\(\s*([^,()\n]+?)\s*,\s*(["'])([A-Za-z0-9_.-]+)\2(?=\s*[,)])/g,
+            /(?<![A-Za-z0-9_$?.])t(?:Opt)?For\(\s*([^,()\n]+?)\s*,\s*(["'])([A-Za-z0-9_.-]+)\2(?=\s*[,)])/g,
             (full, locExpr: string, _q, key: string) => {
               const idx = keyMap.get(key);
               if (idx === undefined) return full;
               changed = true;
-              return `tFor(${locExpr},${idx}`;
+              const fn = full.startsWith("tOptFor") ? "tOptFor" : "tFor";
+              return `${fn}(${locExpr},${idx}`;
             }
           );
       }
@@ -106,10 +108,13 @@ function compactLocalesPlugin(): Plugin {
         cleanId.endsWith("/src/i18n.ts") ||
         cleanId.endsWith("/src/api.ts") ||
         cleanId.endsWith("/src/main.tsx") ||
-        cleanId.endsWith("/src/components/UIControls.tsx")
+        cleanId.endsWith("/src/components/UIControls.tsx") ||
+        cleanId.endsWith("/src/views/DistributeWorkspace.tsx") ||
+        cleanId.endsWith("/src/views/SetupWizard.tsx") ||
+        cleanId.endsWith("/src/views/AppearanceWorkspace.tsx")
       ) {
         out = out.replace(
-          /([:[,]\s*)(["'])((?:bak\.tbl\.|audit\.res\.|audit\.act\.|sys\.waf_reason_|api\.err_|nav\.|dp\.[mw])[A-Za-z0-9_.-]+)\2/g,
+          /([:[,]\s*)(["'])((?:bak\.tbl\.|audit\.res\.|audit\.act\.|sys\.waf_reason_|api\.err_|nav\.|dp\.[mw]|dist\.wh_ev_|setup\.default_|app\.secret_)[A-Za-z0-9_.-]+)\2/g,
           (full, prefix: string, _q, key: string) => {
             const idx = keyMap.get(key);
             if (idx === undefined) return full;
@@ -224,10 +229,10 @@ export default defineConfig({
   oxc: {
     jsx: {
       runtime: "classic",
-      pragma: "__P.h",
-      pragmaFrag: "__P.Fragment",
+      pragma: "__h",
+      pragmaFrag: "__F",
     },
-    jsxInject: `import * as __P from "preact";`,
+    jsxInject: `import { h as __h, Fragment as __F } from "preact";`,
   },
   build: {
     outDir: "../../internal/adminui/dist",
@@ -239,6 +244,7 @@ export default defineConfig({
     modulePreload: false,
     chunkSizeWarningLimit: 1000,
     rolldownOptions: {
+      preserveEntrySignatures: "exports-only",
       output: {
         entryFileNames: "assets/index.js",
         chunkFileNames: (chunkInfo) => {

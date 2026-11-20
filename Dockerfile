@@ -28,7 +28,7 @@ RUN rm -rf /src/internal/adminui/dist /src/dist-minified-plugins && \
 FROM --platform=$BUILDPLATFORM golang:1.27-bookworm AS go-builder
 ARG TARGETOS=linux
 ARG TARGETARCH=amd64
-ARG VERSION=v1.0.3
+ARG VERSION=v1.0.4
 
 WORKDIR /src
 COPY go.mod go.sum ./

@@ -41,6 +41,192 @@ type BookDetailView struct {
 	FlatChapters []domain.BookChapter `json:"flat_chapters"`
 }
 
+// BookReaderPageData represents a bounded 100-chapter window of a book for /books/{slug}.
+type BookReaderPageData struct {
+	Book          BookDetailView
+	ActiveChapter *domain.BookChapter
+	PrevChapter   *domain.BookChapter
+	NextChapter   *domain.BookChapter
+	ChapterPage   int
+	TotalPages    int
+	TotalChapters int
+	PerPage       int
+}
+
+// GetBookReaderPage loads a Book, resolves the active chapter + Prev/Next neighbors in SQL,
+// and loads only a bounded perPage (default 100) window of chapters for the TOC sidebar.
+func (s *Service) GetBookReaderPage(ctx context.Context, slug, activeChID string, cpage, perPage int) (BookReaderPageData, error) {
+	if perPage <= 0 {
+		perPage = 100
+	}
+	if perPage > 200 {
+		perPage = 200
+	}
+
+	var bk domain.Book
+	err := sqlx.GetInto(ctx, s.store, &bk, `SELECT * FROM books WHERE slug = ?`, strings.TrimSpace(slug))
+	if err != nil {
+		return BookReaderPageData{}, err
+	}
+
+	var totalChapters int
+	if err := s.store.QueryRowContext(ctx, `SELECT COUNT(*) FROM book_chapters WHERE book_id = ?`, bk.ID).Scan(&totalChapters); err != nil {
+		return BookReaderPageData{}, err
+	}
+	if totalChapters > 0 || bk.SourceType != "external" {
+		bk.ChapterCount = totalChapters
+	}
+	if totalChapters == 0 {
+		return BookReaderPageData{
+			Book: BookDetailView{
+				Book:         bk,
+				FlatChapters: []domain.BookChapter{},
+			},
+			ChapterPage:   1,
+			TotalPages:    1,
+			TotalChapters: 0,
+			PerPage:       perPage,
+		}, nil
+	}
+
+	var activeCh *domain.BookChapter
+	activeIdx := -1
+	cleanChID := strings.TrimSpace(activeChID)
+	if cleanChID != "" {
+		var found domain.BookChapter
+		if err := sqlx.GetInto(ctx, s.store, &found,
+			`SELECT * FROM book_chapters WHERE book_id = ? AND id = ?`, bk.ID, cleanChID); err != nil {
+			return BookReaderPageData{}, err
+		}
+		activeCh = &found
+	} else if bk.EmbedMode == "iframe" || bk.EmbedMode == "inline" {
+		firstSQL, firstArgs := s.store.Dialect().PaginateSQL(
+			`SELECT * FROM book_chapters WHERE book_id = ? AND TRIM(url) <> '' ORDER BY sort_order ASC, id ASC`, 1, 0)
+		args := append([]any{bk.ID}, firstArgs...)
+		var firstRows []domain.BookChapter
+		if err := sqlx.SelectInto(ctx, s.store, &firstRows, firstSQL, args...); err == nil && len(firstRows) > 0 {
+			cp := firstRows[0]
+			activeCh = &cp
+		}
+	}
+
+	var prevCh, nextCh *domain.BookChapter
+	if activeCh != nil {
+		_ = s.store.QueryRowContext(ctx,
+			`SELECT COUNT(*) FROM book_chapters WHERE book_id = ? AND (sort_order < ? OR (sort_order = ? AND id < ?))`,
+			bk.ID, activeCh.SortOrder, activeCh.SortOrder, activeCh.ID).Scan(&activeIdx)
+
+		prevSQL, prevArgs := s.store.Dialect().PaginateSQL(
+			`SELECT * FROM book_chapters WHERE book_id = ? AND TRIM(url) <> '' AND (sort_order < ? OR (sort_order = ? AND id < ?)) ORDER BY sort_order DESC, id DESC`, 1, 0)
+		pArgs := append([]any{bk.ID, activeCh.SortOrder, activeCh.SortOrder, activeCh.ID}, prevArgs...)
+		var pRows []domain.BookChapter
+		if err := sqlx.SelectInto(ctx, s.store, &pRows, prevSQL, pArgs...); err == nil && len(pRows) > 0 {
+			cp := pRows[0]
+			prevCh = &cp
+		}
+
+		nextSQL, nextArgs := s.store.Dialect().PaginateSQL(
+			`SELECT * FROM book_chapters WHERE book_id = ? AND TRIM(url) <> '' AND (sort_order > ? OR (sort_order = ? AND id > ?)) ORDER BY sort_order ASC, id ASC`, 1, 0)
+		nArgs := append([]any{bk.ID, activeCh.SortOrder, activeCh.SortOrder, activeCh.ID}, nextArgs...)
+		var nRows []domain.BookChapter
+		if err := sqlx.SelectInto(ctx, s.store, &nRows, nextSQL, nArgs...); err == nil && len(nRows) > 0 {
+			cp := nRows[0]
+			nextCh = &cp
+		}
+	}
+
+	totalPages := (totalChapters + perPage - 1) / perPage
+	if totalPages < 1 {
+		totalPages = 1
+	}
+	resolvedPage := cpage
+	if resolvedPage <= 0 {
+		if activeIdx >= 0 {
+			resolvedPage = activeIdx/perPage + 1
+		} else {
+			resolvedPage = 1
+		}
+	}
+	if resolvedPage < 1 {
+		resolvedPage = 1
+	}
+	if resolvedPage > totalPages {
+		resolvedPage = totalPages
+	}
+
+	offset := (resolvedPage - 1) * perPage
+	winSQL, winArgs := s.store.Dialect().PaginateSQL(
+		`SELECT * FROM book_chapters WHERE book_id = ? ORDER BY sort_order ASC, id ASC`, perPage, offset)
+	qArgs := append([]any{bk.ID}, winArgs...)
+	var window []domain.BookChapter
+	if err := sqlx.SelectInto(ctx, s.store, &window, winSQL, qArgs...); err != nil {
+		return BookReaderPageData{}, err
+	}
+
+	// Preserve enclosing ancestor volume/sub-volume headers when cpage > 1 starts mid-volume
+	// so grouped TOC <details> and nested sub-volume labels render cleanly.
+	if resolvedPage > 1 && len(window) > 0 {
+		var hdrCnt int
+		_ = s.store.QueryRowContext(ctx,
+			`SELECT COUNT(*) FROM book_chapters WHERE book_id = ? AND TRIM(url) = ''`, bk.ID).Scan(&hdrCnt)
+		if hdrCnt > 0 {
+			var minGrpDepth int
+			_ = s.store.QueryRowContext(ctx,
+				`SELECT COALESCE(MIN(depth), 0) FROM book_chapters WHERE book_id = ? AND TRIM(url) = ''`, bk.ID).Scan(&minGrpDepth)
+
+			first := window[0]
+			var ancestors []domain.BookChapter
+			cur := first
+			isChapterFirst := strings.TrimSpace(cur.URL) != ""
+			for step := 0; step < 8; step++ {
+				if !isChapterFirst && cur.Depth <= minGrpDepth {
+					break
+				}
+				depthOp := "<"
+				targetDepth := cur.Depth
+				if isChapterFirst && cur.Depth <= minGrpDepth {
+					depthOp = "<="
+				}
+				ancSQL, ancArgs := s.store.Dialect().PaginateSQL(
+					`SELECT * FROM book_chapters WHERE book_id = ? AND TRIM(url) = '' AND depth `+depthOp+` ? AND (sort_order < ? OR (sort_order = ? AND id < ?)) ORDER BY sort_order DESC, id DESC`,
+					1, 0)
+				aArgs := append([]any{bk.ID, targetDepth, cur.SortOrder, cur.SortOrder, cur.ID}, ancArgs...)
+				var ancRows []domain.BookChapter
+				if err := sqlx.SelectInto(ctx, s.store, &ancRows, ancSQL, aArgs...); err != nil || len(ancRows) == 0 || ancRows[0].ID == cur.ID {
+					break
+				}
+				anc := ancRows[0]
+				ancestors = append(ancestors, anc)
+				cur = anc
+				isChapterFirst = false
+				if cur.Depth <= minGrpDepth {
+					break
+				}
+			}
+			if len(ancestors) > 0 {
+				for l, r := 0, len(ancestors)-1; l < r; l, r = l+1, r-1 {
+					ancestors[l], ancestors[r] = ancestors[r], ancestors[l]
+				}
+				window = append(ancestors, window...)
+			}
+		}
+	}
+
+	return BookReaderPageData{
+		Book: BookDetailView{
+			Book:         bk,
+			FlatChapters: window,
+		},
+		ActiveChapter: activeCh,
+		PrevChapter:   prevCh,
+		NextChapter:   nextCh,
+		ChapterPage:   resolvedPage,
+		TotalPages:    totalPages,
+		TotalChapters: totalChapters,
+		PerPage:       perPage,
+	}, nil
+}
+
 // ListBooks returns all books ordered by sort_order ASC, created_at DESC with live chapter counts.
 func (s *Service) ListBooks(ctx context.Context) ([]domain.Book, error) {
 	var books []domain.Book
@@ -698,6 +884,17 @@ func (s *Service) ExtractRemoteBookChapter(
 		return "", false, false, false
 	}
 
+	// If bk was loaded as a paginated window (< ChapterCount), load full (id, url) list on cache miss
+	// so inter-chapter link rewriting resolves chapters on other TOC pages seamlessly.
+	lookupBook := bk
+	if bk.ChapterCount > len(bk.FlatChapters) {
+		var allCh []domain.BookChapter
+		if cErr := sqlx.SelectInto(ctx, s.store, &allCh,
+			`SELECT id, url FROM book_chapters WHERE book_id = ? ORDER BY sort_order ASC, id ASC`, bk.ID); cErr == nil && len(allCh) > 0 {
+			lookupBook.FlatChapters = allCh
+		}
+	}
+
 	fetchCtx, cancel := context.WithTimeout(ctx, 6*time.Second)
 	defer cancel()
 	client := s.dialer.NewHTTPClient(6 * time.Second)
@@ -709,7 +906,7 @@ func (s *Service) ExtractRemoteBookChapter(
 		finalURL = validatedURL
 	}
 
-	cleanedHTML, ok := extractAndRewriteBookHTML(rawBody, finalURL, bk, activeCh, s.renderer)
+	cleanedHTML, ok := extractAndRewriteBookHTML(rawBody, finalURL, lookupBook, activeCh, s.renderer)
 	if !ok || cleanedHTML == "" {
 		return "", false, false, false
 	}

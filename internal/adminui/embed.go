@@ -27,6 +27,7 @@ var distFS embed.FS
 // so the Admin Console & Setup Wizard SPA immediately knows the custom VOLO_ADMIN_PATH, locale, and Studio accent.
 type BootConfig struct {
 	Mode            string            `json:"mode"` // "console" | "setup"
+	Version         string            `json:"version,omitempty"`
 	AdminPath       string            `json:"admin_path"`
 	BaseAdminPath   string            `json:"base_admin_path,omitempty"`
 	PublicURL       string            `json:"public_url"`
@@ -68,7 +69,7 @@ func Default() *Handler {
 	return defaultHandler
 }
 
-// TotalGzipBytes returns the total pre-compressed Gzip byte size of all embedded Admin SPA assets (for < 300 KiB budget audit).
+// TotalGzipBytes returns the total pre-compressed Gzip byte size of all embedded Admin SPA assets (for < 380 KiB budget audit).
 func (h *Handler) TotalGzipBytes() int {
 	total := 0
 	for rel, item := range h.assets {

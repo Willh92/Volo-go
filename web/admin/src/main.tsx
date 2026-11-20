@@ -3,9 +3,11 @@ import type { CSSProperties } from "preact";
 import { useEffect, useMemo, useRef, useState } from "preact/hooks";
 import "./styles/console.css";
 import {
+  ACCENT_OPTIONS,
   accentSig,
   apiFetch,
   applyThemeAttributes,
+  appVersion,
   bootConfig,
   busyCountSig,
   csrfTokenSig,
@@ -18,6 +20,7 @@ import {
   refreshMe,
   resetConsoleScroll,
   resumeToast,
+  safeMediaSrc,
   saveGlobalAccent,
   showToast,
   themeModeSig,
@@ -52,15 +55,20 @@ import type { DistTab } from "./views/DistributeWorkspace";
 import type { SysTab } from "./views/SystemWorkspace";
 import type { AboutHelpTab } from "./views/AboutHelpWorkspace";
 
-import { SetupWizard } from "./views/SetupWizard";
 import {
   AboutHelpWorkspace,
   AppearanceWorkspace,
   ContentWorkspace,
+  createLazyView,
   DistributeWorkspace,
   OverviewWorkspace,
   SystemWorkspace,
 } from "./views/lazyWorkspaces";
+
+const SetupWizard = createLazyView(
+  () => import("./views/SetupWizard").then((m) => m.SetupWizard),
+  "100vh"
+);
 
 type NavSection =
   | OverviewSection
@@ -71,15 +79,6 @@ type NavSection =
   | "plugins"
   | SysTab
   | AboutHelpTab;
-
-const ACCENT_OPTIONS: Array<{ id: string; swatch: string }> = [
-  { id: "forest", swatch: "#246b51" },
-  { id: "ocean", swatch: "#2d6583" },
-  { id: "teal", swatch: "#286c70" },
-  { id: "amber", swatch: "#855c27" },
-  { id: "plum", swatch: "#70517d" },
-  { id: "rose", swatch: "#87525f" },
-];
 
 const MODE_OPTIONS = ["auto", "system", "light", "dark"] as const;
 
@@ -441,7 +440,7 @@ function CommandPalette({
       id: "act:blog",
       title: t("shell.view_blog"),
       sub: "/",
-      run: () => window.open("/", "_blank", "noopener"),
+      run: () => window.open("/", "_blank", "noopener,noreferrer"),
     });
     for (const p of posts) {
       out.push({
@@ -976,7 +975,8 @@ function App() {
         invalidTickPending = true;
         target.focus?.();
         const fieldWrap = target.closest(".volo-field");
-        const lbl = fieldWrap?.querySelector("label")?.textContent?.replace(/\s*\*\s*$/, "").trim();
+        const rawLbl = (fieldWrap?.querySelector("label")?.textContent || "").trim();
+        const lbl = (rawLbl.endsWith("*") ? rawLbl.slice(0, -1) : rawLbl).trim();
         const msg = target.validationMessage && target.validity && !target.validity.valueMissing
           ? target.validationMessage
           : lbl
@@ -1261,7 +1261,7 @@ function App() {
         <div class="volo-rail-footer">
           <span>
             <span class="volo-rail-dot" />
-            VOLO v1.0.2
+            VOLO {appVersion}
           </span>
           <span>{t(`role.${user.role}`)}</span>
         </div>
@@ -1426,11 +1426,14 @@ function App() {
               title={t("nav.account")}
             >
               <span class="volo-user-avatar">
-                {user.avatar_url && !avatarErr ? (
-                  <img src={user.avatar_url} alt="" onError={() => setAvatarErr(true)} />
-                ) : (
-                  initialChar
-                )}
+                {(() => {
+                  const avatarSrc = safeMediaSrc(user.avatar_url, { allowDataImage: true });
+                  return avatarSrc && !avatarErr ? (
+                    <img src={avatarSrc} alt="" onError={() => setAvatarErr(true)} />
+                  ) : (
+                    initialChar
+                  );
+                })()}
               </span>
               <span class="volo-pill-label">{user.display_name || user.username}</span>
             </button>
@@ -1549,6 +1552,9 @@ function App() {
     </div>
   );
 }
+
+export { CM6Editor, CM6CssEditor } from "./components/CM6Editor";
+export { MediaLibraryModal, MediaPickButton } from "./components/MediaLibraryModal";
 
 const root = document.getElementById("app");
 if (root) {

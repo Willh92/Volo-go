@@ -1,12 +1,13 @@
 {
   "name": "volo-admin-console",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "license": "Apache-2.0",
   "private": true,
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "tsc --noEmit && vite build && node scripts/precompress.mjs"
+    "build": "tsc --noEmit && vite build && node scripts/precompress.mjs",
+    "test": "node --test tests/*.test.ts"
   },
   "dependencies": {
     "@codemirror/commands": "^6.7.1",

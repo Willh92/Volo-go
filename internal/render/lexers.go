@@ -1,12 +1,19 @@
 package render
 
 import (
+	"bytes"
+	"compress/gzip"
+	_ "embed"
+	"io"
 	"regexp"
 	"strconv"
 	"strings"
 	"sync"
 	"unicode/utf8"
 )
+
+//go:embed lexers_spec.gz
+var packedLexersGZ []byte
 
 type chromaRule struct {
 	re  *regexp.Regexp
@@ -169,9 +176,18 @@ func normalizeCodeLangKey(lang string) string {
 	if fields := strings.Fields(key); len(fields) > 0 {
 		key = fields[0]
 	}
+	key = strings.TrimPrefix(key, "{.")
+	key = strings.TrimPrefix(key, "{")
+	key = strings.TrimPrefix(key, ".")
+	for _, sep := range []byte{'{', ',', ';', ':'} {
+		if idx := strings.IndexByte(key, sep); idx >= 0 {
+			key = key[:idx]
+		}
+	}
+	key = strings.TrimRight(key, "}")
 	key = strings.TrimPrefix(key, "language-")
 	key = strings.TrimPrefix(key, "lang-")
-	return strings.Trim(key, ",;:")
+	return strings.TrimSpace(key)
 }
 
 func resolveCodeLexer(lang string) *codeLexer {
@@ -202,6 +218,10 @@ func resolveCodeLexerForCode(lang string, code string) (*codeLexer, string) {
 }
 
 func highlightCodeChroma(code string, lang string, withLineNumbers bool) string {
+	if strings.ContainsRune(code, '\r') {
+		code = strings.ReplaceAll(code, "\r\n", "\n")
+		code = strings.ReplaceAll(code, "\r", "\n")
+	}
 	lx, detectedLang := resolveCodeLexerForCode(lang, code)
 
 	var out strings.Builder
@@ -239,6 +259,10 @@ func highlightCodeChroma(code string, lang string, withLineNumbers bool) string 
 }
 
 func highlightCommentCodeChroma(code string, lang string) string {
+	if strings.ContainsRune(code, '\r') {
+		code = strings.ReplaceAll(code, "\r\n", "\n")
+		code = strings.ReplaceAll(code, "\r", "\n")
+	}
 	lx, _ := resolveCodeLexerForCode(lang, code)
 
 	var out strings.Builder
@@ -707,10 +731,6 @@ func tokenizeHTML(w *codeHTMLWriter, src string) {
 				quote := b
 				j := i + 1
 				for j < n {
-					if src[j] == '\\' && j+1 < n {
-						j += 2
-						continue
-					}
 					if src[j] == quote {
 						j++
 						break
@@ -815,522 +835,96 @@ func setPunctBytes(lx *codeLexer, chars string, cls string) {
 	}
 }
 
-const asciiDigits = "0123456789"
-const asciiAlpha = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
-
 func initCodeLexers() {
-	buildIdentMap := func(keywords, types, consts string, fold bool) map[string]string {
+	codeLexers = make(map[string]*codeLexer, 128)
+	gr, err := gzip.NewReader(bytes.NewReader(packedLexersGZ))
+	if err != nil {
+		return
+	}
+	raw, err := io.ReadAll(gr)
+	_ = gr.Close()
+	if err != nil {
+		return
+	}
+
+	buildIdentMap := func(keywords, types, consts, builtins string, fold bool) map[string]string {
+		if keywords == "" && types == "" && consts == "" && builtins == "" {
+			return nil
+		}
 		m := make(map[string]string, 64)
 		setWordMap(m, keywords, "k", fold)
 		setWordMap(m, types, "kt", fold)
 		setWordMap(m, consts, "kc", fold)
+		setWordMap(m, builtins, "nb", false)
 		return m
 	}
 
-	// 1. Go
-	goLex := &codeLexer{
-		skipWS:           true,
-		hasFastIdent:     true,
-		hasSlashComments: true,
-		detectFuncCall:   true,
-		detectTypeIdent:  true,
-		identMap: buildIdentMap(
-			"break|case|chan|const|continue|default|defer|else|fallthrough|for|func|go|goto|if|import|interface|map|package|range|return|select|struct|switch|type|var",
-			"any|bool|byte|comparable|complex64|complex128|error|float32|float64|int|int8|int16|int32|int64|rune|string|uint|uint8|uint16|uint32|uint64|uintptr",
-			"true|false|nil|iota",
-			false,
-		),
-	}
-	addLexerRules(goLex, []rawByteRule{
-		{leads: "/", pattern: `//[^\n]*`, cls: "c1"},
-		{leads: "/", pattern: `/\*[\s\S]*?\*/`, cls: "cm"},
-		{leads: "`", pattern: "`[^`]*`", cls: "sb"},
-		{leads: `"`, pattern: `"(?:\\.|[^"\\\n])*"`, cls: "s2"},
-		{leads: "'", pattern: `'(?:\\.|[^'\\\n])*'`, cls: "s1"},
-		{leads: "0", pattern: `0[xX][0-9a-fA-F](?:_?[0-9a-fA-F])*`, cls: "mh"},
-		{leads: "0", pattern: `0[bB][01](?:_?[01])*`, cls: "mi"},
-		{leads: "0", pattern: `0[oO][0-7](?:_?[0-7])*`, cls: "mo"},
-		{leads: asciiDigits, pattern: `\d(?:_?\d)*(?:\.\d(?:_?\d)*(?:[eE][+-]?\d(?:_?\d)*)?|[eE][+-]?\d(?:_?\d)*)`, cls: "mf"},
-		{leads: asciiDigits, pattern: `\d(?:_?\d)*`, cls: "mi"},
-	})
-	setOpBytes(goLex, "+-*/%&|^!~<>?:=")
-	setPunctBytes(goLex, "{}()[];,.", "p")
-	setWordMap(goLex.identMap, "append|cap|clear|close|complex|copy|delete|imag|len|make|max|min|new|panic|print|println|real|recover", "nb", false)
-
-	// 2. TypeScript / JavaScript / JSX / TSX
-	tsLex := &codeLexer{
-		skipWS:           true,
-		hasFastIdent:     true,
-		identAllowDollar: true,
-		hasSlashComments: true,
-		detectFuncCall:   true,
-		detectTypeIdent:  true,
-		identMap: buildIdentMap(
-			"async|await|break|case|catch|class|const|continue|debugger|default|delete|do|else|enum|export|extends|finally|for|from|function|if|implements|import|in|instanceof|interface|let|new|of|package|private|protected|public|readonly|return|static|super|switch|this|throw|try|type|typeof|var|void|while|with|yield",
-			"any|bigint|boolean|never|number|object|string|symbol|unknown|Promise|Record|Partial|Array|Map|Set",
-			"true|false|null|undefined|NaN|Infinity",
-			false,
-		),
-	}
-	setWordMap(tsLex.identMap, "console|window|document|globalThis|JSON|Math|Object|Reflect|Proxy|Intl|Date|RegExp|Error|URL|URLSearchParams|fetch|setTimeout|clearTimeout|setInterval|clearInterval|queueMicrotask|structuredClone|parseInt|parseFloat|isNaN|isFinite", "nb", false)
-	addLexerRules(tsLex, []rawByteRule{
-		{leads: "/", pattern: `//[^\n]*`, cls: "c1"},
-		{leads: "/", pattern: `/\*[\s\S]*?\*/`, cls: "cm"},
-		{leads: "`", pattern: "`(?:\\\\[\\s\\S]|[^`\\\\])*`", cls: "sb"},
-		{leads: `"`, pattern: `"(?:\\.|[^"\\\n])*"`, cls: "s2"},
-		{leads: "'", pattern: `'(?:\\.|[^'\\\n])*'`, cls: "s1"},
-		{leads: "@", pattern: `@[A-Za-z_$][A-Za-z0-9_$]*`, cls: "nd"},
-		{leads: "0", pattern: `0[xX][0-9a-fA-F](?:_?[0-9a-fA-F])*n?`, cls: "mh"},
-		{leads: "0", pattern: `0[bB][01](?:_?[01])*n?`, cls: "mi"},
-		{leads: "0", pattern: `0[oO][0-7](?:_?[0-7])*n?`, cls: "mo"},
-		{leads: asciiDigits, pattern: `\d(?:_?\d)*(?:\.\d(?:_?\d)*(?:[eE][+-]?\d(?:_?\d)*)?|[eE][+-]?\d(?:_?\d)*)`, cls: "mf"},
-		{leads: asciiDigits, pattern: `\d(?:_?\d)*n?`, cls: "mi"},
-	})
-	setOpBytes(tsLex, "+-*/%&|^!~<>?:=")
-	setPunctBytes(tsLex, "{}()[];,.", "p")
-
-	// 3. Rust (distinguishing single-char literals `'x'`/`'\n'` from lifetime parameters `'a`, `'static`)
-	rsLex := &codeLexer{
-		skipWS:           true,
-		hasFastIdent:     true,
-		rustMacroBang:    true,
-		hasSlashComments: true,
-		detectFuncCall:   true,
-		detectTypeIdent:  true,
-		prefixMode:       prefixRust,
-		identMap: buildIdentMap(
-			"as|async|await|break|const|continue|crate|dyn|else|enum|extern|fn|for|if|impl|in|let|loop|match|mod|move|mut|pub|ref|return|self|Self|static|struct|super|trait|type|unsafe|use|where|while",
-			"bool|char|f32|f64|i8|i16|i32|i64|i128|isize|str|String|u8|u16|u32|u64|u128|usize|Vec|Option|Result|Box",
-			"true|false|None|Some|Ok|Err",
-			false,
-		),
-	}
-	addLexerRules(rsLex, []rawByteRule{
-		{leads: "/", pattern: `//[^\n]*`, cls: "c1"},
-		{leads: "/", pattern: `/\*[\s\S]*?\*/`, cls: "cm"},
-		{leads: "#", pattern: `#!?\[[^\]]*\]`, cls: "nd"},
-		{leads: `"br`, pattern: `b?r##"[\s\S]*?"##|b?r#"[\s\S]*?"#|b?r"[^"]*"|b?"(?:\\[\s\S]|[^"\\])*"`, cls: "s2"},
-		{leads: "'b", pattern: `b?'(?:\\(?:x[0-9a-fA-F]{2}|u\{[0-9a-fA-F_]{1,6}\}|.)|[^'\\\n])'`, cls: "s1"},
-		{leads: "'", pattern: `'[A-Za-z_][A-Za-z0-9_]*\b`, cls: "kt"},
-		{leads: "0", pattern: `0[xX][0-9a-fA-F_]+(?:[iu](?:8|16|32|64|128|size))?`, cls: "mh"},
-		{leads: "0", pattern: `0[bB][01_]+(?:[iu](?:8|16|32|64|128|size))?`, cls: "mi"},
-		{leads: "0", pattern: `0[oO][0-7_]+(?:[iu](?:8|16|32|64|128|size))?`, cls: "mo"},
-		{leads: asciiDigits, pattern: `\d[\d_]*(?:\.\d[\d_]*(?:[eE][+-]?\d[\d_]*)?|[eE][+-]?\d[\d_]*)(?:f32|f64)?`, cls: "mf"},
-		{leads: asciiDigits, pattern: `\d[\d_]*(?:[iu](?:8|16|32|64|128|size)|f32|f64)?`, cls: "mi"},
-	})
-	setOpBytes(rsLex, "+-*/%&|^!~<>?:=")
-	setPunctBytes(rsLex, "{}()[];,.", "p")
-
-	// 4. C / C++ / Java / C# / Kotlin / Swift (supporting C++14 digit separators `1'000'000` / `0xFF'FF` and no JS backticks)
-	cFamLex := &codeLexer{
-		skipWS:           true,
-		hasFastIdent:     true,
-		hasSlashComments: true,
-		detectFuncCall:   true,
-		detectTypeIdent:  true,
-		identMap: buildIdentMap(
-			"abstract|assert|async|await|break|case|catch|class|concept|const|consteval|constexpr|constinit|continue|co_await|co_return|co_yield|decltype|default|delete|do|else|enum|explicit|export|extends|final|finally|for|friend|goto|guard|if|implements|import|in|inline|interface|internal|let|mutable|namespace|new|noexcept|open|operator|override|package|private|protected|public|requires|return|sealed|sizeof|static|static_assert|struct|super|switch|synchronized|template|this|throw|throws|try|typedef|typename|using|val|var|virtual|volatile|when|where|while",
-			"auto|bool|boolean|byte|char|char8_t|char16_t|char32_t|decimal|double|float|int|int8_t|int16_t|int32_t|int64_t|long|ptrdiff_t|short|signed|size_t|string|String|uint8_t|uint16_t|uint32_t|uint64_t|uintptr_t|unsigned|void|wchar_t",
-			"true|false|null|nullptr|nil",
-			false,
-		),
-	}
-	addLexerRules(cFamLex, []rawByteRule{
-		{leads: "/", pattern: `//[^\n]*`, cls: "c1"},
-		{leads: "/", pattern: `/\*[\s\S]*?\*/`, cls: "cm"},
-		{leads: "#", pattern: `#[ \t]*(?:include|define|ifdef|ifndef|endif|elif|else|pragma|undef|error|warning|if|line|region|endregion)\b[^\n]*`, cls: "cp"},
-		{leads: `"`, pattern: `"(?:\\.|[^"\\\n])*"`, cls: "s2"},
-		{leads: "'", pattern: `'(?:\\.|[^'\\\n])+'`, cls: "s1"},
-		{leads: "@", pattern: `@"(?:""|[^"])*"`, cls: "s2"},
-		{leads: "@", pattern: `@[A-Za-z_][A-Za-z0-9_]*`, cls: "nd"},
-		{leads: "0", pattern: `0[xX][0-9a-fA-F](?:['_]?[0-9a-fA-F])*(?:\.[0-9a-fA-F](?:['_]?[0-9a-fA-F])*[pP][+-]?\d(?:['_]?\d)*)?[uUlLfFdD]*`, cls: "mh"},
-		{leads: "0", pattern: `0[bB][01](?:['_]?[01])*[uUlL]*`, cls: "mi"},
-		{leads: asciiDigits, pattern: `\d(?:['_]?\d)*(?:\.\d(?:['_]?\d)*(?:[eE][+-]?\d(?:['_]?\d)*)?|[eE][+-]?\d(?:['_]?\d)*)[fFdDmM]?`, cls: "mf"},
-		{leads: asciiDigits, pattern: `\d(?:['_]?\d)*[uUlL]*`, cls: "mi"},
-	})
-	setOpBytes(cFamLex, "+-*/%&|^!~<>?:=")
-	setPunctBytes(cFamLex, "{}()[];,.", "p")
-
-	// 5. Python (supporting multi-line triple-quoted prefixed f/r/b/u strings)
-	pyLex := &codeLexer{
-		skipWS:          true,
-		hasFastIdent:    true,
-		detectFuncCall:  true,
-		detectTypeIdent: true,
-		prefixMode:      prefixPython,
-		identMap: buildIdentMap(
-			"and|as|assert|async|await|break|case|class|continue|def|del|elif|else|except|finally|for|from|global|if|import|in|is|lambda|match|nonlocal|not|or|pass|raise|return|try|type|while|with|yield",
-			"int|float|str|bytes|bool|list|dict|set|tuple|Any|Optional|Callable|Iterable|Sequence",
-			"True|False|None|self|cls",
-			false,
-		),
-	}
-	addLexerRules(pyLex, []rawByteRule{
-		{leads: "#", pattern: `#[^\n]*`, cls: "c1"},
-		{leads: `"'`, pattern: `"""[\s\S]*?"""|'''[\s\S]*?'''`, cls: "sd"},
-		{leads: `"'fFrRbBuU`, pattern: `(?i)[frbu]{0,2}(?:"""[\s\S]*?"""|'''[\s\S]*?''')`, cls: "s"},
-		{leads: `"'fFrRbBuU`, pattern: `(?i)[frbu]{0,2}"(?:\\.|[^"\\\n])*"|(?i)[frbu]{0,2}'(?:\\.|[^'\\\n])*'`, cls: "s"},
-		{leads: "@", pattern: `@[A-Za-z_][A-Za-z0-9_.]*`, cls: "nd"},
-		{leads: "0", pattern: `0[xX][0-9a-fA-F_]+`, cls: "mh"},
-		{leads: "0", pattern: `0[bB][01_]+`, cls: "mi"},
-		{leads: "0", pattern: `0[oO][0-7_]+`, cls: "mo"},
-		{leads: asciiDigits, pattern: `\d[\d_]*(?:\.\d[\d_]*(?:[eE][+-]?\d[\d_]*)?|[eE][+-]?\d[\d_]*)[jJ]?`, cls: "mf"},
-		{leads: asciiDigits, pattern: `\d[\d_]*[jJ]?`, cls: "mi"},
-	})
-	setOpBytes(pyLex, "+-*/%&|^~<>!=:@")
-	setPunctBytes(pyLex, "{}()[];,.", "p")
-	setWordMap(pyLex.identMap, "abs|all|any|ascii|bin|chr|dir|divmod|enumerate|eval|exec|filter|format|getattr|globals|hasattr|hash|hex|id|input|isinstance|issubclass|iter|len|locals|map|max|min|next|oct|open|ord|pow|print|property|range|repr|reversed|round|setattr|slice|sorted|staticmethod|classmethod|sum|super|vars|zip", "nb", false)
-
-	// 6. Shell / Bash / Dockerfile
-	shLex := &codeLexer{
-		customScan: tokenizeShell,
-	}
-
-	// 7. SQL
-	sqlLex := &codeLexer{
-		skipWS:           true,
-		hasFastIdent:     true,
-		identAllowDollar: true,
-		identFoldCase:    true,
-		hasSlashComments: true,
-		hasDashComment:   true,
-		detectFuncCall:   true,
-		identMap: buildIdentMap(
-			"select|from|where|insert|into|values|update|set|delete|create|alter|drop|table|index|unique|primary|key|foreign|references|join|left|right|inner|outer|on|as|and|or|not|null|is|in|exists|between|like|order|by|group|having|limit|offset|union|all|distinct|case|when|then|else|end|begin|commit|rollback|transaction|pragma|with|returning|conflict|do|nothing|default|cascade|if",
-			"integer|int|bigint|smallint|text|varchar|char|boolean|bool|blob|bytea|real|double|numeric|decimal|timestamp|timestamptz|date|time|uuid|json|jsonb",
-			"true|false",
-			true,
-		),
-	}
-	addLexerRules(sqlLex, []rawByteRule{
-		{leads: "-", pattern: `--[^\n]*`, cls: "c1"},
-		{leads: "/", pattern: `/\*[\s\S]*?\*/`, cls: "cm"},
-		{leads: "'", pattern: `'(?:''|[^'])*'`, cls: "s1"},
-		{leads: "\"`", pattern: `"(?:""|[^"])*"|` + "`[^`]*`", cls: ""},
-		{leads: asciiDigits, pattern: `\d+(?:\.\d+)?`, cls: "m"},
-	})
-	setOpBytes(sqlLex, "=<>!+-*/%|")
-	setPunctBytes(sqlLex, "(),;.", "p")
-
-	// 8. Structured Config Data: YAML / TOML / INI / ENV + dedicated JSON / JSONC
-	jsonLex := &codeLexer{
-		customScan: tokenizeJSON,
-	}
-	dataLex := &codeLexer{
-		customScan: tokenizeConfigData,
-	}
-
-	// 9. HTML / XML / SVG / Vue / Svelte (tag-state-aware scanner)
-	htmlLex := &codeLexer{
-		customScan: tokenizeHTML,
-	}
-
-	// 10. CSS / SCSS / LESS (property-vs-selector-vs-value aware scanner)
-	cssLex := &codeLexer{
-		customScan: tokenizeCSS,
-	}
-
-	// 11. Nginx / Caddy / Apache / Reverse-Proxy Config
-	nginxLex := &codeLexer{
-		skipWS:        true,
-		hasFastIdent:  true,
-		prefixMode:    prefixNginx,
-		stmtDirective: "na",
-		identMap: buildIdentMap(
-			"http|server|location|upstream|events|stream|mail|map|geo|types|limit_except|if|else|return|rewrite|break|set|include|handle|route|match|reverse_proxy|file_server|respond|redir|tls|VirtualHost|Directory|Location|IfModule",
-			"",
-			"on|off|yes|no|true|false|default_server|ssl|http2|http3|permanent|redirect|last|any|all|none|localhost",
-			false,
-		),
-	}
-	addLexerRules(nginxLex, []rawByteRule{
-		{leads: "#", pattern: `#[^\n]*`, cls: "c1"},
-		{leads: "hHwWgGfFuUsS", pattern: `(?i)(?:https?|wss?|grpcs?|fastcgi|uwsgi|scgi)://[^\s;'"<>]+|(?i)unix:[^\s;'"<>]+`, cls: "s2"},
-		{leads: `"`, pattern: `"(?:\\.|[^"\\\n])*"`, cls: "s2"},
-		{leads: "'", pattern: `'[^'\n]*'`, cls: "s1"},
-		{leads: "$", pattern: `\$\{?[A-Za-z_][A-Za-z0-9_]*\}?`, cls: "nv"},
-		{leads: "@", pattern: `@[A-Za-z_][A-Za-z0-9_-]*`, cls: "nd"},
-		{leads: asciiDigits, pattern: `\d+\.\d+\.\d+\.\d+(?::\d+)?(?:/\d+)?`, cls: "m"},
-		{leads: asciiDigits, pattern: `\d+(?:\.\d+)?(?:ms|[kKmMgGsSmMhHdD])?\b`, cls: "m"},
-	})
-	setOpBytes(nginxLex, "=<>!~*&|^")
-	setPunctBytes(nginxLex, "{}()[];,:.", "p")
-
-	// 12. Diff / Patch
-	diffLex := &codeLexer{}
-	addLexerRules(diffLex, []rawByteRule{
-		{leads: "+", pattern: `\+[^\n]*`, cls: "gi"},
-		{leads: "-", pattern: `-[^\n]*`, cls: "gd"},
-		{leads: "@", pattern: `@@[^\n]*`, cls: "gu"},
-		{leads: "#", pattern: `#{1,6}\s[^\n]*`, cls: "gh"},
-		{leads: "", pattern: `[^\n]+|\n`, cls: ""},
-	})
-
-	// 13. Markdown
-	mdLex := &codeLexer{}
-	addLexerRules(mdLex, []rawByteRule{
-		{leads: "#", pattern: `#{1,6}\s[^\n]*`, cls: "gh"},
-		{leads: "`", pattern: "```[^\\n]*|`[^`\\n]+`", cls: "sb"},
-		{leads: "*_", pattern: `\*\*[^*\n]+\*\*|__[^_\n]+__`, cls: "gs"},
-		{leads: "![", pattern: `!?\[[^\]\n]*\]\([^)\n]*\)`, cls: "nt"},
-		{leads: ">", pattern: `>\s?`, cls: "k"},
-		{leads: "-*+" + asciiDigits, pattern: `(?:[-*+]|\d+\.)\s`, cls: "k"},
-		{leads: "", pattern: "[^\\n`*_\\[\\]#>+-]+|.|\\n", cls: ""},
-	})
-
-	// 14. PHP (split from cFamLex so `$class` / `$var` never splits `$` + keyword, with `#`, `//`, and `/* */` comments)
-	phpLex := &codeLexer{
-		skipWS:           true,
-		hasFastIdent:     true,
-		identAllowDollar: true,
-		dollarVarCls:     "nv",
-		hasSlashComments: true,
-		detectFuncCall:   true,
-		detectTypeIdent:  true,
-		identMap: buildIdentMap(
-			"abstract|and|array|as|break|callable|case|catch|class|clone|const|continue|declare|default|die|do|echo|else|elseif|empty|enddeclare|endfor|endforeach|endif|endswitch|endwhile|eval|exit|extends|final|finally|fn|for|foreach|function|global|goto|if|implements|include|include_once|instanceof|insteadof|interface|isset|list|match|namespace|new|or|print|private|protected|public|readonly|require|require_once|return|static|switch|throw|trait|try|unset|use|var|while|xor|yield",
-			"bool|float|int|iterable|mixed|never|numeric|object|parent|resource|self|string|void",
-			"true|false|null|TRUE|FALSE|NULL|__CLASS__|__DIR__|__FILE__|__FUNCTION__|__LINE__|__METHOD__|__NAMESPACE__|__TRAIT__",
-			false,
-		),
-	}
-	addLexerRules(phpLex, []rawByteRule{
-		{leads: "<", pattern: `<\?(?:php|=)?`, cls: "cp"},
-		{leads: "?", pattern: `\?>`, cls: "cp"},
-		{leads: "/", pattern: `//[^\n]*`, cls: "c1"},
-		{leads: "/", pattern: `/\*[\s\S]*?\*/`, cls: "cm"},
-		{leads: "#", pattern: `#\[[^\]]*\]`, cls: "nd"},
-		{leads: "#", pattern: `#[^\n]*`, cls: "c1"},
-		{leads: `"`, pattern: `"(?:\\[\s\S]|[^"\\])*"`, cls: "s2"},
-		{leads: "'", pattern: `'(?:\\[\s\S]|[^'\\])*'`, cls: "s1"},
-		{leads: "0", pattern: `0[xX][0-9a-fA-F_]+`, cls: "mh"},
-		{leads: "0", pattern: `0[bB][01_]+`, cls: "mi"},
-		{leads: "0", pattern: `0[oO][0-7_]+`, cls: "mo"},
-		{leads: asciiDigits, pattern: `\d[\d_]*(?:\.\d[\d_]*(?:[eE][+-]?\d[\d_]*)?|[eE][+-]?\d[\d_]*)`, cls: "mf"},
-		{leads: asciiDigits, pattern: `\d[\d_]*`, cls: "mi"},
-	})
-	setOpBytes(phpLex, "+-*/%&|^!~<>?:=.")
-	setPunctBytes(phpLex, "{}()[];,", "p")
-
-	// 15. Ruby (`#` comments, `:symbol`, `@ivar`/`@@cvar`/`$gvar`, strings, keywords)
-	rubyLex := &codeLexer{
-		skipWS:          true,
-		hasFastIdent:    true,
-		detectFuncCall:  true,
-		detectTypeIdent: true,
-		identMap: buildIdentMap(
-			"alias|and|attr_accessor|attr_reader|attr_writer|begin|break|case|class|def|defined|do|else|elsif|end|ensure|extend|for|if|in|include|module|next|not|or|prepend|private|protected|public|raise|redo|require|require_relative|rescue|retry|return|super|then|undef|unless|until|when|while|yield",
-			"",
-			"nil|true|false|self|__FILE__|__LINE__|__ENCODING__",
-			false,
-		),
-	}
-	setWordMap(rubyLex.identMap, "puts|print|p|pp|lambda|proc|loop|open|sleep|rand|freeze|frozen", "nb", false)
-	addLexerRules(rubyLex, []rawByteRule{
-		{leads: "#", pattern: `#[^\n]*`, cls: "c1"},
-		{leads: ":", pattern: `::`, cls: "o"},
-		{leads: ":", pattern: `:[A-Za-z_][A-Za-z0-9_]*[?!]?`, cls: "ss"},
-		{leads: "@", pattern: `@@?[A-Za-z_][A-Za-z0-9_]*`, cls: "nv"},
-		{leads: "$", pattern: `\$[A-Za-z0-9_!@&+?~*$-]+`, cls: "nv"},
-		{leads: `"`, pattern: `"(?:\\[\s\S]|[^"\\])*"`, cls: "s2"},
-		{leads: "'", pattern: `'(?:\\[\s\S]|[^'\\])*'`, cls: "s1"},
-		{leads: "0", pattern: `0[xX][0-9a-fA-F_]+`, cls: "mh"},
-		{leads: "0", pattern: `0[bB][01_]+`, cls: "mi"},
-		{leads: "0", pattern: `0[oO][0-7_]+`, cls: "mo"},
-		{leads: asciiDigits, pattern: `\d[\d_]*(?:\.\d[\d_]*(?:[eE][+-]?\d[\d_]*)?|[eE][+-]?\d[\d_]*)`, cls: "mf"},
-		{leads: asciiDigits, pattern: `\d[\d_]*`, cls: "mi"},
-	})
-	setOpBytes(rubyLex, "+-*/%&|^!~<>?=")
-	setPunctBytes(rubyLex, "{}()[];,.:", "p")
-
-	// 16. Lua (`--[[...]]` & `--` comments, strings, keywords)
-	luaLex := &codeLexer{
-		skipWS:         true,
-		hasFastIdent:   true,
-		hasDashComment: true,
-		detectFuncCall: true,
-		identMap: buildIdentMap(
-			"and|break|do|else|elseif|end|for|function|goto|if|in|local|not|or|repeat|return|then|until|while",
-			"",
-			"nil|true|false",
-			false,
-		),
-	}
-	setWordMap(luaLex.identMap, "assert|collectgarbage|dofile|error|getmetatable|ipairs|load|loadfile|next|pairs|pcall|print|rawequal|rawget|rawlen|rawset|require|select|setmetatable|tonumber|tostring|type|unpack|xpcall|coroutine|io|math|os|package|string|table|utf8", "nb", false)
-	addLexerRules(luaLex, []rawByteRule{
-		{leads: "-", pattern: `--\[\[[\s\S]*?\]\]|--\[=\[[\s\S]*?\]=\]|--\[==\[[\s\S]*?\]==\]`, cls: "cm"},
-		{leads: "-", pattern: `--[^\n]*`, cls: "c1"},
-		{leads: "[", pattern: `\[\[[\s\S]*?\]\]|\[=\[[\s\S]*?\]=\]|\[==\[[\s\S]*?\]==\]`, cls: "s"},
-		{leads: `"`, pattern: `"(?:\\[\s\S]|[^"\\\n])*"`, cls: "s2"},
-		{leads: "'", pattern: `'(?:\\[\s\S]|[^'\\\n])*'`, cls: "s1"},
-		{leads: ".", pattern: `\.\.\.?`, cls: "o"},
-		{leads: "0", pattern: `0[xX][0-9a-fA-F]+(?:\.[0-9a-fA-F]+)?(?:[pP][+-]?\d+)?`, cls: "mh"},
-		{leads: asciiDigits, pattern: `\d+(?:\.\d+)?(?:[eE][+-]?\d+)?`, cls: "m"},
-	})
-	setOpBytes(luaLex, "+-*/%^#=~<>")
-	setPunctBytes(luaLex, "{}()[];,:.", "p")
-
-	// 17. GraphQL (`#` comments, `@directive`, `$var`, keywords, builtin scalars)
-	graphqlLex := &codeLexer{
-		skipWS:          true,
-		hasFastIdent:    true,
-		detectTypeIdent: true,
-		identMap: buildIdentMap(
-			"directive|enum|extend|fragment|implements|input|interface|mutation|on|query|repeatable|scalar|schema|subscription|type|union",
-			"Boolean|Float|ID|Int|String",
-			"true|false|null",
-			false,
-		),
-	}
-	addLexerRules(graphqlLex, []rawByteRule{
-		{leads: "#", pattern: `#[^\n]*`, cls: "c1"},
-		{leads: `"`, pattern: `"""[\s\S]*?"""`, cls: "sd"},
-		{leads: `"`, pattern: `"(?:\\.|[^"\\\n])*"`, cls: "s2"},
-		{leads: "@", pattern: `@[A-Za-z_][A-Za-z0-9_]*`, cls: "nd"},
-		{leads: "$", pattern: `\$[A-Za-z_][A-Za-z0-9_]*`, cls: "nv"},
-		{leads: ".", pattern: `\.\.\.`, cls: "o"},
-		{leads: "-" + asciiDigits, pattern: `-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?`, cls: "m"},
-	})
-	setOpBytes(graphqlLex, "=!|&")
-	setPunctBytes(graphqlLex, "{}()[]:,", "p")
-
-	// 18. Protocol Buffers (`//` & `/* */` comments, keywords, scalar types)
-	protoLex := &codeLexer{
-		skipWS:           true,
-		hasFastIdent:     true,
-		hasSlashComments: true,
-		detectFuncCall:   true,
-		detectTypeIdent:  true,
-		identMap: buildIdentMap(
-			"edition|enum|extend|extensions|import|map|max|message|oneof|option|optional|package|public|repeated|required|reserved|returns|rpc|service|stream|syntax|to|weak",
-			"bool|bytes|double|fixed32|fixed64|float|int32|int64|sfixed32|sfixed64|sint32|sint64|string|uint32|uint64",
-			"true|false",
-			false,
-		),
-	}
-	addLexerRules(protoLex, []rawByteRule{
-		{leads: "/", pattern: `//[^\n]*`, cls: "c1"},
-		{leads: "/", pattern: `/\*[\s\S]*?\*/`, cls: "cm"},
-		{leads: `"`, pattern: `"(?:\\.|[^"\\\n])*"`, cls: "s2"},
-		{leads: "'", pattern: `'(?:\\.|[^'\\\n])*'`, cls: "s1"},
-		{leads: "0", pattern: `0[xX][0-9a-fA-F]+`, cls: "mh"},
-		{leads: asciiDigits, pattern: `\d+(?:\.\d+)?(?:[eE][+-]?\d+)?`, cls: "m"},
-	})
-	setOpBytes(protoLex, "=<>+-")
-	setPunctBytes(protoLex, "{}()[];,.", "p")
-
-	// 19. HCL / Terraform (`#`, `//`, `/* */` comments, blocks, types)
-	hclLex := &codeLexer{
-		skipWS:           true,
-		hasFastIdent:     true,
-		hasSlashComments: true,
-		detectFuncCall:   true,
-		identMap: buildIdentMap(
-			"backend|count|data|dynamic|for|for_each|if|in|lifecycle|locals|module|moved|output|provider|provisioner|removed|resource|terraform|variable",
-			"any|bool|list|map|number|object|set|string|tuple",
-			"true|false|null",
-			false,
-		),
-	}
-	addLexerRules(hclLex, []rawByteRule{
-		{leads: "#", pattern: `#[^\n]*`, cls: "c1"},
-		{leads: "/", pattern: `//[^\n]*`, cls: "c1"},
-		{leads: "/", pattern: `/\*[\s\S]*?\*/`, cls: "cm"},
-		{leads: `"`, pattern: `"(?:\\.|[^"\\\n])*"`, cls: "s2"},
-		{leads: "$", pattern: `\$\{[^}\n]*\}`, cls: "nv"},
-		{leads: asciiDigits, pattern: `\d+(?:\.\d+)?`, cls: "m"},
-	})
-	setOpBytes(hclLex, "=+-*/%&|!<>?:")
-	setPunctBytes(hclLex, "{}()[],.", "p")
-
-	// 20. Hash-comment scripting languages: Elixir / R / Perl (`#` comments only, never `--` or `//`)
-	hashLangLex := &codeLexer{
-		skipWS:          true,
-		hasFastIdent:    true,
-		detectFuncCall:  true,
-		detectTypeIdent: true,
-		identMap: buildIdentMap(
-			"after|alias|and|case|catch|cond|def|defexception|defimpl|defmacro|defmacrop|defmodule|defoverridable|defp|defprotocol|defstruct|do|else|elsif|end|fn|for|function|if|import|in|last|library|local|my|next|not|or|our|package|quote|raise|receive|repeat|require|rescue|return|sub|try|unless|until|use|when|while|with",
-			"",
-			"true|false|nil|TRUE|FALSE|NULL|NA|NaN|Inf",
-			false,
-		),
-	}
-	addLexerRules(hashLangLex, []rawByteRule{
-		{leads: "#", pattern: `#[^\n]*`, cls: "c1"},
-		{leads: ":", pattern: `::`, cls: "o"},
-		{leads: ":", pattern: `:[A-Za-z_][A-Za-z0-9_]*[?!]?`, cls: "ss"},
-		{leads: "@", pattern: `@[A-Za-z_][A-Za-z0-9_]*`, cls: "nd"},
-		{leads: "$%", pattern: `[\$@%][A-Za-z_][A-Za-z0-9_]*`, cls: "nv"},
-		{leads: `"`, pattern: `"""[\s\S]*?"""|"(?:\\[\s\S]|[^"\\])*"`, cls: "s2"},
-		{leads: "'", pattern: `'(?:\\[\s\S]|[^'\\])*'`, cls: "s1"},
-		{leads: "0", pattern: `0[xX][0-9a-fA-F_]+`, cls: "mh"},
-		{leads: asciiDigits, pattern: `\d[\d_]*(?:\.\d[\d_]*)?`, cls: "m"},
-	})
-	setOpBytes(hashLangLex, "+-*/%&|^!~<>?=")
-	setPunctBytes(hashLangLex, "{}()[];,.:", "p")
-
-	// 21. Generic fallback for code-like unlabeled or rare-language blocks
-	genericLex := &codeLexer{
-		skipWS:           true,
-		hasFastIdent:     true,
-		identAllowDollar: true,
-		hasSlashComments: true,
-		hasDashComment:   true,
-		detectFuncCall:   true,
-		detectTypeIdent:  true,
-		stmtDirective:    "na",
-		identMap: buildIdentMap(
-			"if|else|elif|for|while|do|switch|case|default|break|continue|return|func|function|fn|def|class|struct|interface|enum|trait|impl|type|const|let|var|val|import|from|export|package|pub|async|await|try|catch|finally|throw|new|in|of|with|as|is|match|yield|defer|go|select|server|location|upstream|http|events|listen|proxy_pass",
-			"int|int64|uint|float|float64|bool|boolean|string|str|byte|void|any|error|null|auto|char|double",
-			"true|false|null|nil|undefined|none|None|True|False|on|off|yes|no|NaN|Infinity",
-			false,
-		),
-	}
-	addLexerRules(genericLex, []rawByteRule{
-		{leads: "#", pattern: `#[^\n]*`, cls: "c1"},
-		{leads: "/", pattern: `//[^\n]*`, cls: "c1"},
-		{leads: "/", pattern: `/\*[\s\S]*?\*/`, cls: "cm"},
-		{leads: "-", pattern: `--[^\n]*`, cls: "c1"},
-		{leads: `"`, pattern: `"(?:\\.|[^"\\\n])*"`, cls: "s2"},
-		{leads: "'", pattern: `'(?:\\.|[^'\\\n])*'`, cls: "s1"},
-		{leads: "`", pattern: "`[^`\\n]*`", cls: "sb"},
-		{leads: "$", pattern: `\$\{?[A-Za-z_][A-Za-z0-9_]*\}?`, cls: "nv"},
-		{leads: "0", pattern: `0[xX][0-9a-fA-F_]+`, cls: "mh"},
-		{leads: asciiDigits, pattern: `\d+(?:\.\d+)?`, cls: "m"},
-	})
-	setOpBytes(genericLex, "+-*/%&|^!~<>?:=")
-	setPunctBytes(genericLex, "{}()[];,.", "p")
-	genericCodeLexer = genericLex
-
-	codeLexers = make(map[string]*codeLexer, 128)
-	register := func(lx *codeLexer, aliases ...string) {
-		for _, a := range aliases {
-			codeLexers[a] = lx
+	for _, rec := range strings.Split(string(raw), "\x1e") {
+		if rec == "" {
+			continue
+		}
+		f := strings.Split(rec, "\x1f")
+		if len(f) < 14 {
+			continue
+		}
+		flags, _ := strconv.Atoi(f[1])
+		pmVal, pmErr := strconv.ParseUint(f[2], 10, 8)
+		if pmErr != nil {
+			pmVal = 0
+		}
+		lx := &codeLexer{
+			skipWS:           flags&1 != 0,
+			hasFastIdent:     flags&2 != 0,
+			identAllowDollar: flags&4 != 0,
+			identFoldCase:    flags&8 != 0,
+			rustMacroBang:    flags&16 != 0,
+			hasSlashComments: flags&32 != 0,
+			hasDashComment:   flags&64 != 0,
+			detectFuncCall:   flags&128 != 0,
+			detectTypeIdent:  flags&256 != 0,
+			prefixMode:       identPrefixMode(uint8(pmVal)),
+			dollarVarCls:     f[3],
+			stmtDirective:    f[4],
+			identMap:         buildIdentMap(f[5], f[6], f[7], f[8], flags&8 != 0),
+		}
+		switch f[0] {
+		case "sh":
+			lx.customScan = tokenizeShell
+		case "json":
+			lx.customScan = tokenizeJSON
+		case "data":
+			lx.customScan = tokenizeConfigData
+		case "html":
+			lx.customScan = tokenizeHTML
+		case "css":
+			lx.customScan = tokenizeCSS
+		}
+		if f[9] != "" {
+			setOpBytes(lx, f[9])
+		}
+		if f[10] != "" {
+			setPunctBytes(lx, f[10], f[11])
+		}
+		if f[12] != "" {
+			rawRules := strings.Split(f[12], "\x1d")
+			rules := make([]rawByteRule, 0, len(rawRules))
+			for _, rr := range rawRules {
+				parts := strings.Split(rr, "\x1c")
+				if len(parts) == 3 {
+					rules = append(rules, rawByteRule{leads: parts[0], pattern: parts[1], cls: parts[2]})
+				}
+			}
+			addLexerRules(lx, rules)
+		}
+		if flags&512 != 0 {
+			genericCodeLexer = lx
+		}
+		for _, alias := range strings.Split(f[13], ",") {
+			if alias != "" {
+				codeLexers[alias] = lx
+			}
 		}
 	}
-	register(goLex, "go", "golang")
-	register(tsLex, "ts", "typescript", "tsx", "js", "javascript", "jsx", "mjs", "cjs", "mts", "cts")
-	register(rsLex, "rs", "rust")
-	register(cFamLex, "c", "h", "cpp", "c++", "cc", "hpp", "cxx", "java", "kotlin", "kt", "csharp", "cs", "swift", "dart", "scala", "zig", "prisma")
-	register(phpLex, "php", "php8", "phtml")
-	register(pyLex, "py", "python", "python3")
-	register(rubyLex, "ruby", "rb")
-	register(luaLex, "lua")
-	register(graphqlLex, "graphql", "gql")
-	register(protoLex, "proto", "protobuf")
-	register(hclLex, "hcl", "tf", "terraform")
-	register(hashLangLex, "elixir", "ex", "exs", "r", "perl", "pl")
-	register(shLex, "sh", "bash", "zsh", "fish", "ash", "shell", "console", "shellsession", "sh-session", "terminal", "dockerfile", "docker", "powershell", "ps1", "pwsh", "make", "makefile")
-	register(sqlLex, "sql", "sqlite", "postgres", "postgresql", "pgsql", "mysql")
-	register(jsonLex, "json", "jsonc", "json5", "geojson")
-	register(dataLex, "yaml", "yml", "toml", "ini", "env", "dotenv", "properties", "systemd", "service", "editorconfig")
-	register(nginxLex, "nginx", "conf", "caddy", "caddyfile", "apache", "apacheconf", "haproxy", "vhost")
-	register(htmlLex, "html", "htm", "xml", "svg", "vue", "svelte")
-	register(cssLex, "css", "scss", "sass", "less")
-	register(diffLex, "diff", "patch")
-	register(mdLex, "md", "markdown")
-	register(genericLex, "haskell", "hs", "ada", "vhdl")
 }
 
 var genericCodeLexer *codeLexer

@@ -48,6 +48,11 @@ type kvCounterEntry struct {
 	baseLoaded bool
 	persisted  bool
 	delta      int64
+	expiresAt  int64
+}
+
+func (e *kvCounterEntry) isExpired(now int64) bool {
+	return e != nil && e.expiresAt > 0 && e.expiresAt <= now
 }
 
 type kvBufferHub struct {
@@ -136,6 +141,10 @@ func (h *kvBufferHub) runFlushLoop(stopCh <-chan struct{}, doneCh chan<- struct{
 }
 
 func (h *kvBufferHub) flush(ctx context.Context, filterPluginID string) error {
+	return h.flushAt(ctx, filterPluginID, time.Now().Unix())
+}
+
+func (h *kvBufferHub) flushAt(ctx context.Context, filterPluginID string, now int64) error {
 	if h == nil || h.store == nil {
 		return nil
 	}
@@ -158,6 +167,14 @@ func (h *kvBufferHub) flush(ctx context.Context, filterPluginID string) error {
 	}
 	batch := make([]deltaItem, 0, len(h.dirty))
 	for pk, d := range h.dirty {
+		if ent := h.entries[pk]; ent != nil && ent.isExpired(now) {
+			if filterPluginID == "" || pk.pluginID == filterPluginID {
+				delete(h.dirty, pk)
+				delete(h.entries, pk)
+				h.gen++
+			}
+			continue
+		}
 		if d == 0 {
 			delete(h.dirty, pk)
 			continue
@@ -180,7 +197,6 @@ func (h *kvBufferHub) flush(ctx context.Context, filterPluginID string) error {
 		return batch[i].pk.key < batch[j].pk.key
 	})
 
-	now := time.Now().Unix()
 	var firstErr error
 
 	for start := 0; start < len(batch); {
@@ -396,7 +412,7 @@ func (kv *KVStore) Get(ctx context.Context, key string) (string, bool, error) {
 		pk := kvPluginKey{pluginID: kv.pluginID, key: k}
 		hub.mu.Lock()
 		var pendingDelta int64
-		if ent := hub.entries[pk]; ent != nil {
+		if ent := hub.entries[pk]; ent != nil && !ent.isExpired(now) {
 			pendingDelta = ent.delta
 		}
 		hub.mu.Unlock()
@@ -431,22 +447,29 @@ func (kv *KVStore) IncrBuffered(ctx context.Context, key string, delta int64) (i
 	pk := kvPluginKey{pluginID: kv.pluginID, key: k}
 
 	for {
+		now := kv.nowFn().Unix()
 		hub.mu.Lock()
-		if ent := hub.entries[pk]; ent != nil && ent.baseLoaded {
-			if delta != 0 && hub.dirty[pk] == 0 && len(hub.dirty) >= maxKVDirtyEntriesTotal {
-				hub.mu.Unlock()
-				return 0, fmt.Errorf("%w: total dirty buffered counter limit (%d) reached", ErrKVQuotaExceeded, maxKVDirtyEntriesTotal)
-			}
-			ent.delta += delta
-			if ent.delta == 0 {
+		if ent := hub.entries[pk]; ent != nil {
+			if ent.isExpired(now) {
 				delete(hub.dirty, pk)
-			} else {
-				hub.dirty[pk] = ent.delta
-				hub.ensureFlushLoopLocked()
+				delete(hub.entries, pk)
+				hub.gen++
+			} else if ent.baseLoaded {
+				if delta != 0 && hub.dirty[pk] == 0 && len(hub.dirty) >= maxKVDirtyEntriesTotal {
+					hub.mu.Unlock()
+					return 0, fmt.Errorf("%w: total dirty buffered counter limit (%d) reached", ErrKVQuotaExceeded, maxKVDirtyEntriesTotal)
+				}
+				ent.delta += delta
+				if ent.delta == 0 {
+					delete(hub.dirty, pk)
+				} else {
+					hub.dirty[pk] = ent.delta
+					hub.ensureFlushLoopLocked()
+				}
+				combined := ent.base + ent.delta
+				hub.mu.Unlock()
+				return combined, nil
 			}
-			combined := ent.base + ent.delta
-			hub.mu.Unlock()
-			return combined, nil
 		}
 		pluginDirty := 0
 		for dpk := range hub.dirty {
@@ -466,7 +489,7 @@ func (kv *KVStore) IncrBuffered(ctx context.Context, key string, delta int64) (i
 		hub.mu.Unlock()
 
 		// Cold-miss only: read initial base from ReadDB (zero write transactions).
-		now := kv.nowFn().Unix()
+		now = kv.nowFn().Unix()
 		var row domain.PluginKV
 		qErr := sqlx.GetInto(
 			ctx,
@@ -497,21 +520,27 @@ func (kv *KVStore) IncrBuffered(ctx context.Context, key string, delta int64) (i
 		}
 
 		hub.mu.Lock()
-		if ent := hub.entries[pk]; ent != nil && ent.baseLoaded {
-			if delta != 0 && hub.dirty[pk] == 0 && len(hub.dirty) >= maxKVDirtyEntriesTotal {
-				hub.mu.Unlock()
-				return 0, fmt.Errorf("%w: total dirty buffered counter limit (%d) reached", ErrKVQuotaExceeded, maxKVDirtyEntriesTotal)
-			}
-			ent.delta += delta
-			if ent.delta == 0 {
+		if ent := hub.entries[pk]; ent != nil {
+			if ent.isExpired(now) {
 				delete(hub.dirty, pk)
-			} else {
-				hub.dirty[pk] = ent.delta
-				hub.ensureFlushLoopLocked()
+				delete(hub.entries, pk)
+				hub.gen++
+			} else if ent.baseLoaded {
+				if delta != 0 && hub.dirty[pk] == 0 && len(hub.dirty) >= maxKVDirtyEntriesTotal {
+					hub.mu.Unlock()
+					return 0, fmt.Errorf("%w: total dirty buffered counter limit (%d) reached", ErrKVQuotaExceeded, maxKVDirtyEntriesTotal)
+				}
+				ent.delta += delta
+				if ent.delta == 0 {
+					delete(hub.dirty, pk)
+				} else {
+					hub.dirty[pk] = ent.delta
+					hub.ensureFlushLoopLocked()
+				}
+				combined := ent.base + ent.delta
+				hub.mu.Unlock()
+				return combined, nil
 			}
-			combined := ent.base + ent.delta
-			hub.mu.Unlock()
-			return combined, nil
 		}
 		if hub.gen != readGen {
 			hub.mu.Unlock()
@@ -572,6 +601,11 @@ func (kv *KVStore) IncrBuffered(ctx context.Context, key string, delta int64) (i
 		ent.base = loadedBase
 		ent.baseLoaded = true
 		ent.persisted = rowExists
+		if rowExists {
+			ent.expiresAt = row.ExpiresAt
+		} else {
+			ent.expiresAt = 0
+		}
 		ent.delta += delta
 		if ent.delta == 0 {
 			delete(hub.dirty, pk)
@@ -587,7 +621,18 @@ func (kv *KVStore) IncrBuffered(ctx context.Context, key string, delta int64) (i
 
 // Flush deterministically flushes any dirty buffered counters for this plugin.
 func (kv *KVStore) Flush(ctx context.Context) error {
-	return FlushPluginKV(ctx, kv.store, kv.pluginID)
+	if kv.pluginID == "" {
+		return nil
+	}
+	hub := lookupKVHub(kv.store)
+	if hub == nil {
+		return nil
+	}
+	nowFn := kv.nowFn
+	if nowFn == nil {
+		nowFn = time.Now
+	}
+	return hub.flushAt(ctx, kv.pluginID, nowFn().Unix())
 }
 
 // Set stores a string value with optional ttlSeconds (<= 0 means never expires).
@@ -636,7 +681,7 @@ func (kv *KVStore) Set(ctx context.Context, key string, value string, ttlSeconds
 		hub.gen++
 		delete(hub.dirty, pk)
 		if ttlSeconds <= 0 && parsedErr == nil {
-			hub.entries[pk] = &kvCounterEntry{base: intVal, baseLoaded: true, persisted: true, delta: 0}
+			hub.entries[pk] = &kvCounterEntry{base: intVal, baseLoaded: true, persisted: true, delta: 0, expiresAt: 0}
 		} else {
 			delete(hub.entries, pk)
 		}
@@ -652,6 +697,7 @@ func (kv *KVStore) IncrBy(ctx context.Context, key string, delta int64, ttlSecon
 	if err != nil {
 		return 0, err
 	}
+	now := kv.nowFn().Unix()
 	hub := lookupKVHub(kv.store)
 	var pending int64
 	pk := kvPluginKey{pluginID: kv.pluginID, key: k}
@@ -660,12 +706,17 @@ func (kv *KVStore) IncrBy(ctx context.Context, key string, delta int64, ttlSecon
 		defer hub.flushMu.Unlock()
 		hub.mu.Lock()
 		if ent := hub.entries[pk]; ent != nil {
-			pending = ent.delta
+			if ent.isExpired(now) {
+				delete(hub.dirty, pk)
+				delete(hub.entries, pk)
+				hub.gen++
+			} else {
+				pending = ent.delta
+			}
 		}
 		hub.mu.Unlock()
 	}
 
-	now := kv.nowFn().Unix()
 	var nextVal int64
 	effectiveDelta := delta + pending
 
@@ -689,6 +740,8 @@ func (kv *KVStore) IncrBy(ctx context.Context, key string, delta int64, ttlSecon
 				ent.persisted = true
 			} else {
 				ent.baseLoaded = false
+				ent.persisted = true
+				ent.expiresAt = now + ttlSeconds
 			}
 			if ent.delta == 0 {
 				delete(hub.dirty, pk)
@@ -789,6 +842,11 @@ func (kv *KVStore) Delete(ctx context.Context, key string) error {
 	if hub != nil {
 		hub.flushMu.Lock()
 		defer hub.flushMu.Unlock()
+	}
+	if _, err = kv.store.ExecBgContext(ctx, `DELETE FROM plugin_kv WHERE plugin_id = ? AND k = ?`, kv.pluginID, k); err != nil {
+		return err
+	}
+	if hub != nil {
 		pk := kvPluginKey{pluginID: kv.pluginID, key: k}
 		hub.mu.Lock()
 		hub.gen++
@@ -796,8 +854,7 @@ func (kv *KVStore) Delete(ctx context.Context, key string) error {
 		delete(hub.entries, pk)
 		hub.mu.Unlock()
 	}
-	_, err = kv.store.ExecBgContext(ctx, `DELETE FROM plugin_kv WHERE plugin_id = ? AND k = ?`, kv.pluginID, k)
-	return err
+	return nil
 }
 
 // ListPrefix returns up to limit non-expired entries whose key begins with prefix (and optionally > afterKey), ordered by key ASC.
@@ -841,6 +898,9 @@ func (kv *KVStore) ListPrefix(ctx context.Context, prefix string, limit int, aft
 		hub.mu.Lock()
 		for pk, d := range hub.dirty {
 			if d != 0 && pk.pluginID == kv.pluginID && (p == "" || strings.HasPrefix(pk.key, p)) && (cursor == "" || pk.key > cursor) {
+				if ent := hub.entries[pk]; ent != nil && ent.isExpired(now) {
+					continue
+				}
 				if pendingByKey == nil {
 					pendingByKey = make(map[string]int64)
 				}
@@ -943,6 +1003,9 @@ func PurgeExpiredKV(ctx context.Context, store *sqlx.Store, nowUnix int64) (int6
 // DeletePrefix deletes all keys belonging to this plugin whose key begins with prefix
 // without bumping content dataRev. Requires a non-empty prefix (use ClearPluginKV to wipe all keys).
 func (kv *KVStore) DeletePrefix(ctx context.Context, prefix string) (int64, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	p := strings.TrimSpace(prefix)
 	if p == "" {
 		return 0, errors.New("plugin_kv: deletePrefix requires a non-empty prefix")
@@ -954,16 +1017,87 @@ func (kv *KVStore) DeletePrefix(ctx context.Context, prefix string) (int64, erro
 		return 0, errors.New("plugin_kv: prefix cannot contain NUL byte")
 	}
 	hub := lookupKVHub(kv.store)
-	var removedBuffered int64
 	if hub != nil {
 		hub.flushMu.Lock()
 		defer hub.flushMu.Unlock()
+	}
+
+	var sqlDeleted int64
+	err := kv.store.WithBgTx(ctx, func(tx *sqlx.Tx) error {
+		rows, qErr := tx.QueryContext(
+			ctx,
+			`SELECT k FROM plugin_kv WHERE plugin_id = ? AND k LIKE ? ESCAPE '!'`,
+			kv.pluginID,
+			escapeLikePrefix(p)+"%",
+		)
+		if qErr != nil {
+			return qErr
+		}
+		var matched []string
+		for rows.Next() {
+			var k string
+			if sErr := rows.Scan(&k); sErr != nil {
+				_ = rows.Close()
+				return sErr
+			}
+			// Enforce exact case-sensitive prefix match across SQLite/MySQL case-insensitive LIKE collations.
+			if strings.HasPrefix(k, p) {
+				matched = append(matched, k)
+			}
+		}
+		if rErr := rows.Err(); rErr != nil {
+			_ = rows.Close()
+			return rErr
+		}
+		if cErr := rows.Close(); cErr != nil {
+			return cErr
+		}
+		if len(matched) == 0 {
+			return nil
+		}
+
+		const batchSize = 400
+		for start := 0; start < len(matched); start += batchSize {
+			end := start + batchSize
+			if end > len(matched) {
+				end = len(matched)
+			}
+			chunk := matched[start:end]
+			var qb strings.Builder
+			qb.Grow(64 + len(chunk)*2)
+			qb.WriteString(`DELETE FROM plugin_kv WHERE plugin_id = ? AND k IN (`)
+			args := make([]any, 0, 1+len(chunk))
+			args = append(args, kv.pluginID)
+			for i, k := range chunk {
+				if i > 0 {
+					qb.WriteByte(',')
+				}
+				qb.WriteByte('?')
+				args = append(args, k)
+			}
+			qb.WriteByte(')')
+			res, dErr := tx.ExecContext(ctx, qb.String(), args...)
+			if dErr != nil {
+				return dErr
+			}
+			if aff, aErr := res.RowsAffected(); aErr == nil && aff > 0 {
+				sqlDeleted += aff
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return 0, err
+	}
+
+	var removedBufferedOnly int64
+	if hub != nil {
 		hub.mu.Lock()
 		hub.gen++
-		for pk := range hub.entries {
+		for pk, ent := range hub.entries {
 			if pk.pluginID == kv.pluginID && strings.HasPrefix(pk.key, p) {
-				if hub.dirty[pk] != 0 {
-					removedBuffered++
+				if hub.dirty[pk] != 0 && (ent == nil || !ent.persisted) {
+					removedBufferedOnly++
 				}
 				delete(hub.dirty, pk)
 				delete(hub.entries, pk)
@@ -971,33 +1105,14 @@ func (kv *KVStore) DeletePrefix(ctx context.Context, prefix string) (int64, erro
 		}
 		hub.mu.Unlock()
 	}
-	res, err := kv.store.ExecBgContext(
-		ctx,
-		`DELETE FROM plugin_kv WHERE plugin_id = ? AND k LIKE ? ESCAPE '\'`,
-		kv.pluginID,
-		escapeLikePrefix(p)+"%",
-	)
-	if err != nil {
-		return 0, err
-	}
-	n, _ := res.RowsAffected()
-	if n == 0 && removedBuffered > 0 {
-		return removedBuffered, nil
-	}
-	return n, nil
+
+	return sqlDeleted + removedBufferedOnly, nil
 }
 
+var kvLikeEscaper = strings.NewReplacer("!", "!!", "%", "!%", "_", "!_")
+
 func escapeLikePrefix(s string) string {
-	var b strings.Builder
-	b.Grow(len(s) + 4)
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		if c == '\\' || c == '%' || c == '_' {
-			b.WriteByte('\\')
-		}
-		b.WriteByte(c)
-	}
-	return b.String()
+	return kvLikeEscaper.Replace(s)
 }
 
 // ClearPluginKV deletes all stored keys belonging to pluginID without bumping content dataRev.
@@ -1006,6 +1121,11 @@ func ClearPluginKV(ctx context.Context, store *sqlx.Store, pluginID string) erro
 	if hub != nil {
 		hub.flushMu.Lock()
 		defer hub.flushMu.Unlock()
+	}
+	if _, err := store.ExecBgContext(ctx, `DELETE FROM plugin_kv WHERE plugin_id = ?`, pluginID); err != nil {
+		return err
+	}
+	if hub != nil {
 		hub.mu.Lock()
 		hub.gen++
 		for pk := range hub.entries {
@@ -1016,6 +1136,5 @@ func ClearPluginKV(ctx context.Context, store *sqlx.Store, pluginID string) erro
 		}
 		hub.mu.Unlock()
 	}
-	_, err := store.ExecBgContext(ctx, `DELETE FROM plugin_kv WHERE plugin_id = ?`, pluginID)
-	return err
+	return nil
 }

@@ -432,7 +432,7 @@ func TestLegacyV102OfficialThemeUpdateBootstrapAndRealCatalogRoundTrip(t *testin
 	if err != nil {
 		t.Fatalf("NewEngine: %v", err)
 	}
-	eng.SetHostVersion("1.0.3")
+	eng.SetHostVersion("1.0.4")
 	eng.SetAllowLoopbackForTests(true)
 	eng.SetOfficialCatalogURL(srv.URL + "/themes/catalog.json")
 

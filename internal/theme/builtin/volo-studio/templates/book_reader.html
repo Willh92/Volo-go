@@ -21,34 +21,35 @@
       </button>
     </div>
     <h2 class="book-reader-toc__title">{{.BookDetail.Title}}</h2>
+    {{$tocWin := bookTOCWindow .BookDetail .ActiveChapter .RawQuery .Page .TotalPages .Pagination}}
+    {{$bookCurPath := coalesce .CurrentPath (printf "/books/%s" .BookDetail.Slug)}}
     <div class="book-reader-toc__count">
-      {{t .Locale "bookshelf.chapters" (dict "count" (len .BookDetail.FlatChapters))}}
+      {{t .Locale "bookshelf.chapters" (dict "count" $tocWin.TotalChapters)}}
     </div>
-    {{if gt (len .BookDetail.FlatChapters) 8}}
+    {{if gt $tocWin.TotalChapters 8}}
       <div class="book-chap-filter">
         <input type="search" class="volo-input book-chap-filter__input js-book-chap-filter" placeholder="{{t .Locale "bookshelf.filter_chapters"}}" aria-label="{{t .Locale "bookshelf.filter_chapters"}}" autocomplete="off">
       </div>
     {{end}}
     <nav class="book-reader-toc__nav" aria-label="{{.BookDetail.Title}}">
-      {{$totalChaps := len .BookDetail.FlatChapters}}
       {{$hasGroups := false}}{{$minGrpDepth := 99}}
-      {{range .BookDetail.FlatChapters}}{{if not .URL}}{{$hasGroups = true}}{{if lt .Depth $minGrpDepth}}{{$minGrpDepth = .Depth}}{{end}}{{end}}{{end}}
-      {{if and (gt $totalChaps 60) $hasGroups}}
+      {{range $tocWin.Chapters}}{{if not .URL}}{{$hasGroups = true}}{{if lt .Depth $minGrpDepth}}{{$minGrpDepth = .Depth}}{{end}}{{end}}{{end}}
+      {{if and (gt $tocWin.TotalChapters 60) $hasGroups}}
         {{$activeVol := -1}}{{$scanVol := -1}}
-        {{range .BookDetail.FlatChapters}}
+        {{range $tocWin.Chapters}}
           {{if and (not .URL) (le .Depth $minGrpDepth)}}{{$scanVol = add $scanVol 1}}{{else if and $.ActiveChapter (eq $.ActiveChapter.ID .ID)}}{{$activeVol = $scanVol}}{{end}}
         {{end}}
         {{if and (lt $activeVol 0) (ge $scanVol 0)}}{{$activeVol = 0}}{{end}}
         {{$curVol := -1}}{{$volOpen := false}}
-        {{range .BookDetail.FlatChapters}}
+        {{range $tocWin.Chapters}}
           {{$d := .Depth}}{{if lt $d 0}}{{$d = 0}}{{end}}{{if gt $d 4}}{{$d = 4}}{{end}}
           {{$isAct := and $.ActiveChapter (eq $.ActiveChapter.ID .ID)}}
           {{if and (not .URL) (le .Depth $minGrpDepth)}}
             {{if $volOpen}}</div></details>{{end}}
             {{$curVol = add $curVol 1}}{{$volOpen = true}}{{$isOpen := eq $curVol $activeVol}}
             <details class="book-reader-toc__volume"{{if $isOpen}} open data-default-open="1"{{end}}>
-              <summary class="book-reader-toc__volume-sum"><span>{{.Title}}</span></summary>
-              <div class="book-reader-toc__volume-list">
+              <summary class="book-reader-toc__volume-summary"><span>{{.Title}}</span><svg class="book-reader-toc__volume-chevron" viewBox="0 0 24 24" aria-hidden="true"><path d="m9 6 6 6-6 6"/></svg></summary>
+              <div class="book-reader-toc__volume-items">
           {{else if hasPrefix .URL "/"}}
             <a href="{{.URL}}" data-chapter-id="{{.ID}}" data-chapter-title="{{.Title}}" class="book-reader-toc__link book-chap-link reader-tree__item{{if $isAct}} is-active active{{end}}" style="padding-left:{{add 12 (mul $d 12)}}px">{{.Title}}</a>
           {{else if .URL}}
@@ -63,7 +64,7 @@
         {{end}}
         {{if $volOpen}}</div></details>{{end}}
       {{else}}
-        {{range .BookDetail.FlatChapters}}
+        {{range $tocWin.Chapters}}
           {{$d := .Depth}}{{if lt $d 0}}{{$d = 0}}{{end}}{{if gt $d 4}}{{$d = 4}}{{end}}
           {{$isAct := and $.ActiveChapter (eq $.ActiveChapter.ID .ID)}}
           {{if hasPrefix .URL "/"}}
@@ -80,10 +81,39 @@
         {{end}}
       {{end}}
     </nav>
+    {{if gt $tocWin.TotalPages 1}}
+      {{$tocBase := $bookCurPath}}
+      {{if .RawQuery}}{{$tocBase = printf "%s?%s" $bookCurPath .RawQuery}}{{end}}
+      <nav class="pagination pagination--compact" aria-label="{{t .Locale "article.toc_title"}}">
+        {{if gt $tocWin.Page 1}}
+          <a class="pagination__item" href="{{cpageURL $tocBase (sub $tocWin.Page 1)}}" aria-label="{{t .Locale "pagination.prev"}}">←</a>
+        {{end}}
+        {{if $tocWin.Pagination.PageNumbers}}
+          {{if $tocWin.Pagination.ShowFirst}}
+            <a class="pagination__item" href="{{cpageURL $tocBase 1}}">1</a>
+            <span class="pagination__ellipsis">…</span>
+          {{end}}
+          {{range $tocWin.Pagination.PageNumbers}}
+            {{if eq . $tocWin.Page}}
+              <span class="pagination__item pagination__item--current" aria-current="page">{{.}}</span>
+            {{else}}
+              <a class="pagination__item" href="{{cpageURL $tocBase .}}">{{.}}</a>
+            {{end}}
+          {{end}}
+          {{if $tocWin.Pagination.ShowLast}}
+            <span class="pagination__ellipsis">…</span>
+            <a class="pagination__item" href="{{cpageURL $tocBase $tocWin.TotalPages}}">{{$tocWin.TotalPages}}</a>
+          {{end}}
+        {{end}}
+        {{if lt $tocWin.Page $tocWin.TotalPages}}
+          <a class="pagination__item" href="{{cpageURL $tocBase (add $tocWin.Page 1)}}" aria-label="{{t .Locale "pagination.next"}}">→</a>
+        {{end}}
+      </nav>
+      <div class="book-reader-toc__page-info">{{t .Locale "pagination.page_info" (dict "page" $tocWin.Page "total" $tocWin.TotalPages)}}</div>
+    {{end}}
     <p class="studio-muted-empty book-chap-empty js-book-chap-empty" hidden>{{t .Locale "studio.filter_empty"}}</p>
   </aside>
 
-  {{$bookCurPath := coalesce .CurrentPath (printf "/books/%s" .BookDetail.Slug)}}
   <article class="studio-article book-reader-main{{if $isExternalIframe}} book-reader-main--frame{{end}}"
            {{if and (not .BookLocked) .ActiveChapterNeedsMath}}data-needs-math="1"{{end}}
            {{if and (not .BookLocked) .ActiveChapterNeedsMermaid}}data-needs-mermaid="1"{{end}}>

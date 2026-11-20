@@ -499,9 +499,35 @@ func TestUXAndAdminModalCRUDParity(t *testing.T) {
 		t.Fatalf("expected 12 monthly_articles and non-empty recent_logs, got months=%d logs=%d", len(ovData.MonthlyArticles), len(ovData.RecentLogs))
 	}
 
-	abResp, abBody := doJSONReq(t, http.MethodGet, env.ts.URL+"/api/admin/about/project-info", nil, adminCookies, nil)
-	if abResp.StatusCode != http.StatusOK || !bytes.Contains(abBody, []byte(`"go_version"`)) {
+	abResp, abBody := doJSONReq(t, http.MethodGet, env.ts.URL+"/api/admin/about/project-info?offline=1", nil, adminCookies, nil)
+	if abResp.StatusCode != http.StatusOK {
 		t.Fatalf("GET /api/admin/about/project-info = %d %s", abResp.StatusCode, string(abBody))
+	}
+	var abData struct {
+		Version       string  `json:"version"`
+		GoVersion     string  `json:"go_version"`
+		AdminGzipKB   float64 `json:"admin_gzip_kb"`
+		Online        bool    `json:"online"`
+		Repo          struct {
+			FullName string `json:"full_name"`
+			HTMLURL  string `json:"html_url"`
+		} `json:"repo"`
+		LatestRelease struct {
+			TagName string `json:"tag_name"`
+			HTMLURL string `json:"html_url"`
+		} `json:"latest_release"`
+	}
+	if err := json.Unmarshal(abBody, &abData); err != nil {
+		t.Fatalf("unmarshal about/project-info: %v (%s)", err, string(abBody))
+	}
+	if abData.Version == "" || abData.GoVersion == "" || abData.AdminGzipKB <= 0 || abData.Repo.FullName == "" || abData.LatestRelease.TagName == "" {
+		t.Fatalf("incomplete about/project-info payload: %+v (%s)", abData, string(abBody))
+	}
+
+	// Verify /console BootConfig injects runtime version so sidebar/login never drift from binary Version
+	consoleResp, consoleHTML := doJSONReq(t, http.MethodGet, env.ts.URL+"/console", nil, nil, nil)
+	if consoleResp.StatusCode != http.StatusOK || !bytes.Contains(consoleHTML, []byte(`"version":"`+abData.Version+`"`)) {
+		t.Fatalf("GET /console missing BootConfig version %q: status=%d", abData.Version, consoleResp.StatusCode)
 	}
 
 	// 7. `GET /logout?redirect=/archives` revokes session & redirects `303 SeeOther`

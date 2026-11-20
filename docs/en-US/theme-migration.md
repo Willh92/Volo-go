@@ -164,10 +164,11 @@ In addition, legacy static-suffix routes (`/archives.html`, `/tags.html`, `/cate
 | `mostUsedCategories` / `mostUsedTags` / `archiveDates` | `.SidebarCategories` / `.SidebarTags` / `.SidebarArchives` | Sidebar categories, popular tags, and monthly archives |
 | `recentArticles` / `mostViewCountArticles` / `mostCommentArticles` | `.RecentPosts` / `.MostViewedPosts` / `.MostCommentedPosts` | Sidebar recent, most-viewed, and most-commented rankings |
 | `recentComments` | `.RecentComments` | Recent approved public comments |
+| `links` / search query | `.LinkGroups` / `.TagQuery` | Ordered friend-link category groups and active `?q=` search string on `/categories` & `/links` |
 
 ### 5.3 Built-in Template Function Library (`FuncMap`)
 
-- **i18n, Site Vars & Assets**: `t`, `tt`, `customVar`, `assetURL`, `coverSVG`, `pageURL`
+- **i18n, Site Vars & Assets**: `t`, `tt`, `customVar`, `assetURL`, `coverSVG`, `pageURL`, `cpageURL` (preserves existing query params when paging book chapter TOC `?cpage=`), `bookTOCWindow` (bounded chapter pagination slice/window for `book_reader.html`)
 - **Theme Config**: `themeCfg`, `themeCfgBool` (alias `themeBool`), `themeCfgInt` (alias `themeInt`)
 - **Date & Time**: `formatDate` (`YYYY-MM-DD`), `formatDotDate` (`YYYY.MM.DD`), `formatDateTime`, `formatMonthDay`, `formatTime`, `nowYear`
 - **Collections & Dictionaries**: `dict` (pass named arguments to partials, e.g., `{{template "card" (dict "Post" . "Root" $)}}`), `slice`, `seq`, `first`, `default`, `coalesce`

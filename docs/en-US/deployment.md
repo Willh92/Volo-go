@@ -211,7 +211,7 @@ docker compose --profile postgres up -d
      ```bash
      mkdir -p data && sudo chown -R 65532:65532 data
      ```
-  2. **Do not bind-mount empty `./themes` or `./plugins` host directories** onto `/app/themes` or `/app/plugins`, as empty host directories will shadow the image-bundled themes (`volo-journal`) and plugins (`sensitive-words`). Standalone extensions — such as Live2D Mascot (`plugin-kanbanniang-v2.0.5.zip` with corner minimize/summon pill, see the [Official Plugin Catalog](../../plugins/README.md)) and official `zh-TW` / `ja-JP` language packs — can be installed in 1 click from the official catalog (`SHA256SUMS.txt` verified) or dragged-and-dropped via local `.zip` preflight in **Admin Console -> Appearance & Extensions**.
+  2. **Do not bind-mount empty `./themes` or `./plugins` host directories** onto `/app/themes` or `/app/plugins`, as empty host directories will shadow the image-bundled themes (`volo-journal`) and plugins (`sensitive-words`). Standalone extensions — such as Live2D Mascot (`plugin-kanbanniang-v2.0.6.zip` with corner minimize/summon pill, see the [Official Plugin Catalog](../../plugins/README.md)) and official `zh-TW` / `ja-JP` language packs — can be installed in 1 click from the official catalog (`SHA256SUMS.txt` verified) or dragged-and-dropped via local `.zip` preflight in **Admin Console -> Appearance & Extensions**.
 
 ### 5.2 Database Engine DSN Examples (Explicit Pinning Mode)
 

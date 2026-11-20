@@ -6,6 +6,20 @@
 
 ---
 
+## [1.0.4] - 2026-11-20
+
+### 新增特性
+- **官方扩展合并分发（`extensions-v1.0.4`）与四语词条全对齐**：统一将 `kanbanniang v2.0.6`、`volo-journal v1.1.2`、`zh-TW v1.0.1`、`ja-JP v1.0.1` 与 `sensitive-words v1.1.0` 合并打包发布至单一 `extensions-v1.0.4` 合集，完成 `zh-TW`/`ja-JP` 与核心 2,181 条词条 100% 对等裁剪；为后台「关于与帮助」新增 `/api/admin/about/project-info` 失败提示横幅与一键重试恢复，并补全 `/api/admin/categories`、`/api/admin/nav`、`/categories`、`/links` 及 `/books/{slug}`（`?cpage=`）的服务端分页与检索。
+
+### 变更与优化
+- **后端热路径优化、管理台真按需分包与体积门禁**：为孤立媒体扫描补齐并发去重与版本号校验（`collectMediaRefCountsCached`），优化 `RenderArticleDetail` 缓存与数据库索引，并将 `lazyWorkspaces.ts` 与 `SetupWizard` 转为原生动态 `import()` 懒加载分块；实测内嵌管理台总 Gzip 体积 `358,235 B`（约 `349.8 KiB`，`< 358,400 B`），`linux/amd64` 静态单二进制 `20.46 MiB`（`< 22.00 MiB`）。
+- **双主题响应式、`kanbanniang v2.0.6` 与 `volo-journal v1.1.2` 打磨**：对齐 `>=1440px` `wide` 宽屏页头/挂件/主栏/页脚宽度，修复 `book_reader.html` 卷折叠样式、`volo-studio.css` `.chroma .line` 横向滚动高亮裁切、桌面端 `.volo-toc-drawer` 与右侧 `kanbanniang` 重叠及多行 `.lntable` 复制换行/评论区包裹问题，并无损去重 `ShizukuTalk` 贴图将 `kanbanniang` 瘦身至 `~34.94 MiB`。
+
+### 安全加固与问题修复
+- **编辑器 `IR -> WYSIWYG` 水合竞态修复与 CodeQL 零告警清零**：在 `CM6EditorCore.tsx` 中引入 `wysiwygHydrating` 编辑锁定与 `previewSourceRef` 缓存匹配，彻底根除切换瞬间按键/粘贴清空文档的竞态；使用纯 TypeScript 无 DOM HTML 分词树解析器（`clipboardHtmlParser.ts`）替换剪贴板 `DOMParser`；修复空/null 主题配置覆盖清空已存配置与密钥的问题，拦截 `PATCH /api/admin/settings/{domain}` 的 JSON `null` 误升版本号行为，加固 `pkg/plugin` KV `Delete`/`ClearPluginKV` 先删库后递增值守卫与 `wrapGoFuncVal` 中断穿透 JS `try/catch` 护栏，补齐 `OutboundSafeDialer` 兜底，并将本地 CodeQL（`go`、`javascript-typescript`、`actions`）清零至 0 条告警。
+
+---
+
 ## [1.0.3] - 2026-11-15
 
 ### 新增特性

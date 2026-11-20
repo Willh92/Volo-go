@@ -53,8 +53,7 @@ html[data-volo-skin="volo-journal"] .chroma .ln,
 html[data-volo-skin="volo-journal"] .chroma .lnt {
   user-select: none;
   -webkit-user-select: none;
-  padding-right: 12px;
-  opacity: 0.55;
+  opacity: 1;
 }
 
 html[data-volo-skin="volo-journal"] .volo-prose .volo-callout {
@@ -96,13 +95,16 @@ html[data-volo-skin="volo-journal"] .volo-comment-shielded {
 }
 
 /* Unified 1180px Shell Alignment across Header, Main, Masthead & Footer */
+html[data-volo-skin="volo-journal"] {
+  --journal-shell-max: 1180px;
+}
 html[data-volo-skin="volo-journal"] .journal-shell,
 html[data-volo-skin="volo-journal"] .studio-header__inner.studio-container,
 html[data-volo-skin="volo-journal"] #studio-main.studio-container,
 html[data-volo-skin="volo-journal"] .studio-header-widgets.studio-container,
 html[data-volo-skin="volo-journal"] .studio-footer {
-  width: min(1180px, calc(100% - 64px));
-  max-width: 1180px;
+  width: min(var(--journal-shell-max, 1180px), calc(100% - 64px));
+  max-width: var(--journal-shell-max, 1180px);
   margin-inline: auto;
 }
 
@@ -196,18 +198,17 @@ html[data-volo-skin="volo-journal"] .studio-layout--article.has-toc {
 html[data-volo-skin="volo-journal"] .studio-layout--wide,
 html[data-volo-skin="volo-journal"] .studio-layout--tpl-wide,
 html[data-volo-skin="volo-journal"] .studio-layout--article:has(article[data-page-template="wide"]) {
-  max-width: 1120px;
+  max-width: 1180px;
 }
 
 @media (min-width: 1440px) {
-  html[data-volo-skin="volo-journal"] #studio-main.studio-container:has(.studio-layout--wide, .studio-layout--tpl-wide, article[data-page-template="wide"]) {
-    width: min(1320px, calc(100% - 64px));
-    max-width: 1320px;
+  html[data-volo-skin="volo-journal"]:has(.studio-layout--wide, .studio-layout--tpl-wide, article[data-page-template="wide"]) {
+    --journal-shell-max: 1320px;
   }
   html[data-volo-skin="volo-journal"] .studio-layout--wide,
   html[data-volo-skin="volo-journal"] .studio-layout--tpl-wide,
   html[data-volo-skin="volo-journal"] .studio-layout--article:has(article[data-page-template="wide"]) {
-    max-width: 1280px;
+    max-width: 1320px;
   }
 }
 
@@ -242,6 +243,7 @@ html[data-volo-skin="volo-journal"] .studio-fab-btn--toc:not([hidden]) {
 /* Desktop Floating Card Popover for TOC in Single-Column Journal Theme */
 @media (min-width: 1024px) {
   html[data-volo-skin="volo-journal"] .volo-toc-drawer {
+    z-index: 88;
     background: transparent;
     backdrop-filter: none;
     justify-content: flex-end;
@@ -252,13 +254,32 @@ html[data-volo-skin="volo-journal"] .studio-fab-btn--toc:not([hidden]) {
   html[data-volo-skin="volo-journal"] .volo-toc-drawer__panel {
     pointer-events: auto;
     width: 300px;
-    max-height: min(68dvh, 520px);
+    max-width: calc(100vw - 48px);
+    max-height: min(68dvh, 520px, calc(100dvh - 100px - env(safe-area-inset-bottom, 0px)));
     border-radius: 16px;
     padding: 14px 16px;
     box-shadow: var(--volo-shadow), 0 18px 42px rgba(0, 0, 0, 0.16);
   }
   html[data-volo-skin="volo-journal"][data-podcast-open="1"] .volo-toc-drawer {
     padding-bottom: calc(148px + env(safe-area-inset-bottom, 0px));
+  }
+  html[data-volo-skin="volo-journal"][data-podcast-open="1"] .volo-toc-drawer__panel {
+    max-height: min(68dvh, 520px, calc(100dvh - 172px - env(safe-area-inset-bottom, 0px)));
+  }
+  html[data-volo-skin="volo-journal"]:has(.solo-kanbanniang:is(.volo-kbn-right, [data-position="right"]):not([hidden]):not(.is-closed):not([data-dragged="1"])) .volo-toc-drawer {
+    padding-right: 312px;
+  }
+  html[data-volo-skin="volo-journal"]:has(.solo-kanbanniang-summon:is(.volo-kbn-right, [data-position="right"]):not([hidden])) .volo-toc-drawer {
+    padding-bottom: calc(164px + env(safe-area-inset-bottom, 0px));
+  }
+  html[data-volo-skin="volo-journal"]:has(.solo-kanbanniang-summon:is(.volo-kbn-right, [data-position="right"]):not([hidden])) .volo-toc-drawer__panel {
+    max-height: min(68dvh, 520px, calc(100dvh - 188px - env(safe-area-inset-bottom, 0px)));
+  }
+  html[data-volo-skin="volo-journal"][data-podcast-open="1"]:has(.solo-kanbanniang-summon:is(.volo-kbn-right, [data-position="right"]):not([hidden])) .volo-toc-drawer {
+    padding-bottom: calc(236px + env(safe-area-inset-bottom, 0px));
+  }
+  html[data-volo-skin="volo-journal"][data-podcast-open="1"]:has(.solo-kanbanniang-summon:is(.volo-kbn-right, [data-position="right"]):not([hidden])) .volo-toc-drawer__panel {
+    max-height: min(68dvh, 520px, calc(100dvh - 260px - env(safe-area-inset-bottom, 0px)));
   }
 }
 
@@ -299,38 +320,5 @@ html[data-volo-skin="volo-journal"] .journal-colophon {
   html[data-volo-skin="volo-journal"] .studio-header-widgets.studio-container,
   html[data-volo-skin="volo-journal"] .studio-footer {
     width: calc(100% - 20px);
-  }
-}
-
-/* Scoped Scrollbar Polish (prevent Windows Chromium classic scrollbar arrows) */
-html[data-volo-skin="volo-journal"]::-webkit-scrollbar,
-html[data-volo-skin="volo-journal"] *::-webkit-scrollbar {
-  width: 6px;
-  height: 6px;
-}
-html[data-volo-skin="volo-journal"]::-webkit-scrollbar-track,
-html[data-volo-skin="volo-journal"] *::-webkit-scrollbar-track {
-  background: transparent;
-}
-html[data-volo-skin="volo-journal"]::-webkit-scrollbar-thumb,
-html[data-volo-skin="volo-journal"] *::-webkit-scrollbar-thumb {
-  background: color-mix(in srgb, var(--volo-muted) 32%, transparent);
-  border-radius: 999px;
-}
-html[data-volo-skin="volo-journal"]::-webkit-scrollbar-thumb:hover,
-html[data-volo-skin="volo-journal"] *::-webkit-scrollbar-thumb:hover {
-  background: color-mix(in srgb, var(--volo-accent) 55%, var(--volo-muted));
-}
-html[data-volo-skin="volo-journal"]::-webkit-scrollbar-button,
-html[data-volo-skin="volo-journal"] *::-webkit-scrollbar-button {
-  display: none;
-  width: 0;
-  height: 0;
-}
-@supports not selector(::-webkit-scrollbar) {
-  html[data-volo-skin="volo-journal"],
-  html[data-volo-skin="volo-journal"] * {
-    scrollbar-width: thin;
-    scrollbar-color: color-mix(in srgb, var(--volo-muted) 34%, transparent) transparent;
   }
 }

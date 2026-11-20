@@ -1,6 +1,7 @@
 package dialect_test
 
 import (
+	"math"
 	"strings"
 	"testing"
 
@@ -139,6 +140,16 @@ func TestDialect_PaginateSQLAndNormalizePage(t *testing.T) {
 	qMY, _ := my.PaginateSQL("SELECT * FROM articles WHERE status = ?;", 10, 0)
 	if qMY != "SELECT * FROM articles WHERE status = ? LIMIT ? OFFSET ?" {
 		t.Fatalf("mysql PaginateSQL = %q", qMY)
+	}
+
+	// Overflow guard: extreme page must saturate offset at math.MaxInt (never wrap negative).
+	limOver, offOver := dialect.NormalizePage(math.MaxInt, 100, 100, 500)
+	if limOver != 100 || offOver != math.MaxInt {
+		t.Fatalf("NormalizePage(MaxInt, 100) = (%d, %d), want (100, %d)", limOver, offOver, math.MaxInt)
+	}
+	_, negArgs := pg.PaginateSQL("SELECT * FROM nav_items", 100, -200)
+	if negArgs[1] != 0 {
+		t.Fatalf("PaginateSQL negative offset should clamp to 0, got %+v", negArgs)
 	}
 }
 

@@ -1209,7 +1209,7 @@ func (e *Engine) RedactAllThemeConfigs(configs map[string]map[string]any) map[st
 // and seals new plaintext `"secret"` strings with AES-256-GCM when a `SecretSealer` is configured.
 func (e *Engine) MergeThemeConfigSecrets(themeID string, incoming, existing map[string]any) map[string]any {
 	if len(incoming) == 0 {
-		return nil
+		return map[string]any{}
 	}
 	e.mu.RLock()
 	sealer := e.sealer

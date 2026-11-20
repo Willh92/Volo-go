@@ -8,6 +8,8 @@ import {
   LocalDraft,
   openConfirm,
   resetConsoleScroll,
+  safeHref,
+  safeMediaSrc,
   saveLocalDraft,
   showToast,
   storageDriverSig,
@@ -25,6 +27,7 @@ import {
   DragGripIcon,
   MobileSelectAllBar,
   MoveTopIcon,
+  pagedSlice,
   paginateItems,
   Pagination,
   runConcurrentUploads,
@@ -1705,11 +1708,13 @@ export function ContentWorkspace({
   const copyMediaMarkdown = (m: MediaAssetRecord) => {
     const label = m.alt_text || m.original_name || m.id;
     const mime = String(m.mime_type || "");
+    const mediaUrl = safeMediaSrc(m.public_url);
+    const linkUrl = safeHref(m.public_url) || mediaUrl;
     const md = mime.startsWith("image/")
-      ? `![${label}](${m.public_url})`
+      ? `![${label}](${mediaUrl})`
       : mime.startsWith("video/")
-      ? `<video controls preload="metadata" src="${m.public_url}"></video>`
-      : `[${label}](${m.public_url})`;
+      ? `<video controls preload="metadata" src="${mediaUrl}"></video>`
+      : `[${label}](${linkUrl})`;
     void navigator.clipboard?.writeText(md);
     showToast(t("cnt.media_copied"));
   };
@@ -1736,13 +1741,13 @@ export function ContentWorkspace({
       : media.reduce((acc, m) => acc + Number(m.size_bytes || 0), 0);
   const totalMB = (computedMediaBytes / (1024 * 1024)).toFixed(2);
 
-  const displayPages = pages.length > pageSize ? paginateItems(pages, pageIdx, pageSize).slice : pages;
-  const displayCats = categories.length > pageSize ? paginateItems(categories, pageIdx, pageSize).slice : categories;
-  const displayTags = tags.length > tagPageSize ? paginateItems(tags, pageIdx, tagPageSize).slice : tags;
-  const displaySeries = series.length > pageSize ? paginateItems(series, pageIdx, pageSize).slice : series;
-  const displayBooks = books.length > pageSize ? paginateItems(books, pageIdx, pageSize).slice : books;
-  const displayComments = comments.length > pageSize ? paginateItems(comments, pageIdx, pageSize).slice : comments;
-  const displayMedia = media.length > mediaPageSize ? paginateItems(media, pageIdx, mediaPageSize).slice : media;
+  const displayPages = pagedSlice(pages, pageIdx, pageSize);
+  const displayCats = pagedSlice(categories, pageIdx, pageSize);
+  const displayTags = pagedSlice(tags, pageIdx, tagPageSize);
+  const displaySeries = pagedSlice(series, pageIdx, pageSize);
+  const displayBooks = pagedSlice(books, pageIdx, pageSize);
+  const displayComments = pagedSlice(comments, pageIdx, pageSize);
+  const displayMedia = pagedSlice(media, pageIdx, mediaPageSize);
 
   // Build deduplicated Page Template options (builtin + active theme localized_page_templates)
   const builtinTplValues = new Set(["default", "wide", "minimal"]);
@@ -3743,14 +3748,13 @@ export function ContentWorkspace({
                       Boolean(row.is_shielded ?? c.is_shielded) ||
                       (Boolean(row.user_shield_comments ?? c.user_shield_comments) && (cmtUserBanned || cmtUserMuted));
                     const targetTitle = row.target_title || row.target_slug || c.target_id;
-                    const targetHref =
+                    const safeTargetHref = safeHref(
                       row.target_url ||
-                      (c.target_type === "page"
-                        ? `/${encodeURIComponent(row.target_slug || c.target_id)}`
-                        : `/posts/${encodeURIComponent(row.target_slug || c.target_id)}`);
-                    const safeAuthorUrl = /^https?:\/\//i.test(String(c.author_url || ""))
-                      ? String(c.author_url)
-                      : "";
+                        (c.target_type === "page"
+                          ? `/${encodeURIComponent(row.target_slug || c.target_id)}`
+                          : `/posts/${encodeURIComponent(row.target_slug || c.target_id)}`)
+                    );
+                    const safeAuthorUrl = safeHref(c.author_url, { allowRelative: false });
                     const uaSummary = summarizeUA(c.user_agent);
                     const matchedParent = c.parent_id
                       ? comments.map((r) => r.comment || r).find((cm) => cm.id === c.parent_id)
@@ -3798,9 +3802,13 @@ export function ContentWorkspace({
                               {(c.client_ip || c.ip_masked) && (
                                 <span class="volo-code-chip">{c.client_ip || c.ip_masked}</span>
                               )}
-                              <a class="volo-help" href={targetHref} target="_blank" rel="noreferrer">
-                                {t("cnt.cmt_on", { target: targetTitle })} ↗
-                              </a>
+                              {safeTargetHref ? (
+                                <a class="volo-help" href={safeTargetHref} target="_blank" rel="noreferrer">
+                                  {t("cnt.cmt_on", { target: targetTitle })} ↗
+                                </a>
+                              ) : (
+                                <span class="volo-help">{t("cnt.cmt_on", { target: targetTitle })}</span>
+                              )}
                             </div>
                             {parentAuthor && (
                               <div class="volo-help" style={{ fontSize: "12px", opacity: 0.85 }}>
@@ -4417,9 +4425,10 @@ export function ContentWorkspace({
                   {displayMedia.map((m) => {
                     const displayName = m.original_name || m.id;
                     const mime = String(m.mime_type || "");
-                    const isImage = mime.startsWith("image/") && !brokenMediaIds[m.id];
-                    const isVideo = mime.startsWith("video/") && !brokenMediaIds[m.id];
-                    const isAudio = mime.startsWith("audio/");
+                    const mediaSrc = safeMediaSrc(m.public_url);
+                    const isImage = mime.startsWith("image/") && !brokenMediaIds[m.id] && Boolean(mediaSrc);
+                    const isVideo = mime.startsWith("video/") && !brokenMediaIds[m.id] && Boolean(mediaSrc);
+                    const isAudio = mime.startsWith("audio/") && Boolean(mediaSrc);
                     const isSmallImg = m.width > 0 && m.width <= 160 && m.height > 0 && m.height <= 140;
                     const extBadge = (displayName.split(".").pop() || mime.split("/").pop() || "FILE").toUpperCase();
                     const isSelected = selMediaIds.includes(m.id);
@@ -4439,7 +4448,7 @@ export function ContentWorkspace({
                           </label>
                           {isImage ? (
                             <img
-                              src={m.public_url}
+                              src={mediaSrc}
                               alt={m.alt_text || displayName}
                               loading="lazy"
                               decoding="async"
@@ -4448,7 +4457,7 @@ export function ContentWorkspace({
                             />
                           ) : isVideo ? (
                             <video
-                              src={m.public_url}
+                              src={mediaSrc}
                               preload="metadata"
                               muted
                               playsInline
@@ -4459,7 +4468,7 @@ export function ContentWorkspace({
                               <audio
                                 controls
                                 preload="none"
-                                src={m.public_url}
+                                src={mediaSrc}
                                 style={{ width: "90%", height: "32px" }}
                                 onClick={(e) => e.stopPropagation()}
                               />
@@ -4566,8 +4575,9 @@ export function ContentWorkspace({
                       {displayMedia.map((m) => {
                         const displayName = m.original_name || m.id;
                         const mime = String(m.mime_type || "");
-                        const isImage = mime.startsWith("image/") && !brokenMediaIds[m.id];
-                        const isVideo = mime.startsWith("video/") && !brokenMediaIds[m.id];
+                        const mediaSrc = safeMediaSrc(m.public_url);
+                        const isImage = mime.startsWith("image/") && !brokenMediaIds[m.id] && Boolean(mediaSrc);
+                        const isVideo = mime.startsWith("video/") && !brokenMediaIds[m.id] && Boolean(mediaSrc);
                         const isAudio = mime.startsWith("audio/");
                         const isSmallImg = m.width > 0 && m.width <= 160 && m.height > 0 && m.height <= 140;
                         const extBadge = (displayName.split(".").pop() || mime.split("/").pop() || "FILE")
@@ -4598,7 +4608,7 @@ export function ContentWorkspace({
                                 >
                                   {isImage ? (
                                     <img
-                                      src={m.public_url}
+                                      src={mediaSrc}
                                       alt={m.alt_text || displayName}
                                       loading="lazy"
                                       decoding="async"
@@ -4607,7 +4617,7 @@ export function ContentWorkspace({
                                     />
                                   ) : isVideo ? (
                                     <video
-                                      src={m.public_url}
+                                      src={mediaSrc}
                                       preload="metadata"
                                       muted
                                       playsInline
@@ -4688,7 +4698,7 @@ export function ContentWorkspace({
                                     },
                                     {
                                       label: `${t("cnt.media_open_new")} ↗`,
-                                      href: m.public_url,
+                                      href: safeHref(m.public_url),
                                       target: "_blank",
                                     },
                                     {
@@ -4743,9 +4753,14 @@ export function ContentWorkspace({
                   <button type="button" class="volo-btn" onClick={() => copyMediaUrl(previewAsset)}>
                     {t("cnt.media_copy")}
                   </button>
-                  <a class="volo-btn" href={previewAsset.public_url} target="_blank" rel="noreferrer">
-                    {t("cnt.media_open_new")} ↗
-                  </a>
+                  {(() => {
+                    const assetHref = safeHref(previewAsset.public_url);
+                    return assetHref ? (
+                      <a class="volo-btn" href={assetHref} target="_blank" rel="noreferrer">
+                        {t("cnt.media_open_new")} ↗
+                      </a>
+                    ) : null;
+                  })()}
                   <button
                     type="button"
                     class="volo-btn volo-btn-primary"
@@ -4758,25 +4773,28 @@ export function ContentWorkspace({
               ) : null
             }
           >
-            {previewAsset && (
+            {previewAsset && (() => {
+              const previewMediaSrc = safeMediaSrc(previewAsset.public_url);
+              const previewMime = String(previewAsset.mime_type || "");
+              return (
               <>
                 <div class="volo-lightbox-img-wrap">
-                  {String(previewAsset.mime_type || "").startsWith("image/") && !brokenMediaIds[previewAsset.id] ? (
+                  {previewMime.startsWith("image/") && !brokenMediaIds[previewAsset.id] && previewMediaSrc ? (
                     <img
-                      src={previewAsset.public_url}
+                      src={previewMediaSrc}
                       alt={previewAsset.alt_text || previewAsset.original_name}
                       onError={() => setBrokenMediaIds((prev) => ({ ...prev, [previewAsset.id]: true }))}
                     />
-                  ) : String(previewAsset.mime_type || "").startsWith("video/") && !brokenMediaIds[previewAsset.id] ? (
+                  ) : previewMime.startsWith("video/") && !brokenMediaIds[previewAsset.id] && previewMediaSrc ? (
                     <video
                       controls
                       preload="metadata"
-                      src={previewAsset.public_url}
+                      src={previewMediaSrc}
                       style={{ maxWidth: "100%", maxHeight: "56vh", borderRadius: "8px" }}
                       onError={() => setBrokenMediaIds((prev) => ({ ...prev, [previewAsset.id]: true }))}
                     />
-                  ) : String(previewAsset.mime_type || "").startsWith("audio/") ? (
-                    <audio controls src={previewAsset.public_url} class="volo-w-full" />
+                  ) : previewMime.startsWith("audio/") && previewMediaSrc ? (
+                    <audio controls src={previewMediaSrc} class="volo-w-full" />
                   ) : (
                     <div class="volo-media-type-placeholder" style={{ minWidth: 0, padding: "12px" }}>
                       <span class="volo-code-chip">{previewAsset.mime_type || "FILE"}</span>
@@ -4845,7 +4863,8 @@ export function ContentWorkspace({
                   </div>
                 </div>
               </>
-            )}
+              );
+            })()}
           </AnimatedModal>
           </div>
         );

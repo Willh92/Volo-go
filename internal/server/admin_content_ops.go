@@ -25,6 +25,7 @@ import (
 	"github.com/Willh92/Volo-go/internal/db/sqlx"
 	"github.com/Willh92/Volo-go/internal/domain"
 	"github.com/Willh92/Volo-go/internal/render"
+	"github.com/Willh92/Volo-go/internal/security"
 	"github.com/Willh92/Volo-go/internal/tinyxml"
 	"github.com/Willh92/Volo-go/pkg/id"
 	"github.com/Willh92/Volo-go/pkg/plugin"
@@ -463,19 +464,30 @@ func computeReadingMetrics(md string) (words int, minutes int) {
 
 // --- Friend Link Concurrent SSRF-Safe Health Patrol ---
 
-func (s *AppServer) newLinkPatrolHTTPClient() *http.Client {
-	client := &http.Client{Timeout: 8 * time.Second}
-	if s.deps.OutboundDialer != nil {
-		client = s.deps.OutboundDialer.NewHTTPClient(8 * time.Second)
+func (s *AppServer) outboundDialerOrDefault(timeout time.Duration) *security.OutboundSafeDialer {
+	if s != nil && s.deps.OutboundDialer != nil {
+		return s.deps.OutboundDialer
 	}
+	return &security.OutboundSafeDialer{Timeout: timeout}
+}
+
+func (s *AppServer) newLinkPatrolHTTPClient() *http.Client {
+	dialer := s.outboundDialerOrDefault(8 * time.Second)
+	client := dialer.NewHTTPClient(8 * time.Second)
 	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
 		if len(via) >= 4 {
 			return errors.New("too many redirects")
 		}
-		if s.deps.OutboundDialer != nil {
-			if _, err := s.deps.OutboundDialer.ValidateOutboundURL(req.URL.String()); err != nil {
-				return err
-			}
+		if len(via) > 0 && strings.EqualFold(via[len(via)-1].URL.Scheme, "https") && !strings.EqualFold(req.URL.Scheme, "https") {
+			return errors.New("refusing insecure https to http scheme downgrade redirect")
+		}
+		if _, err := dialer.ValidateOutboundURL(req.URL.String()); err != nil {
+			return err
+		}
+		if len(via) > 0 && (!strings.EqualFold(via[0].URL.Host, req.URL.Host) || !strings.EqualFold(via[len(via)-1].URL.Host, req.URL.Host)) {
+			req.Header.Del("Authorization")
+			req.Header.Del("Proxy-Authorization")
+			req.Header.Del("Cookie")
 		}
 		return nil
 	}
@@ -614,10 +626,7 @@ type parsedFeedEntry struct {
 }
 
 func (s *AppServer) newFollowSyncHTTPClient() *http.Client {
-	if s.deps.OutboundDialer != nil {
-		return s.deps.OutboundDialer.NewHTTPClient(10 * time.Second)
-	}
-	return &http.Client{Timeout: 10 * time.Second}
+	return s.outboundDialerOrDefault(10 * time.Second).NewHTTPClient(10 * time.Second)
 }
 
 func (s *AppServer) syncSingleFollowFeed(ctx context.Context, fw domain.Follow) (int, domain.Follow, error) {
@@ -924,7 +933,7 @@ func (s *AppServer) refreshGitHubRepositories(ctx context.Context, usernameOverr
 		UpdatedAt       string `json:"updated_at"`
 	}
 
-	client := s.deps.OutboundDialer.NewHTTPClient(12 * time.Second)
+	client := s.outboundDialerOrDefault(12 * time.Second).NewHTTPClient(12 * time.Second)
 	var allRaw []ghRawRepo
 	for page := 1; page <= 5; page++ {
 		apiURL := fmt.Sprintf("https://api.github.com/users/%s/repos?per_page=100&page=%d&sort=updated", url.PathEscape(uname), page)
@@ -1272,7 +1281,7 @@ func (s *AppServer) pushIndexNowURLs(ctx context.Context, baseURL string) (int, 
 		"keyLocation": strings.TrimRight(baseURL, "/") + "/" + seo.IndexNowKey + ".txt",
 		"urlList":     urls,
 	})
-	client := s.deps.OutboundDialer.NewHTTPClient(8 * time.Second)
+	client := s.outboundDialerOrDefault(8 * time.Second).NewHTTPClient(8 * time.Second)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://api.indexnow.org/indexnow", bytes.NewReader(payload))
 	if err != nil {
 		return 0, err

@@ -2,6 +2,7 @@ package plugin
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -72,7 +73,8 @@ type jsObject struct {
 }
 
 type jsArray struct {
-	items []jsValue
+	items  []jsValue
+	frozen bool
 }
 
 type jsRegExp struct {
@@ -261,6 +263,11 @@ type jsRuntime struct {
 	evalDepth       int
 	interrupted     atomic.Bool
 	interruptVal    atomic.Value
+	baseCtx         context.Context
+	execCtx         context.Context
+	deadline        time.Time
+	hasDeadline     bool
+	interruptStride uint32
 }
 
 func newJSRuntime() *jsRuntime {
@@ -272,6 +279,41 @@ func newJSRuntime() *jsRuntime {
 	return rt
 }
 
+func freezeBuiltinValue(v jsValue, seenObj map[*jsObject]bool, seenFn map[*jsFunc]bool, seenArr map[*jsArray]bool) {
+	switch v.kind {
+	case valObject:
+		if v.obj == nil || v.obj.scope != nil || seenObj[v.obj] {
+			return
+		}
+		seenObj[v.obj] = true
+		v.obj.frozen = true
+		for _, pv := range v.obj.props {
+			freezeBuiltinValue(pv, seenObj, seenFn, seenArr)
+		}
+	case valFunc:
+		if v.fn == nil || seenFn[v.fn] {
+			return
+		}
+		seenFn[v.fn] = true
+		v.fn.frozenProps = true
+		for _, pv := range v.fn.props {
+			freezeBuiltinValue(pv, seenObj, seenFn, seenArr)
+		}
+	case valArray:
+		if v.arr == nil || (seenArr != nil && seenArr[v.arr]) {
+			return
+		}
+		if seenArr == nil {
+			seenArr = make(map[*jsArray]bool, 8)
+		}
+		seenArr[v.arr] = true
+		v.arr.frozen = true
+		for _, elem := range v.arr.items {
+			freezeBuiltinValue(elem, seenObj, seenFn, seenArr)
+		}
+	}
+}
+
 // freezeBuiltinsAndSnapshot captures post-module-init global state and freezes
 // builtin prototypes/namespaces so pooled VMs cannot leak prototype or globalThis
 // mutations across invocations while preserving normal module-level globals.
@@ -280,9 +322,12 @@ func (rt *jsRuntime) snapshotPostInit() {
 		rt.objProto, rt.arrProto, rt.strProto, rt.numProto,
 		rt.boolProto, rt.reProto, rt.funcProto, rt.jsonObj, rt.mathObj,
 	}
+	seenObj := make(map[*jsObject]bool, 32)
+	seenFn := make(map[*jsFunc]bool, 64)
+	seenArr := make(map[*jsArray]bool, 16)
 	for _, proto := range sharedBuiltins {
 		if proto != nil {
-			proto.frozen = true
+			freezeBuiltinValue(jsValue{kind: valObject, obj: proto}, seenObj, seenFn, seenArr)
 		}
 	}
 	rt.protoSnaps = make(map[*jsObject]map[string]jsValue, len(sharedBuiltins))
@@ -297,11 +342,7 @@ func (rt *jsRuntime) snapshotPostInit() {
 	}
 	for name := range rt.builtinGlobals {
 		if v, ok := rt.global.vars[name]; ok {
-			if v.kind == valObject && v.obj != nil && v.obj.scope == nil {
-				v.obj.frozen = true
-			} else if v.kind == valFunc && v.fn != nil {
-				v.fn.frozenProps = true
-			}
+			freezeBuiltinValue(v, seenObj, seenFn, seenArr)
 		}
 	}
 	rt.postInitGlobals = make(map[string]jsValue, len(rt.global.vars))
@@ -393,9 +434,49 @@ func (rt *jsRuntime) ClearInterrupt() {
 	rt.interrupted.Store(false)
 }
 
+func (rt *jsRuntime) setExecBudget(baseCtx context.Context, execCtx context.Context, deadline time.Time) {
+	rt.baseCtx = baseCtx
+	rt.execCtx = execCtx
+	rt.deadline = deadline
+	rt.hasDeadline = !deadline.IsZero()
+	rt.interruptStride = 63
+}
+
+func (rt *jsRuntime) clearExecBudget() {
+	rt.baseCtx = nil
+	rt.execCtx = nil
+	rt.deadline = time.Time{}
+	rt.hasDeadline = false
+	rt.interruptStride = 0
+}
+
 func (rt *jsRuntime) checkInterrupt() error {
 	if rt.interrupted.Load() {
 		return &jsInterruptedError{cause: rt.loadInterruptCause()}
+	}
+	if rt.baseCtx != nil || rt.execCtx != nil || rt.hasDeadline {
+		rt.interruptStride++
+		if (rt.interruptStride & 63) == 0 {
+			if rt.baseCtx != nil {
+				if err := rt.baseCtx.Err(); err != nil {
+					rt.Interrupt(err)
+					return &jsInterruptedError{cause: err}
+				}
+			}
+			if rt.hasDeadline && !time.Now().Before(rt.deadline) {
+				rt.Interrupt(ErrExecutionTimeout)
+				return &jsInterruptedError{cause: ErrExecutionTimeout}
+			}
+			if rt.execCtx != nil {
+				if err := rt.execCtx.Err(); err != nil {
+					if errors.Is(err, context.DeadlineExceeded) && rt.hasDeadline {
+						err = ErrExecutionTimeout
+					}
+					rt.Interrupt(err)
+					return &jsInterruptedError{cause: err}
+				}
+			}
+		}
 	}
 	return nil
 }
@@ -641,7 +722,11 @@ func (rt *jsRuntime) callFunc(fn *jsFunc, thisVal jsValue, args []jsValue) (retV
 	}
 
 	if fn.native != nil {
-		return fn.native(rt, thisVal, args)
+		out, err := fn.native(rt, thisVal, args)
+		if rt.baseCtx != nil || rt.execCtx != nil || rt.hasDeadline {
+			rt.interruptStride = 63
+		}
+		return out, err
 	}
 
 	callScope := newJSFuncScope(fn.env)
@@ -1575,6 +1660,13 @@ func (rt *jsRuntime) evalExpr(ex jsExpr, scope *jsScope, thisVal jsValue) (jsVal
 					if objVal.fn.props != nil {
 						delete(objVal.fn.props, key)
 					}
+				} else if objVal.kind == valArray && objVal.arr != nil {
+					if objVal.arr.frozen {
+						return jsFalseVal, nil
+					}
+					if idx, pErr := strconv.Atoi(key); pErr == nil && idx >= 0 && idx < len(objVal.arr.items) {
+						objVal.arr.items[idx] = jsUndefinedVal
+					}
 				}
 			}
 			return jsTrueVal, nil
@@ -1821,6 +1913,9 @@ func (rt *jsRuntime) resolveLValue(target jsExpr, scope *jsScope, thisVal jsValu
 				return nil
 			}
 			if objVal.kind == valArray && objVal.arr != nil {
+				if objVal.arr.frozen {
+					return nil
+				}
 				if idx, pErr := strconv.Atoi(prop); pErr == nil && idx >= 0 {
 					if idx >= maxJSArrayLen {
 						return rt.throwErr("RangeError", "Invalid array length")
@@ -2662,6 +2757,44 @@ func funcProperty(fn *jsFunc, prop string) jsValue {
 	return jsUndefinedVal
 }
 
+func clampJSNonNegInt(f float64, limit int) int {
+	if math.IsNaN(f) || f <= 0 {
+		return 0
+	}
+	if f >= float64(limit) {
+		return limit
+	}
+	return int(math.Trunc(f))
+}
+
+func clampJSRelativeIndex(f float64, length int) int {
+	if math.IsNaN(f) || f == 0 {
+		return 0
+	}
+	if f >= float64(length) {
+		return length
+	}
+	if f <= -float64(length) {
+		return 0
+	}
+	t := int(math.Trunc(f))
+	if t < 0 {
+		return max(0, length+t)
+	}
+	return t
+}
+
+func jsToUint32(f float64) uint32 {
+	if math.IsNaN(f) || math.IsInf(f, 0) || f == 0 {
+		return 0
+	}
+	m := math.Mod(math.Trunc(f), 4294967296)
+	if m < 0 {
+		m += 4294967296
+	}
+	return uint32(m)
+}
+
 func stringProperty(s string, prop string) jsValue {
 	if prop == "length" {
 		return jsValue{kind: valNumber, num: float64(utf8.RuneCountInString(s))}
@@ -2741,7 +2874,7 @@ func stringProperty(s string, prop string) jsValue {
 			sub := args[0].toString()
 			if len(args) >= 2 && args[1].kind != valUndefined {
 				sRunes := []rune(s)
-				pos := min(max(0, int(math.Trunc(args[1].toNumber()))), len(sRunes))
+				pos := clampJSNonNegInt(args[1].toNumber(), len(sRunes))
 				tail := string(sRunes[pos:])
 				byteIdx := strings.Index(tail, sub)
 				if byteIdx < 0 {
@@ -2761,28 +2894,53 @@ func stringProperty(s string, prop string) jsValue {
 				return jsValue{kind: valNumber, num: -1}, nil
 			}
 			sub := args[0].toString()
-			sRunes := []rune(s)
-			subRunes := []rune(sub)
-			maxPos := len(sRunes)
-			if len(args) >= 2 && args[1].kind != valUndefined {
-				pf := args[1].toNumber()
-				if !math.IsNaN(pf) {
-					maxPos = min(maxPos, max(0, int(math.Trunc(pf))))
+			hasPos := len(args) >= 2 && args[1].kind != valUndefined
+			var pf float64
+			if hasPos {
+				pf = args[1].toNumber()
+				if math.IsNaN(pf) {
+					hasPos = false
 				}
 			}
-			for i := min(maxPos, len(sRunes)-len(subRunes)); i >= 0; i-- {
-				matched := true
-				for j := 0; j < len(subRunes); j++ {
-					if sRunes[i+j] != subRunes[j] {
-						matched = false
-						break
-					}
+			if sub == "" {
+				runeLen := utf8.RuneCountInString(s)
+				if !hasPos || pf >= float64(runeLen) {
+					return jsValue{kind: valNumber, num: float64(runeLen)}, nil
 				}
-				if matched {
-					return jsValue{kind: valNumber, num: float64(i)}, nil
+				if pf <= 0 {
+					return jsValue{kind: valNumber, num: 0}, nil
 				}
+				return jsValue{kind: valNumber, num: float64(int(math.Trunc(pf)))}, nil
 			}
-			return jsValue{kind: valNumber, num: -1}, nil
+			if !hasPos || pf >= float64(len(s)) {
+				byteIdx := strings.LastIndex(s, sub)
+				if byteIdx < 0 {
+					return jsValue{kind: valNumber, num: -1}, nil
+				}
+				return jsValue{kind: valNumber, num: float64(utf8.RuneCountInString(s[:byteIdx]))}, nil
+			}
+			maxPos := 0
+			if pf > 0 {
+				maxPos = int(math.Trunc(pf))
+			}
+			subRunes := utf8.RuneCountInString(sub)
+			endRunes := maxPos + subRunes
+			endByte := len(s)
+			if endRunes < len(s) {
+				bytePos := 0
+				count := 0
+				for bytePos < len(s) && count < endRunes {
+					_, w := utf8.DecodeRuneInString(s[bytePos:])
+					bytePos += w
+					count++
+				}
+				endByte = bytePos
+			}
+			byteIdx := strings.LastIndex(s[:endByte], sub)
+			if byteIdx < 0 {
+				return jsValue{kind: valNumber, num: -1}, nil
+			}
+			return jsValue{kind: valNumber, num: float64(utf8.RuneCountInString(s[:byteIdx]))}, nil
 		})
 	case "includes", "startsWith", "endsWith":
 		return nativeVal(func(_ *jsRuntime, _ jsValue, args []jsValue) (jsValue, error) {
@@ -2805,27 +2963,17 @@ func stringProperty(s string, prop string) jsValue {
 			l := len(runes)
 			start, end := 0, l
 			if len(args) >= 1 && args[0].kind != valUndefined {
-				start = int(args[0].toNumber())
-				if start < 0 {
-					if prop == "slice" {
-						start = max(0, l+start)
-					} else {
-						start = 0
-					}
-				} else if start > l {
-					start = l
+				if prop == "slice" {
+					start = clampJSRelativeIndex(args[0].toNumber(), l)
+				} else {
+					start = clampJSNonNegInt(args[0].toNumber(), l)
 				}
 			}
 			if len(args) >= 2 && args[1].kind != valUndefined {
-				end = int(args[1].toNumber())
-				if end < 0 {
-					if prop == "slice" {
-						end = max(0, l+end)
-					} else {
-						end = 0
-					}
-				} else if end > l {
-					end = l
+				if prop == "slice" {
+					end = clampJSRelativeIndex(args[1].toNumber(), l)
+				} else {
+					end = clampJSNonNegInt(args[1].toNumber(), l)
 				}
 			}
 			if end < start {
@@ -2839,12 +2987,20 @@ func stringProperty(s string, prop string) jsValue {
 		})
 	case "charAt", "charCodeAt":
 		return nativeVal(func(_ *jsRuntime, _ jsValue, args []jsValue) (jsValue, error) {
-			idx := 0
-			if len(args) > 0 {
-				idx = int(args[0].toNumber())
-			}
 			runes := []rune(s)
-			if idx < 0 || idx >= len(runes) {
+			idx := 0
+			outOfBounds := false
+			if len(args) > 0 && args[0].kind != valUndefined {
+				nf := args[0].toNumber()
+				if math.IsNaN(nf) {
+					idx = 0
+				} else if nf < 0 || nf >= float64(len(runes)) {
+					outOfBounds = true
+				} else {
+					idx = int(math.Trunc(nf))
+				}
+			}
+			if outOfBounds || idx < 0 || idx >= len(runes) {
 				if prop == "charAt" {
 					return jsValue{kind: valString, str: ""}, nil
 				}
@@ -2864,14 +3020,21 @@ func stringProperty(s string, prop string) jsValue {
 			if math.IsNaN(n) {
 				return jsValue{kind: valString, str: ""}, nil
 			}
-			if n < 0 || math.IsInf(n, 0) {
+			if math.IsInf(n, 0) {
 				return rt.throwValErr("RangeError", "Invalid count value")
 			}
-			count := int(n)
-			if count == 0 || len(s) == 0 {
+			n = math.Trunc(n)
+			if n < 0 {
+				return rt.throwValErr("RangeError", "Invalid count value")
+			}
+			if n == 0 || len(s) == 0 {
 				return jsValue{kind: valString, str: ""}, nil
 			}
-			if count > maxJSStringBytes || int64(len(s))*int64(count) > maxJSStringBytes {
+			if n > float64(maxJSStringBytes) {
+				return rt.throwStrLenErr()
+			}
+			count := int(n)
+			if int64(len(s))*int64(count) > maxJSStringBytes {
 				return rt.throwStrLenErr()
 			}
 			return jsValue{kind: valString, str: strings.Repeat(s, count)}, nil
@@ -2882,11 +3045,7 @@ func stringProperty(s string, prop string) jsValue {
 			limit := maxJSArrayLen + 1
 			if len(args) >= 2 && args[1].kind != valUndefined {
 				hasLimit = true
-				lf := args[1].toNumber()
-				if math.IsNaN(lf) || lf == 0 {
-					return jsValue{kind: valArray, arr: &jsArray{items: []jsValue{}}}, nil
-				}
-				u := uint32(int64(math.Trunc(lf)))
+				u := jsToUint32(args[1].toNumber())
 				if u == 0 {
 					return jsValue{kind: valArray, arr: &jsArray{items: []jsValue{}}}, nil
 				}
@@ -3080,10 +3239,23 @@ func stringProperty(s string, prop string) jsValue {
 			return jsValue{kind: valArray, arr: &jsArray{items: items}}, nil
 		})
 	}
-	if idx, err := strconv.Atoi(prop); err == nil && idx >= 0 {
-		runes := []rune(s)
-		if idx < len(runes) {
-			return jsValue{kind: valString, str: string(runes[idx])}
+	if idx, err := strconv.Atoi(prop); err == nil && idx >= 0 && idx < len(s) {
+		isASCIIPrefix := true
+		for i := 0; i <= idx; i++ {
+			if s[i] >= utf8.RuneSelf {
+				isASCIIPrefix = false
+				break
+			}
+		}
+		if isASCIIPrefix {
+			return jsValue{kind: valString, str: s[idx : idx+1]}
+		}
+		cur := 0
+		for _, rn := range s {
+			if cur == idx {
+				return jsValue{kind: valString, str: string(rn)}
+			}
+			cur++
 		}
 	}
 	return jsUndefinedVal
@@ -3291,6 +3463,9 @@ func arrayProperty(arr *jsArray, prop string) jsValue {
 	switch prop {
 	case "push":
 		return nativeVal(func(rt *jsRuntime, _ jsValue, args []jsValue) (jsValue, error) {
+			if arr.frozen {
+				return rt.throwValErr("TypeError", "Cannot add property to frozen array")
+			}
 			if len(arr.items)+len(args) > maxJSArrayLen {
 				return rt.throwValErr("RangeError", "Invalid array length")
 			}
@@ -3298,7 +3473,10 @@ func arrayProperty(arr *jsArray, prop string) jsValue {
 			return jsValue{kind: valNumber, num: float64(len(arr.items))}, nil
 		})
 	case "pop", "shift":
-		return nativeVal(func(_ *jsRuntime, _ jsValue, _ []jsValue) (jsValue, error) {
+		return nativeVal(func(rt *jsRuntime, _ jsValue, _ []jsValue) (jsValue, error) {
+			if arr.frozen {
+				return rt.throwValErr("TypeError", "Cannot modify frozen array")
+			}
 			if len(arr.items) == 0 {
 				return jsUndefinedVal, nil
 			}
@@ -3316,6 +3494,9 @@ func arrayProperty(arr *jsArray, prop string) jsValue {
 		})
 	case "unshift":
 		return nativeVal(func(rt *jsRuntime, _ jsValue, args []jsValue) (jsValue, error) {
+			if arr.frozen {
+				return rt.throwValErr("TypeError", "Cannot modify frozen array")
+			}
 			if len(args) == 0 {
 				return jsValue{kind: valNumber, num: float64(len(arr.items))}, nil
 			}
@@ -3351,7 +3532,10 @@ func arrayProperty(arr *jsArray, prop string) jsValue {
 			return jsValue{kind: valArray, arr: &jsArray{items: out}}, nil
 		})
 	case "reverse":
-		return nativeVal(func(_ *jsRuntime, _ jsValue, _ []jsValue) (jsValue, error) {
+		return nativeVal(func(rt *jsRuntime, _ jsValue, _ []jsValue) (jsValue, error) {
+			if arr.frozen {
+				return rt.throwValErr("TypeError", "Cannot modify frozen array")
+			}
 			for i, j := 0, len(arr.items)-1; i < j; i, j = i+1, j-1 {
 				arr.items[i], arr.items[j] = arr.items[j], arr.items[i]
 			}
@@ -3359,6 +3543,9 @@ func arrayProperty(arr *jsArray, prop string) jsValue {
 		})
 	case "sort":
 		return nativeVal(func(rt *jsRuntime, _ jsValue, args []jsValue) (jsValue, error) {
+			if arr.frozen {
+				return rt.throwValErr("TypeError", "Cannot modify frozen array")
+			}
 			var cmpFn *jsFunc
 			if len(args) > 0 && args[0].kind != valUndefined {
 				if args[0].kind != valFunc || args[0].fn == nil {
@@ -3456,24 +3643,17 @@ func arrayProperty(arr *jsArray, prop string) jsValue {
 		})
 	case "splice":
 		return nativeVal(func(rt *jsRuntime, _ jsValue, args []jsValue) (jsValue, error) {
+			if arr.frozen {
+				return rt.throwValErr("TypeError", "Cannot modify frozen array")
+			}
 			if len(args) == 0 {
 				return jsValue{kind: valArray, arr: &jsArray{}}, nil
 			}
 			l := len(arr.items)
-			start := int(math.Trunc(args[0].toNumber()))
-			if start < 0 {
-				start = max(0, l+start)
-			} else if start > l {
-				start = l
-			}
+			start := clampJSRelativeIndex(args[0].toNumber(), l)
 			delCount := l - start
 			if len(args) >= 2 {
-				df := args[1].toNumber()
-				if math.IsNaN(df) || df <= 0 {
-					delCount = 0
-				} else if !math.IsInf(df, 1) && int(math.Trunc(df)) <= l-start {
-					delCount = int(math.Trunc(df))
-				}
+				delCount = clampJSNonNegInt(args[1].toNumber(), l-start)
 			}
 			var insertItems []jsValue
 			if len(args) > 2 {
@@ -3556,20 +3736,10 @@ func arrayProperty(arr *jsArray, prop string) jsValue {
 			l := len(arr.items)
 			start, end := 0, l
 			if len(args) >= 1 && args[0].kind != valUndefined {
-				start = int(args[0].toNumber())
-				if start < 0 {
-					start = max(0, l+start)
-				} else if start > l {
-					start = l
-				}
+				start = clampJSRelativeIndex(args[0].toNumber(), l)
 			}
 			if len(args) >= 2 && args[1].kind != valUndefined {
-				end = int(args[1].toNumber())
-				if end < 0 {
-					end = max(0, l+end)
-				} else if end > l {
-					end = l
-				}
+				end = clampJSRelativeIndex(args[1].toNumber(), l)
 			}
 			end = max(start, end)
 			cp := make([]jsValue, end-start)
@@ -3587,10 +3757,7 @@ func arrayProperty(arr *jsArray, prop string) jsValue {
 			}
 			start := 0
 			if len(args) >= 2 && args[1].kind != valUndefined {
-				start = int(math.Trunc(args[1].toNumber()))
-				if start < 0 {
-					start = max(0, len(arr.items)+start)
-				}
+				start = clampJSRelativeIndex(args[1].toNumber(), len(arr.items))
 			}
 			for i := start; i < len(arr.items); i++ {
 				if err := rt.checkInterrupt(); err != nil {
@@ -4495,10 +4662,19 @@ func (rt *jsRuntime) installBuiltins() {
 				if len(args) == 0 {
 					return jsUndefinedVal, nil
 				}
-				if args[0].kind == valObject && args[0].obj != nil && args[0].obj.scope == nil {
-					args[0].obj.frozen = true
-				} else if args[0].kind == valFunc && args[0].fn != nil {
-					args[0].fn.frozenProps = true
+				switch args[0].kind {
+				case valObject:
+					if args[0].obj != nil && args[0].obj.scope == nil {
+						args[0].obj.frozen = true
+					}
+				case valArray:
+					if args[0].arr != nil {
+						args[0].arr.frozen = true
+					}
+				case valFunc:
+					if args[0].fn != nil {
+						args[0].fn.frozenProps = true
+					}
 				}
 				return args[0], nil
 			}),
@@ -4512,12 +4688,17 @@ func (rt *jsRuntime) installBuiltins() {
 						return jsTrueVal, nil
 					}
 					return boolVal(args[0].obj.frozen), nil
+				case valArray:
+					if args[0].arr == nil {
+						return jsTrueVal, nil
+					}
+					return boolVal(args[0].arr.frozen), nil
 				case valFunc:
 					if args[0].fn == nil {
 						return jsTrueVal, nil
 					}
 					return boolVal(args[0].fn.frozenProps), nil
-				case valArray, valRegExp:
+				case valRegExp:
 					return jsFalseVal, nil
 				default:
 					return jsTrueVal, nil
@@ -4560,6 +4741,9 @@ func (rt *jsRuntime) installBuiltins() {
 					return nullObjErr(r)
 				}
 				dst := args[0]
+				if dst.kind == valArray && dst.arr != nil && dst.arr.frozen {
+					return r.throwValErr("TypeError", "Cannot assign to read only property of frozen object")
+				}
 				if dst.kind == valObject && dst.obj != nil {
 					if dst.obj.frozen {
 						return r.throwValErr("TypeError", "Cannot assign to read only property of frozen object")
@@ -4683,21 +4867,30 @@ func (rt *jsRuntime) installBuiltins() {
 
 	rt.jsonObj = jsonObj
 	rt.mathObj = mathObj
+	seenObj := make(map[*jsObject]bool, 16)
+	seenFn := make(map[*jsFunc]bool, 64)
+	seenArr := make(map[*jsArray]bool, 16)
 	for _, shared := range []*jsObject{
 		rt.objProto, rt.arrProto, rt.strProto, rt.numProto,
 		rt.boolProto, rt.reProto, rt.funcProto, jsonObj, mathObj,
 	} {
 		if shared != nil {
-			shared.frozen = true
+			freezeBuiltinValue(jsValue{kind: valObject, obj: shared}, seenObj, seenFn, seenArr)
 		}
 	}
 	for _, ctor := range []*jsFunc{strCtor, numCtor, boolCtor, reCtor, arrCtor, objCtor, dateCtor} {
 		if ctor != nil {
-			ctor.frozenProps = true
+			freezeBuiltinValue(jsValue{kind: valFunc, fn: ctor}, seenObj, seenFn, seenArr)
 		}
 	}
+	for _, v := range rt.global.vars {
+		if v.kind == valObject && v.obj == rt.globalObj {
+			continue
+		}
+		freezeBuiltinValue(v, seenObj, seenFn, seenArr)
+	}
 
-	rt.builtinGlobals = make(map[string]jsValue, len(rt.global.vars)+4)
+	rt.builtinGlobals = make(map[string]jsValue, len(rt.global.vars)+6)
 	for k, v := range rt.global.vars {
 		rt.builtinGlobals[k] = v
 	}
@@ -5170,7 +5363,9 @@ func wrapGoFuncVal(fnVal reflect.Value) jsValue {
 	return nativeVal(func(callRT *jsRuntime, _ jsValue, args []jsValue) (ret jsValue, retErr error) {
 		defer func() {
 			if rec := recover(); rec != nil {
-				if thrown, ok := rec.(*jsThrownError); ok {
+				if inter, ok := rec.(*jsInterruptedError); ok {
+					retErr = inter
+				} else if thrown, ok := rec.(*jsThrownError); ok {
 					retErr = thrown
 				} else {
 					retErr = &jsThrownError{val: callRT.newErrorVal("Error", fmt.Sprint(rec))}
@@ -5188,13 +5383,41 @@ func wrapGoFuncVal(fnVal reflect.Value) jsValue {
 		}
 		outs := fnVal.Call(in)
 		if len(outs) == 0 {
+			if callRT != nil && callRT.interrupted.Load() {
+				return jsUndefinedVal, &jsInterruptedError{cause: callRT.loadInterruptCause()}
+			}
+			return jsUndefinedVal, nil
+		}
+		if len(outs) == 1 && outs[0].Type().Implements(reflect.TypeFor[error]()) {
+			if !outs[0].IsNil() {
+				errVal := outs[0].Interface().(error)
+				if errors.Is(errVal, context.Canceled) || errors.Is(errVal, context.DeadlineExceeded) || errors.Is(errVal, ErrExecutionTimeout) {
+					if callRT != nil {
+						callRT.Interrupt(errVal)
+					}
+					return jsUndefinedVal, &jsInterruptedError{cause: errVal}
+				}
+				return jsUndefinedVal, &jsThrownError{val: callRT.newErrorVal("Error", errVal.Error())}
+			}
+			if callRT != nil && callRT.interrupted.Load() {
+				return jsUndefinedVal, &jsInterruptedError{cause: callRT.loadInterruptCause()}
+			}
 			return jsUndefinedVal, nil
 		}
 		if len(outs) == 2 && outs[1].Type().Implements(reflect.TypeFor[error]()) {
 			if !outs[1].IsNil() {
 				errVal := outs[1].Interface().(error)
+				if errors.Is(errVal, context.Canceled) || errors.Is(errVal, context.DeadlineExceeded) || errors.Is(errVal, ErrExecutionTimeout) {
+					if callRT != nil {
+						callRT.Interrupt(errVal)
+					}
+					return jsUndefinedVal, &jsInterruptedError{cause: errVal}
+				}
 				return jsUndefinedVal, &jsThrownError{val: callRT.newErrorVal("Error", errVal.Error())}
 			}
+		}
+		if callRT != nil && callRT.interrupted.Load() {
+			return jsUndefinedVal, &jsInterruptedError{cause: callRT.loadInterruptCause()}
 		}
 		return goToJSValue(outs[0].Interface()), nil
 	})

@@ -188,6 +188,17 @@ func TestThemeSanitizersAndPageURL(t *testing.T) {
 	if got := buildThemePageURL("/tags?q=golang&sort=name", 2); got != "/tags?page=2&q=golang&sort=name" {
 		t.Fatalf("pageURL(page=2) = %q, want /tags?page=2&q=golang&sort=name", got)
 	}
+
+	// cpageURL query preservation (keeps cpage=1 explicitly when ch= is present)
+	if got := buildThemeCPageURL("/books/handbook?cpage=2", 1); got != "/books/handbook" {
+		t.Fatalf("cpageURL(page=1, no ch) = %q, want /books/handbook", got)
+	}
+	if got := buildThemeCPageURL("/books/handbook?ch=ch_150&cpage=2", 1); got != "/books/handbook?ch=ch_150&cpage=1" {
+		t.Fatalf("cpageURL(page=1, with ch) = %q, want /books/handbook?ch=ch_150&cpage=1", got)
+	}
+	if got := buildThemeCPageURL("/books/handbook?ch=ch_150", 3); got != "/books/handbook?ch=ch_150&cpage=3" {
+		t.Fatalf("cpageURL(page=3, with ch) = %q, want /books/handbook?ch=ch_150&cpage=3", got)
+	}
 }
 
 func TestDualCDNAssetAndVendorUnifiedRuntime(t *testing.T) {

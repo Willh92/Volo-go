@@ -74,8 +74,8 @@ func TestKanbanniang_CatalogParityAndAll26BundledModels(t *testing.T) {
 		}
 		seenInCatalog[entry.ID] = entry.Version
 	}
-	if seenInCatalog["kanbanniang"] != "2.0.5" || seenInCatalog["sensitive-words"] == "" {
-		t.Fatalf("expected kanbanniang=2.0.5 and sensitive-words in catalog, got %+v", seenInCatalog)
+	if seenInCatalog["kanbanniang"] != "2.0.6" || seenInCatalog["sensitive-words"] == "" {
+		t.Fatalf("expected kanbanniang=2.0.6 and sensitive-words in catalog, got %+v", seenInCatalog)
 	}
 
 	// 2. Stage kanbanniang into isolated test environment and verify admin/public endpoints + all 26 models.
@@ -163,7 +163,7 @@ func TestKanbanniang_CatalogParityAndAll26BundledModels(t *testing.T) {
 	}
 	// Only the host-managed external defer <script src="/plugins/kanbanniang/assets/widget.js?v=..."> tag may appear (zero inline JS).
 	if strings.Count(footerHTML, "<script") != 1 ||
-		!strings.Contains(footerHTML, `<script defer src="/plugins/kanbanniang/assets/widget.js?v=2.0.5"`) ||
+		!strings.Contains(footerHTML, `<script defer src="/plugins/kanbanniang/assets/widget.js?v=2.0.6"`) ||
 		!strings.Contains(footerHTML, `></script>`) {
 		t.Fatalf("expected single external defer widget.js script with zero inline JS, got: %s", footerHTML)
 	}
@@ -608,7 +608,7 @@ func TestKanbanniang_MinifiedZipInstallAndJSVMExecution(t *testing.T) {
 		t.Fatalf("package-plugin.py failed: %v\n%s", cErr, string(out))
 	}
 
-	builtZip := filepath.Join(outDir, "plugin-kanbanniang-v2.0.5.zip")
+	builtZip := filepath.Join(outDir, "plugin-kanbanniang-v2.0.6.zip")
 	zr, err := zip.OpenReader(builtZip)
 	if err != nil {
 		t.Fatalf("open built zip: %v", err)
@@ -772,6 +772,9 @@ func TestKanbanniang_MotionPurityAndControllerInvariants(t *testing.T) {
 		"body:has([data-book-reader]) .solo-kanbanniang",
 		".solo-kanbanniang:focus-within .solo-kanbanniang__tool",
 		".solo-kanbanniang-summon",
+		"--kbn-dock-reserve-right",
+		`meta[name="color-scheme"][content="dark"]`,
+		"html:not([data-volo-skin=\"volo-journal\"]):has(#volo-toc-drawer:not([hidden]))",
 	} {
 		if !strings.Contains(cssStr, cssNeedle) {
 			t.Fatalf("widget.css missing expected selector %q", cssNeedle)
@@ -789,8 +792,13 @@ func TestKanbanniang_MotionPurityAndControllerInvariants(t *testing.T) {
 		!strings.Contains(jsStr, "function retryLoad(") ||
 		!strings.Contains(jsStr, "solo-kanbanniang-summon") ||
 		!strings.Contains(jsStr, "function restoreFromSummon(") ||
+		!strings.Contains(jsStr, "function syncDockAttributes(") ||
+		!strings.Contains(jsStr, `pe !== "none"`) ||
+		!strings.Contains(jsStr, "#volo-search-modal:not([hidden]):not(.is-closing)") ||
+		!strings.Contains(jsStr, "subtree: true") ||
+		!strings.Contains(jsStr, `window.addEventListener("pointermove", handleDragMove`) ||
 		strings.Contains(jsStr, "showMessage(tips.click,") {
-		t.Fatalf("widget.js missing rule-object tip unwrapping, summon pill, or manual retry recovery guard")
+		t.Fatalf("widget.js missing rule-object tip unwrapping, summon pill, Contract #2 dock sync, overlay sync, window drag capture, or manual retry recovery guard")
 	}
 
 	live2dSrc, err := os.ReadFile(filepath.Join(assetsRoot, "live2d.js"))

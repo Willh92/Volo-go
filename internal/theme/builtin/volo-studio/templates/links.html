@@ -8,100 +8,110 @@
       </div>
     </section>
     {{$okLabel := t .Locale "links.status_ok"}}{{$brokenLabel := t .Locale "links.status_broken"}}
-    {{if .LinkGroups}}
-      {{$grpLen := len .LinkGroups}}
+    {{if or .LinkGroups .LinksByCategory .TagQuery}}
+      {{$shownLinks := 0}}
+      {{if .LinkGroups}}
+        {{range .LinkGroups}}{{$shownLinks = add $shownLinks (len .Items)}}{{end}}
+      {{else if .LinksByCategory}}
+        {{range $cat, $items := .LinksByCategory}}{{$shownLinks = add $shownLinks (len $items)}}{{end}}
+      {{end}}
+      {{$totalLinks := $shownLinks}}
+      {{if gt .Pagination.TotalItems $totalLinks}}{{$totalLinks = .Pagination.TotalItems}}{{end}}
       <div class="studio-stack" data-collection-root="links">
         <div class="studio-article studio-card-pad studio-collection-toolbar">
-          <div class="studio-collection-search-wrap">
-            <input type="search" class="volo-input studio-collection-filter js-collection-filter" placeholder="{{t .Locale "studio.filter_placeholder"}}" aria-label="{{t .Locale "nav.links"}}" autocomplete="off">
-          </div>
-          {{if gt $grpLen 1}}
-            <nav class="studio-jump-pills" aria-label="{{t .Locale "nav.links"}}">
-              {{range $i, $g := .LinkGroups}}
-                <a class="studio-jump-pill" href="#link-group-{{$i}}"{{if ge $i 18}} data-extra-pill hidden{{end}}>{{$g.Category}} <small>{{len $g.Items}}</small></a>
-              {{end}}
-              {{if gt $grpLen 18}}
-                <button type="button" class="studio-jump-pill studio-tags-more-btn js-jump-pills-toggle"
-                        aria-expanded="false"
-                        data-more-label="+{{sub $grpLen 18}}"
-                        data-less-label="{{t .Locale "studio.show_less"}}">+{{sub $grpLen 18}}</button>
-              {{end}}
-            </nav>
+          <form class="studio-tax-search studio-collection-search-wrap" method="get" action="/links">
+            <input type="search" name="q" value="{{.TagQuery}}" data-server-filter="1" class="volo-input studio-tax-search__input studio-collection-filter js-collection-filter" placeholder="{{t .Locale "studio.filter_placeholder"}}" aria-label="{{t .Locale "nav.links"}}" autocomplete="off">
+            <a class="studio-icon-btn studio-tag-clear js-collection-filter-clear" href="/links" data-server-query="{{.TagQuery}}" {{if not .TagQuery}}hidden{{end}} title="{{t .Locale "studio.clear_filter"}}" aria-label="{{t .Locale "studio.clear_filter"}}"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"/></svg><span>×</span></a>
+            <button class="volo-btn studio-tax-search__btn" type="submit" aria-label="{{t .Locale "nav.links"}}">↵</button>
+            <span class="volo-badge studio-collection-count js-collection-count" data-total="{{$totalLinks}}">{{if and (gt $totalLinks $shownLinks) (gt $shownLinks 0)}}{{$shownLinks}} / {{$totalLinks}}{{else}}{{$shownLinks}}{{end}}</span>
+          </form>
+          {{if .LinkGroups}}
+            {{$grpLen := len .LinkGroups}}
+            {{if gt $grpLen 1}}
+              <nav class="studio-jump-pills" aria-label="{{t .Locale "nav.links"}}">
+                {{range $i, $g := .LinkGroups}}
+                  <a class="studio-jump-pill" href="#link-group-{{$i}}"{{if ge $i 18}} data-extra-pill hidden{{end}}>{{$g.Category}} <small>{{len $g.Items}}</small></a>
+                {{end}}
+                {{if gt $grpLen 18}}
+                  <button type="button" class="studio-jump-pill studio-tags-more-btn js-jump-pills-toggle"
+                          aria-expanded="false"
+                          data-more-label="+{{sub $grpLen 18}}"
+                          data-less-label="{{t .Locale "studio.show_less"}}">+{{sub $grpLen 18}}</button>
+                {{end}}
+              </nav>
+            {{end}}
+          {{else if .LinksByCategory}}
+            {{$catLen := len .LinksByCategory}}
+            {{if gt $catLen 1}}
+              <nav class="studio-jump-pills" aria-label="{{t .Locale "nav.links"}}">
+                {{$catIdx := 0}}
+                {{range $cat, $items := .LinksByCategory}}
+                  <a class="studio-jump-pill" href="#link-cat-{{urlquery $cat}}"{{if ge $catIdx 18}} data-extra-pill hidden{{end}}>{{$cat}} <small>{{len $items}}</small></a>
+                  {{$catIdx = add $catIdx 1}}
+                {{end}}
+                {{if gt $catLen 18}}
+                  <button type="button" class="studio-jump-pill studio-tags-more-btn js-jump-pills-toggle"
+                          aria-expanded="false"
+                          data-more-label="+{{sub $catLen 18}}"
+                          data-less-label="{{t .Locale "studio.show_less"}}">+{{sub $catLen 18}}</button>
+                {{end}}
+              </nav>
+            {{end}}
           {{end}}
         </div>
-        {{range $i, $g := .LinkGroups}}
-          <section id="link-group-{{$i}}" class="studio-article studio-card-pad" data-collection-group>
-            <h2 class="studio-card-title">{{$g.Category}}</h2>
-            <div class="bookshelf-grid">
-              {{range $g.Items}}
-                <a class="book-card studio-link-card" href="{{.URL}}" target="_blank" rel="noopener" data-no-pjax data-collection-item="{{lower .Title}} {{lower .Description}} {{lower $g.Category}}">
-                  <div class="studio-link-card__head">
-                    <img class="studio-link-icon" src="{{if .IconURL}}{{.IconURL}}{{else}}/avatars/{{.ID}}.svg{{end}}" data-avatar-seed="{{.ID}}" alt="{{.Title}}" width="40" height="40" loading="lazy">
-                    <div class="studio-link-card__meta">
-                      <strong>{{.Title}}</strong>
-                      {{if eq .HealthStatus "broken"}}
-                        <div class="studio-link-card__status studio-link-status--broken" title="{{$brokenLabel}}" aria-label="{{$brokenLabel}}">⚠</div>
-                      {{else}}
-                        <div class="studio-link-card__status studio-link-status--ok" title="{{$okLabel}}" aria-label="{{$okLabel}}">●</div>
-                      {{end}}
+        {{if .LinkGroups}}
+          {{range $i, $g := .LinkGroups}}
+            <section id="link-group-{{$i}}" class="studio-article studio-card-pad" data-collection-group>
+              <h2 class="studio-card-title">{{$g.Category}}</h2>
+              <div class="bookshelf-grid">
+                {{range $g.Items}}
+                  <a class="book-card studio-link-card" href="{{.URL}}" target="_blank" rel="noopener" data-no-pjax data-collection-item="{{lower .Title}} {{lower .Description}} {{lower $g.Category}}">
+                    <div class="studio-link-card__head">
+                      <img class="studio-link-icon" src="{{if .IconURL}}{{.IconURL}}{{else}}/avatars/{{.ID}}.svg{{end}}" data-avatar-seed="{{.ID}}" alt="{{.Title}}" width="40" height="40" loading="lazy">
+                      <div class="studio-link-card__meta">
+                        <strong>{{.Title}}</strong>
+                        {{if eq .HealthStatus "broken"}}
+                          <div class="studio-link-card__status studio-link-status--broken" title="{{$brokenLabel}}" aria-label="{{$brokenLabel}}">⚠</div>
+                        {{else}}
+                          <div class="studio-link-card__status studio-link-status--ok" title="{{$okLabel}}" aria-label="{{$okLabel}}">●</div>
+                        {{end}}
+                      </div>
                     </div>
-                  </div>
-                  {{if .Description}}<p class="studio-tax-card__desc">{{.Description}}</p>{{end}}
-                </a>
-              {{end}}
-            </div>
-          </section>
-        {{end}}
-        <p class="studio-muted-empty js-collection-empty" hidden>{{t .Locale "studio.filter_empty"}}</p>
-        {{template "pagination" .}}
-      </div>
-    {{else if .LinksByCategory}}
-      {{$catLen := len .LinksByCategory}}
-      <div class="studio-stack" data-collection-root="links">
-        <div class="studio-article studio-card-pad studio-collection-toolbar">
-          <div class="studio-collection-search-wrap">
-            <input type="search" class="volo-input studio-collection-filter js-collection-filter" placeholder="{{t .Locale "studio.filter_placeholder"}}" aria-label="{{t .Locale "nav.links"}}" autocomplete="off">
-          </div>
-          {{if gt $catLen 1}}
-            <nav class="studio-jump-pills" aria-label="{{t .Locale "nav.links"}}">
-              {{$catIdx := 0}}
-              {{range $cat, $items := .LinksByCategory}}
-                <a class="studio-jump-pill" href="#link-cat-{{urlquery $cat}}"{{if ge $catIdx 18}} data-extra-pill hidden{{end}}>{{$cat}} <small>{{len $items}}</small></a>
-                {{$catIdx = add $catIdx 1}}
-              {{end}}
-              {{if gt $catLen 18}}
-                <button type="button" class="studio-jump-pill studio-tags-more-btn js-jump-pills-toggle"
-                        aria-expanded="false"
-                        data-more-label="+{{sub $catLen 18}}"
-                        data-less-label="{{t .Locale "studio.show_less"}}">+{{sub $catLen 18}}</button>
-              {{end}}
-            </nav>
+                    {{if .Description}}<p class="studio-tax-card__desc">{{.Description}}</p>{{end}}
+                  </a>
+                {{end}}
+              </div>
+            </section>
           {{end}}
-        </div>
-        {{range $cat, $items := .LinksByCategory}}
-          <section id="link-cat-{{urlquery $cat}}" class="studio-article studio-card-pad" data-collection-group>
-            <h2 class="studio-card-title">{{$cat}}</h2>
-            <div class="bookshelf-grid">
-              {{range $items}}
-                <a class="book-card studio-link-card" href="{{.URL}}" target="_blank" rel="noopener" data-no-pjax data-collection-item="{{lower .Title}} {{lower .Description}} {{lower $cat}}">
-                  <div class="studio-link-card__head">
-                    <img class="studio-link-icon" src="{{if .IconURL}}{{.IconURL}}{{else}}/avatars/{{.ID}}.svg{{end}}" data-avatar-seed="{{.ID}}" alt="{{.Title}}" width="40" height="40" loading="lazy">
-                    <div class="studio-link-card__meta">
-                      <strong>{{.Title}}</strong>
-                      {{if eq .HealthStatus "broken"}}
-                        <div class="studio-link-card__status studio-link-status--broken" title="{{$brokenLabel}}" aria-label="{{$brokenLabel}}">⚠</div>
-                      {{else}}
-                        <div class="studio-link-card__status studio-link-status--ok" title="{{$okLabel}}" aria-label="{{$okLabel}}">●</div>
-                      {{end}}
+          <p class="studio-muted-empty js-collection-empty" hidden>{{t .Locale "studio.filter_empty"}}</p>
+        {{else if .LinksByCategory}}
+          {{range $cat, $items := .LinksByCategory}}
+            <section id="link-cat-{{urlquery $cat}}" class="studio-article studio-card-pad" data-collection-group>
+              <h2 class="studio-card-title">{{$cat}}</h2>
+              <div class="bookshelf-grid">
+                {{range $items}}
+                  <a class="book-card studio-link-card" href="{{.URL}}" target="_blank" rel="noopener" data-no-pjax data-collection-item="{{lower .Title}} {{lower .Description}} {{lower $cat}}">
+                    <div class="studio-link-card__head">
+                      <img class="studio-link-icon" src="{{if .IconURL}}{{.IconURL}}{{else}}/avatars/{{.ID}}.svg{{end}}" data-avatar-seed="{{.ID}}" alt="{{.Title}}" width="40" height="40" loading="lazy">
+                      <div class="studio-link-card__meta">
+                        <strong>{{.Title}}</strong>
+                        {{if eq .HealthStatus "broken"}}
+                          <div class="studio-link-card__status studio-link-status--broken" title="{{$brokenLabel}}" aria-label="{{$brokenLabel}}">⚠</div>
+                        {{else}}
+                          <div class="studio-link-card__status studio-link-status--ok" title="{{$okLabel}}" aria-label="{{$okLabel}}">●</div>
+                        {{end}}
+                      </div>
                     </div>
-                  </div>
-                  {{if .Description}}<p class="studio-tax-card__desc">{{.Description}}</p>{{end}}
-                </a>
-              {{end}}
-            </div>
-          </section>
+                    {{if .Description}}<p class="studio-tax-card__desc">{{.Description}}</p>{{end}}
+                  </a>
+                {{end}}
+              </div>
+            </section>
+          {{end}}
+          <p class="studio-muted-empty js-collection-empty" hidden>{{t .Locale "studio.filter_empty"}}</p>
+        {{else}}
+          <p class="studio-muted-empty">{{t .Locale "studio.filter_empty"}}</p>
         {{end}}
-        <p class="studio-muted-empty js-collection-empty" hidden>{{t .Locale "studio.filter_empty"}}</p>
         {{template "pagination" .}}
       </div>
     {{else}}

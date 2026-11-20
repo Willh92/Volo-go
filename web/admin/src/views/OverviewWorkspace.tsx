@@ -10,6 +10,8 @@ import {
   LocalDraft,
   openConfirm,
   resetConsoleScroll,
+  safeHref,
+  safeMediaSrc,
   saveLocalDraft,
   showToast,
 } from "../api";
@@ -24,7 +26,7 @@ import {
   ConsoleEmpty,
   ConsoleSelect,
   MobileSelectAllBar,
-  paginateItems,
+  pagedSlice,
   Pagination,
   SwitchToggle,
   TableSkeleton,
@@ -41,6 +43,7 @@ import {
   localizeAuditResource,
   t,
 } from "../i18n";
+import { resolveTaxonomyInitAction } from "./articleInitGuard";
 
 export type OverviewSection = "dashboard" | "editor" | "articles" | "drafts";
 
@@ -905,6 +908,8 @@ export function OverviewWorkspace({
   const savingArticleRef = useRef(false);
   const sectionRef = useRef<OverviewSection>(section);
   sectionRef.current = section;
+  const editorStateRef = useRef({ title, slug, contentMD, summaryMD, categoryID, editingCategoryName });
+  editorStateRef.current = { title, slug, contentMD, summaryMD, categoryID, editingCategoryName };
 
   const draftKey = editingID === "" ? "article:new" : editingID ? `article:${editingID}` : "";
 
@@ -981,6 +986,32 @@ export function OverviewWorkspace({
     setAllTags(tagItems);
     setTotalTagCount(typeof tgs.total === "number" ? tgs.total : tagItems.length);
     return catItems;
+  };
+
+  const applyTaxonomiesToNewEditor = (cats: any[]) => {
+    const cur = editorStateRef.current;
+    const act = resolveTaxonomyInitAction({
+      section: sectionRef.current,
+      editingID: editingIDRef.current,
+      dirty: dirtyEditorSig.value,
+      title: cur.title,
+      slug: cur.slug,
+      contentMD: cur.contentMD,
+      summaryMD: cur.summaryMD,
+      categoryID: cur.categoryID,
+      editingCategoryName: cur.editingCategoryName,
+      hasCategories: cats.length > 0,
+    });
+    if (act === "reset") {
+      void startNewArticle(cats);
+    } else if (act === "apply_default_category" && cats[0]) {
+      if (editingIDRef.current === null) {
+        editingIDRef.current = "";
+        setEditingID("");
+      }
+      setCategoryID(cats[0].id || "");
+      setEditingCategoryName(cats[0].name || "");
+    }
   };
 
   const searchRemoteCategories = async (q: string) => {
@@ -1208,15 +1239,8 @@ export function OverviewWorkspace({
       return;
     }
     if (section === "editor") {
-      ++editReqSeqRef.current;
-      dirtyEditorSig.value = false;
-      editingIDRef.current = null;
-      setEditingID(null);
-      void loadTaxonomies().then((cats) => {
-        if (editingIDRef.current === null && sectionRef.current === "editor") {
-          void startNewArticle(cats);
-        }
-      });
+      void startNewArticle();
+      void loadTaxonomies().then(applyTaxonomiesToNewEditor);
       void loadOverview(trendDays);
       return;
     }
@@ -1247,15 +1271,8 @@ export function OverviewWorkspace({
     const onNavReselect = (ev: Event) => {
       const sec = (ev as CustomEvent<{ section?: string }>)?.detail?.section || sectionRef.current;
       if (sec === "editor") {
-        ++editReqSeqRef.current;
-        dirtyEditorSig.value = false;
-        editingIDRef.current = null;
-        setEditingID(null);
-        void loadTaxonomies().then((cats) => {
-          if (sectionRef.current === "editor") {
-            void startNewArticle(cats);
-          }
-        });
+        void startNewArticle();
+        void loadTaxonomies().then(applyTaxonomiesToNewEditor);
       } else if ((sec === "articles" || sec === "drafts") && editingIDRef.current !== null) {
         ++editReqSeqRef.current;
         dirtyEditorSig.value = false;
@@ -1593,13 +1610,13 @@ export function OverviewWorkspace({
   }, []);
 
   const handlePreview = async () => {
-    const directUrl = shareURL || previewURL;
+    const directUrl = safeHref(shareURL || previewURL);
     if (directUrl) {
-      window.open(directUrl, "_blank", "noopener");
+      window.open(directUrl, "_blank", "noopener,noreferrer");
       return;
     }
     if (editingID && slug.trim()) {
-      window.open(`/posts/${encodeURIComponent(slug.trim())}?preview=1`, "_blank", "noopener");
+      window.open(`/posts/${encodeURIComponent(slug.trim())}?preview=1`, "_blank", "noopener,noreferrer");
       return;
     }
     if (!contentMD.trim()) {
@@ -1723,10 +1740,7 @@ export function OverviewWorkspace({
       }
       const hasServerTotal = typeof res.total === "number";
       const total = hasServerTotal ? Number(res.total) : rawItems.length;
-      const slice =
-        !hasServerTotal && rawItems.length > 20
-          ? paginateItems(rawItems, page, 20).slice
-          : rawItems;
+      const slice = hasServerTotal ? rawItems : pagedSlice(rawItems, page, 20);
       if (page === 1) {
         setInlineRevs(slice.slice(0, 4).map(({ content_md: _cmd, ...summaryItem }: any) => summaryItem));
       }
@@ -2010,24 +2024,27 @@ export function OverviewWorkspace({
             </div>
           )}
 
-          {shareURL && (
-            <div class="volo-subcard" style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: "12px", flexWrap: "wrap" }}>
-              <div style={{ wordBreak: "break-all", fontSize: "12.5px" }}>
-                <strong>{t("art.share_label")}</strong>{" "}
-                <a href={shareURL} target="_blank" rel="noreferrer">{shareURL}</a>
+          {(() => {
+            const safeShareHref = safeHref(shareURL);
+            return safeShareHref ? (
+              <div class="volo-subcard" style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: "12px", flexWrap: "wrap" }}>
+                <div style={{ wordBreak: "break-all", fontSize: "12.5px" }}>
+                  <strong>{t("art.share_label")}</strong>{" "}
+                  <a href={safeShareHref} target="_blank" rel="noreferrer">{safeShareHref}</a>
+                </div>
+                <button
+                  type="button"
+                  class="volo-btn volo-btn-sm"
+                  onClick={() => {
+                    void navigator.clipboard?.writeText(safeShareHref);
+                    showToast(t("art.share_copied"), "ok");
+                  }}
+                >
+                  {t("art.share_copy")}
+                </button>
               </div>
-              <button
-                type="button"
-                class="volo-btn volo-btn-sm"
-                onClick={() => {
-                  void navigator.clipboard?.writeText(shareURL);
-                  showToast(t("art.share_copied"), "ok");
-                }}
-              >
-                {t("art.share_copy")}
-              </button>
-            </div>
-          )}
+            ) : null;
+          })()}
 
           <form
             autoComplete="off"
@@ -2550,20 +2567,23 @@ export function OverviewWorkspace({
                             }}
                           />
                         </div>
-                        {coverURL.trim() && (
-                          <img
-                            src={coverURL}
-                            alt="cover"
-                            style={{
-                              marginTop: "6px",
-                              maxHeight: "84px",
-                              width: "100%",
-                              objectFit: "cover",
-                              borderRadius: "8px",
-                              border: "1px solid var(--volo-line)",
-                            }}
-                          />
-                        )}
+                        {(() => {
+                          const safeCoverSrc = safeMediaSrc(coverURL, { allowDataImage: true });
+                          return safeCoverSrc ? (
+                            <img
+                              src={safeCoverSrc}
+                              alt="cover"
+                              style={{
+                                marginTop: "6px",
+                                maxHeight: "84px",
+                                width: "100%",
+                                objectFit: "cover",
+                                borderRadius: "8px",
+                                border: "1px solid var(--volo-line)",
+                              }}
+                            />
+                          ) : null;
+                        })()}
                       </div>
                       <div class="volo-field">
                         <label>{t("art.audio_url")}</label>
@@ -2890,8 +2910,7 @@ export function OverviewWorkspace({
 
   // 2. Article Management / Drafts View (`section === "articles" | "drafts"`)
   if (section === "articles" || section === "drafts") {
-    const displayArts =
-      articles.length > artPageSize ? paginateItems(articles, artPage, artPageSize).slice : articles;
+    const displayArts = pagedSlice(articles, artPage, artPageSize);
     const pageIds = displayArts.map((r) => r.article.id);
     const allPageSelected = pageIds.length > 0 && pageIds.every((id) => selectedIds.includes(id));
 

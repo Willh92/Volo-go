@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "preact/hooks";
 import {
+  ACCENT_OPTIONS as ACCENTS,
   accentSig,
   apiFetch,
   applyThemeAttributes,
@@ -25,15 +26,6 @@ import {
   t,
   tFor,
 } from "../i18n";
-
-const ACCENTS: Array<{ id: string; swatch: string }> = [
-  { id: "forest", swatch: "#246b51" },
-  { id: "ocean", swatch: "#2d6583" },
-  { id: "teal", swatch: "#286c70" },
-  { id: "amber", swatch: "#855c27" },
-  { id: "plum", swatch: "#70517d" },
-  { id: "rose", swatch: "#87525f" },
-];
 
 const COMMON_TIMEZONES = [
   "Asia/Shanghai",

@@ -228,6 +228,25 @@ func TestQueryIndexesAndNoDuplicateIndexCollision(t *testing.T) {
 		"idx_comments_del_updated",
 		"idx_follows_sort_created",
 		"idx_series_sort_created",
+		// V10 query and cleanup composite indexes
+		"idx_pages_pub_slug",
+		"idx_pages_author_updated",
+		"idx_follow_items_follow_pub_id",
+		"idx_webhooks_enabled_created",
+		"idx_webhooks_created",
+		"idx_media_dims_created",
+		"idx_media_uploader_mime_created",
+		"idx_media_sha256",
+		"idx_nav_items_enabled_order",
+		"idx_nav_items_parent_order",
+		"idx_links_cat_order_created",
+		"idx_links_health_order_created",
+		"idx_redirects_hits_created",
+		"idx_redirects_legacy_created",
+		"idx_analytics_top_kind_date",
+		"idx_ip_bans_expires",
+		"idx_ip_bans_created",
+		"idx_categories_order_created",
 	}
 
 	rows, err := sqlx.Select[struct {
@@ -249,13 +268,13 @@ func TestQueryIndexesAndNoDuplicateIndexCollision(t *testing.T) {
 		t.Fatalf("duplicate index idx_media_created should have been dropped in V6")
 	}
 
-	// Verify V9 schema version recorded and execIdempotentAddColumn pre-checks existing columns cleanly
+	// Verify V10 schema version recorded and execIdempotentAddColumn pre-checks existing columns cleanly
 	var maxVer int
 	if err := store.QueryRowContext(ctx, `SELECT MAX(version) FROM schema_migrations`).Scan(&maxVer); err != nil {
 		t.Fatal(err)
 	}
-	if maxVer != 9 || CurrentSchemaVersion != 9 {
-		t.Fatalf("expected schema version 9, got maxVer=%d CurrentSchemaVersion=%d", maxVer, CurrentSchemaVersion)
+	if maxVer != 10 || CurrentSchemaVersion != 10 {
+		t.Fatalf("expected schema version 10, got maxVer=%d CurrentSchemaVersion=%d", maxVer, CurrentSchemaVersion)
 	}
 	for _, col := range []string{"ban_until", "muted_until", "ban_reason", "shield_comments", "shield_text"} {
 		exists, cErr := columnExists(ctx, store, "users", col)

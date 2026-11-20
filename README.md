@@ -7,7 +7,7 @@
 
 **Pure-Go Sovereign Independent Blog Engine**
 
-`CGO_ENABLED=0` static single binary across 6 OS/Arch targets · **`~19.4–20.2 MiB`** (`< 22 MiB` gate) across all 6 targets · **`24.23 MiB` (< 35 MiB)** warm `VmRSS` · Native multi-dialect SQL (SQLite WAL / PostgreSQL / MySQL) · Real-time non-destructive ImageView (`?imageView2` + KV) · 10-surface zero-leakage privacy guard · 3-mode (`IR` / `WYSIWYG` / `SV`) Studio Editor & fullscreen Markdown comment composer
+`CGO_ENABLED=0` static single binary across 6 OS/Arch targets · **`20.46–20.74 MiB`** (`< 22 MiB` gate) across `linux/amd64` & `windows/amd64` targets · **`24.23 MiB` (< 35 MiB)** warm `VmRSS` · Native multi-dialect SQL (SQLite WAL / PostgreSQL / MySQL) · Real-time non-destructive ImageView (`?imageView2` + KV) · 10-surface zero-leakage privacy guard · 3-mode (`IR` / `WYSIWYG` / `SV`) Studio Editor & fullscreen Markdown comment composer
 
 [English](./README.md) | [简体中文](./README.zh-CN.md) · [Changelog](./CHANGELOG.md) | [版本更新日志](./CHANGELOG.zh-CN.md)
 
@@ -22,7 +22,7 @@
 | [Reverse Proxy & CDN Guide (`docs/en-US/reverse-proxy.md`)](./docs/en-US/reverse-proxy.md) | TCP vs Unix Domain Socket (`--unix-socket` / `--socket-mode` / `--socket-group`), `VOLO_TRUSTED_PROXIES` anti-spoofing CIDRs, Nginx / Caddy / Traefik / Apache / Cloudflare recipes |
 | [CLI & Open API Reference (`docs/en-US/cli-and-api.md`)](./docs/en-US/cli-and-api.md) | Built-in `volo` CLI (`secret rotate`, read-only `doctor`, `/healthz` readiness `healthcheck`), scoped `volo_pat_*` tokens, `?imageView2` & KV ImageView, Step-Up guards, and REST endpoints |
 | [Themes & Plugin SDK (`docs/en-US/themes-and-plugins.md`)](./docs/en-US/themes-and-plugins.md) | `theme.json`, fullscreen reply editor, pure-Go ES6 plugin sandbox, `SHA256SUMS.txt` (`checksum_url`) URL direct install, batch updates, client-side `.zip` preflight inspector, & atomic rollback |
-| [Official Plugin Catalog (`plugins/README.md`)](./plugins/README.md) | Canonical registries ([`plugins/catalog.json`](./plugins/catalog.json), [`themes/catalog.json`](./themes/catalog.json), [`locales/catalog.json`](./locales/catalog.json): `sensitive-words v1.1.0`, `volo-journal v1.1.1`, & 26-model Live2D `kanbanniang v2.0.5` with corner minimize/summon pill) |
+| [Official Plugin Catalog (`plugins/README.md`)](./plugins/README.md) | Canonical registries ([`plugins/catalog.json`](./plugins/catalog.json), [`themes/catalog.json`](./themes/catalog.json), [`locales/catalog.json`](./locales/catalog.json): `sensitive-words v1.1.0`, `volo-journal v1.1.2`, `zh-TW`/`ja-JP v1.0.1`, & 26-model Live2D `kanbanniang v2.0.6` with corner minimize/summon pill) |
 | [Theme Skin Migration Guide (`docs/en-US/theme-migration.md`)](./docs/en-US/theme-migration.md) | Standalone full-HTML & layout inheritance modes, full `PageContext`, `config_schema` fields, and template FuncMap reference |
 | [Language Pack Extension Guide (`docs/en-US/locale-extension.md`)](./docs/en-US/locale-extension.md) | 1-click official catalog & remote URL language pack installer (`zh-TW` & `ja-JP`), hot-installable JSON / `.zip` packs, `admin.nav.*` namespace, and starter template export |
 | [Legacy Migration & Cross-DB Backup (`docs/en-US/migration-and-backup.md`)](./docs/en-US/migration-and-backup.md) | Streaming legacy 15-table ETL, `301` `.html` permalink preservation, `SQLite ⇄ PostgreSQL ⇄ MySQL` 33-table streaming backups, and automatic `pre-restore-*.zip` safety snapshots |
@@ -34,9 +34,9 @@
 
 | Metric / Benchmark (`CGO_ENABLED=0`) | Measured Result | Hard Budget / Notes |
 | :--- | :--- | :--- |
-| Static Single Binary Size (`linux/amd64`) | **`~19.6 MiB`** | **`< 22.00 MiB`** across all 6 OS/Arch targets (`< 8.00 MiB` archives) |
+| Static Single Binary Size (`linux/amd64`) | **`20.46 MiB`** | **`< 22.00 MiB`** across all 6 OS/Arch targets (`< 8.00 MiB` archives) |
 | Warm Resident Memory (`VmRSS`) | **`24.23 MiB`** | `< 35.00 MiB` including embedded themes, plugin sandbox, `wordFilter` engine, and warm caches |
-| Admin Console Initial Core (Gzip) | **`~132 KB`** (`~341.0 KiB` total) | `< 380 KiB` total embedded SPA budget; CodeMirror 6 3-mode editor core is lazy-loaded |
+| Admin Console Initial Core (Gzip) | **`~120–123 KB`** (`~349.8 KiB` / `358,235 B` total) | `< 350 KiB` (`358,400 B`) embedded SPA budget; CodeMirror 6 3-mode editor core is lazy-loaded |
 | Warm Article Card Cache (`ToCard`) | **`1.19 µs/op`** (`864 B/op`) | 4 MiB digest-verified LRU (`758×` faster than cold Markdown render) |
 | Warm Article Detail Cache (`ToDetail`) | **`4.64 µs/op`** (`3.3 KB/op`) | Strictly excludes password-locked & `?preview=` requests (zero cross-user leakage) |
 | Pre-Compressed RSS / Sitemap + `ETag` | **`7.69 µs/op`** (`~130k req/s`) | `1ns` revision invalidation; auto-shards into `<sitemapindex>` above `10,000` URLs |

@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "preact/hooks";
 import {
+  ACCENT_OPTIONS as ACCENTS,
   accentSig,
   apiFetch,
   applyThemeAttributes,
@@ -8,6 +9,8 @@ import {
   localizeAdminError,
   openConfirm,
   resetConsoleScroll,
+  safeHttpUrl,
+  safeMediaSrc,
   showToast,
   themeModeSig,
   uploadWithProgress,
@@ -31,6 +34,7 @@ import {
   DragGripIcon,
   MoveTopIcon,
   NativeModalDialog,
+  pagedSlice,
   paginateItems,
   Pagination,
   PlusIcon,
@@ -48,15 +52,6 @@ import { CM6CssEditor } from "../components/CM6Editor";
 export type AppearanceTab = "themes" | "locales" | "plugins";
 
 const CLEAR_SECRET_SENTINEL = "__VOLO_CLEAR_SECRET__";
-
-const ACCENTS: Array<{ id: string; swatch: string }> = [
-  { id: "forest", swatch: "#246b51" },
-  { id: "ocean", swatch: "#2d6583" },
-  { id: "teal", swatch: "#286c70" },
-  { id: "amber", swatch: "#855c27" },
-  { id: "plum", swatch: "#70517d" },
-  { id: "rose", swatch: "#87525f" },
-];
 
 function renderAccentLabel(id: string): string {
   switch (id) {
@@ -221,17 +216,6 @@ function validateSchemaRequired(
     }
   }
   return null;
-}
-
-function safeHttpUrl(raw: unknown): string {
-  const s = String(raw ?? "").trim();
-  if (!/^https?:\/\/[^\s\u0000-\u001f\u007f"'<>`]+$/i.test(s)) return "";
-  try {
-    const u = new URL(s);
-    return u.protocol === "https:" || u.protocol === "http:" ? s : "";
-  } catch {
-    return "";
-  }
 }
 
 function matchesArchiveBaseId(baseName: string, knownId: string): boolean {
@@ -468,6 +452,101 @@ async function downloadZipBlob(url: string, filename: string): Promise<void> {
   }
 }
 
+function reorderList<T>(items: T[], from: number, to: number): T[] | null {
+  if (from < 0 || from >= items.length || to < 0 || to >= items.length || from === to) return null;
+  const next = [...items];
+  const [picked] = next.splice(from, 1);
+  next.splice(to, 0, picked);
+  return next;
+}
+
+function SortableRow({
+  idx,
+  total,
+  label,
+  dragging,
+  grabbing,
+  handleProps,
+  beforeLabel,
+  beforeActs,
+  afterActs,
+  onMove,
+}: {
+  idx: number;
+  total: number;
+  label: string;
+  dragging: boolean;
+  grabbing: boolean;
+  handleProps: any;
+  beforeLabel?: any;
+  beforeActs?: any;
+  afterActs?: any;
+  onMove: (to: number) => void;
+}) {
+  return (
+    <div
+      data-sort-idx={idx}
+      class={`volo-sortable-row ${dragging ? "is-dragging" : ""} ${grabbing ? "is-grabbing" : ""}`}
+    >
+      <div class="volo-sortable-main">
+        <span
+          class={`volo-drag-handle ${total < 2 ? "is-disabled" : ""}`}
+          title={t("app.drag_sort")}
+          aria-label={t("app.drag_sort")}
+          {...handleProps}
+        >
+          <DragGripIcon />
+        </span>
+        {beforeLabel}
+        <span
+          class="volo-sortable-label"
+          onPointerDown={(e) => {
+            if (e.pointerType === "mouse") {
+              handleProps.onPointerDown(e as unknown as PointerEvent);
+            }
+          }}
+        >
+          {idx + 1}. {label}
+        </span>
+      </div>
+      <div class="volo-sortable-acts">
+        {beforeActs}
+        <button
+          type="button"
+          class="volo-act-btn"
+          disabled={idx === 0}
+          title={t("app.move_top")}
+          aria-label={t("app.move_top")}
+          onClick={() => onMove(0)}
+        >
+          <MoveTopIcon />
+        </button>
+        <button
+          type="button"
+          class="volo-act-btn"
+          disabled={idx === 0}
+          title={t("app.move_up")}
+          aria-label={t("app.move_up")}
+          onClick={() => onMove(idx - 1)}
+        >
+          ↑
+        </button>
+        <button
+          type="button"
+          class="volo-act-btn"
+          disabled={idx === total - 1}
+          title={t("app.move_down")}
+          aria-label={t("app.move_down")}
+          onClick={() => onMove(idx + 1)}
+        >
+          ↓
+        </button>
+        {afterActs}
+      </div>
+    </div>
+  );
+}
+
 function SortableFixedOptsField({
   fieldKey,
   label,
@@ -498,23 +577,12 @@ function SortableFixedOptsField({
     enabledKeys.length > 1
   );
 
-  const moveItem = (idx: number, delta: number) => {
-    const target = idx + delta;
-    if (target < 0 || target >= enabledKeys.length) return;
-    captureFlip();
-    const next = [...enabledKeys];
-    const [picked] = next.splice(idx, 1);
-    next.splice(target, 0, picked);
-    onChange(fieldKey, next);
-  };
-
-  const moveToTop = (idx: number) => {
-    if (idx <= 0 || idx >= enabledKeys.length) return;
-    captureFlip();
-    const next = [...enabledKeys];
-    const [picked] = next.splice(idx, 1);
-    next.unshift(picked);
-    onChange(fieldKey, next);
+  const moveItem = (idx: number, to: number) => {
+    const next = reorderList(enabledKeys, idx, to);
+    if (next) {
+      captureFlip();
+      onChange(fieldKey, next);
+    }
   };
 
   return (
@@ -529,86 +597,36 @@ function SortableFixedOptsField({
         class="volo-sortable-list"
         style={{ maxHeight: "280px", overflowY: "auto", margin: "4px -4px 0", padding: "2px 4px" }}
       >
-        {enabledKeys.map((k, idx) => {
-          const handleProps = getHandleProps(idx);
-          return (
-            <div
-              key={k}
-              data-sort-idx={idx}
-              class={`volo-sortable-row ${draggingIdx === idx ? "is-dragging" : ""} ${grabbingIdx === idx ? "is-grabbing" : ""}`}
-            >
-              <div class="volo-sortable-main">
-                <span
-                  class={`volo-drag-handle ${enabledKeys.length < 2 ? "is-disabled" : ""}`}
-                  title={t("app.drag_sort")}
-                  aria-label={t("app.drag_sort")}
-                  {...(handleProps as any)}
-                >
-                  <DragGripIcon />
+        {enabledKeys.map((k, idx) => (
+          <SortableRow
+            key={k}
+            idx={idx}
+            total={enabledKeys.length}
+            label={optMap.get(k) || k}
+            dragging={draggingIdx === idx}
+            grabbing={grabbingIdx === idx}
+            handleProps={getHandleProps(idx)}
+            onMove={(to) => moveItem(idx, to)}
+            beforeLabel={
+              <SwitchToggle
+                checked={true}
+                onChange={(checked) => {
+                  if (!checked) {
+                    captureFlip();
+                    onChange(fieldKey, enabledKeys.filter((it) => it !== k));
+                  }
+                }}
+              />
+            }
+            beforeActs={
+              showNavPlacement && (
+                <span class={`volo-badge ${idx < primaryLimit ? "volo-badge-ok" : ""}`}>
+                  {idx < primaryLimit ? t("app.nav_slot_primary") : t("app.nav_slot_more")}
                 </span>
-                <SwitchToggle
-                  checked={true}
-                  onChange={(checked) => {
-                    if (!checked) {
-                      captureFlip();
-                      onChange(
-                        fieldKey,
-                        enabledKeys.filter((it) => it !== k)
-                      );
-                    }
-                  }}
-                />
-                <span
-                  class="volo-sortable-label"
-                  onPointerDown={(e) => {
-                    if (e.pointerType === "mouse") {
-                      handleProps.onPointerDown(e as unknown as PointerEvent);
-                    }
-                  }}
-                >
-                  {idx + 1}. {optMap.get(k) || k}
-                </span>
-              </div>
-              <div class="volo-sortable-acts">
-                {showNavPlacement && (
-                  <span class={`volo-badge ${idx < primaryLimit ? "volo-badge-ok" : ""}`}>
-                    {idx < primaryLimit ? t("app.nav_slot_primary") : t("app.nav_slot_more")}
-                  </span>
-                )}
-                <button
-                  type="button"
-                  class="volo-act-btn"
-                  disabled={idx === 0}
-                  title={t("app.move_top")}
-                  aria-label={t("app.move_top")}
-                  onClick={() => moveToTop(idx)}
-                >
-                  <MoveTopIcon />
-                </button>
-                <button
-                  type="button"
-                  class="volo-act-btn"
-                  disabled={idx === 0}
-                  title={t("app.move_up")}
-                  aria-label={t("app.move_up")}
-                  onClick={() => moveItem(idx, -1)}
-                >
-                  ↑
-                </button>
-                <button
-                  type="button"
-                  class="volo-act-btn"
-                  disabled={idx === enabledKeys.length - 1}
-                  title={t("app.move_down")}
-                  aria-label={t("app.move_down")}
-                  onClick={() => moveItem(idx, 1)}
-                >
-                  ↓
-                </button>
-              </div>
-            </div>
-          );
-        })}
+              )
+            }
+          />
+        ))}
         {disabledOpts.map((opt) => (
           <div key={opt.value} data-flip-row="1" class="volo-sortable-row is-off">
             <div class="volo-sortable-main">
@@ -660,23 +678,12 @@ function SortableFreeItemsField({
     items.length > 1
   );
 
-  const moveFree = (idx: number, delta: number) => {
-    const target = idx + delta;
-    if (target < 0 || target >= items.length) return;
-    captureFlip();
-    const next = [...items];
-    const [picked] = next.splice(idx, 1);
-    next.splice(target, 0, picked);
-    onChange(fieldKey, next);
-  };
-
-  const moveFreeTop = (idx: number) => {
-    if (idx <= 0 || idx >= items.length) return;
-    captureFlip();
-    const next = [...items];
-    const [picked] = next.splice(idx, 1);
-    next.unshift(picked);
-    onChange(fieldKey, next);
+  const moveFree = (idx: number, to: number) => {
+    const next = reorderList(items, idx, to);
+    if (next) {
+      captureFlip();
+      onChange(fieldKey, next);
+    }
   };
 
   const addFree = () => {
@@ -715,79 +722,30 @@ function SortableFreeItemsField({
       </div>
       {items.length > 0 && (
         <div ref={listRef} class="volo-sortable-list">
-          {items.map((item, idx) => {
-            const handleProps = getHandleProps(idx);
-            return (
-              <div
-                key={item}
-                data-sort-idx={idx}
-                class={`volo-sortable-row ${draggingIdx === idx ? "is-dragging" : ""} ${grabbingIdx === idx ? "is-grabbing" : ""}`}
-              >
-                <div class="volo-sortable-main">
-                  <span
-                    class={`volo-drag-handle ${items.length < 2 ? "is-disabled" : ""}`}
-                    title={t("app.drag_sort")}
-                    aria-label={t("app.drag_sort")}
-                    {...(handleProps as any)}
-                  >
-                    <DragGripIcon />
-                  </span>
-                  <span
-                    class="volo-sortable-label"
-                    onPointerDown={(e) => {
-                      if (e.pointerType === "mouse") {
-                        handleProps.onPointerDown(e as unknown as PointerEvent);
-                      }
-                    }}
-                  >
-                    {idx + 1}. {item}
-                  </span>
-                </div>
-                <div class="volo-sortable-acts">
-                  <button
-                    type="button"
-                    class="volo-act-btn"
-                    disabled={idx === 0}
-                    title={t("app.move_top")}
-                    aria-label={t("app.move_top")}
-                    onClick={() => moveFreeTop(idx)}
-                  >
-                    <MoveTopIcon />
-                  </button>
-                  <button
-                    type="button"
-                    class="volo-act-btn"
-                    disabled={idx === 0}
-                    title={t("app.move_up")}
-                    aria-label={t("app.move_up")}
-                    onClick={() => moveFree(idx, -1)}
-                  >
-                    ↑
-                  </button>
-                  <button
-                    type="button"
-                    class="volo-act-btn"
-                    disabled={idx === items.length - 1}
-                    title={t("app.move_down")}
-                    aria-label={t("app.move_down")}
-                    onClick={() => moveFree(idx, 1)}
-                  >
-                    ↓
-                  </button>
-                  <button
-                    type="button"
-                    class="volo-act-btn danger"
-                    onClick={() => {
-                      captureFlip();
-                      onChange(fieldKey, items.filter((_, i) => i !== idx));
-                    }}
-                  >
-                    <CloseIcon size={13} />
-                  </button>
-                </div>
-              </div>
-            );
-          })}
+          {items.map((item, idx) => (
+            <SortableRow
+              key={item}
+              idx={idx}
+              total={items.length}
+              label={item}
+              dragging={draggingIdx === idx}
+              grabbing={grabbingIdx === idx}
+              handleProps={getHandleProps(idx)}
+              onMove={(to) => moveFree(idx, to)}
+              afterActs={
+                <button
+                  type="button"
+                  class="volo-act-btn danger"
+                  onClick={() => {
+                    captureFlip();
+                    onChange(fieldKey, items.filter((_, i) => i !== idx));
+                  }}
+                >
+                  <CloseIcon size={13} />
+                </button>
+              }
+            />
+          ))}
         </div>
       )}
     </div>
@@ -2754,7 +2712,7 @@ export function AppearanceWorkspace({
                   appCfg.mobile_theme && appCfg.mobile_theme !== "same" && appCfg.mobile_theme === th.id,
                 );
                 const schema: any[] = th.localized_schema || th.config_schema || [];
-                const previewSrc = th.preview_url || `/themes/${encodeURIComponent(th.id)}/preview`;
+                const previewSrc = safeMediaSrc(th.preview_url) || `/themes/${encodeURIComponent(th.id)}/preview`;
                 const title = th.display_name || th.name || th.id;
                 const desc = th.display_description || th.description || "";
                 const hasBrokenImg = Boolean(brokenPreviews[th.id]);
@@ -3208,7 +3166,7 @@ export function AppearanceWorkspace({
                 ) : locPacks.length === 0 ? (
                   <ConsoleEmpty colSpan={5} />
                 ) : (
-                  paginateItems(locPacks, locPage, 12).slice.map((p) => {
+                  pagedSlice(locPacks, locPage, 12).map((p) => {
                     const isDef = p.code === defaultLocale;
                     const isUI = p.code === curLocale;
                     const srcLabel =

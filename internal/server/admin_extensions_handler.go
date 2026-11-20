@@ -178,8 +178,79 @@ func (s *AppServer) loadCatalogBytes(ctx context.Context, localPath string, remo
 	return nil, "none", warning
 }
 
+type installedExtensionMeta struct {
+	version string
+	builtin bool
+}
+
+func (s *AppServer) buildAdminCatalogEntry(
+	it extpkg.CatalogItem,
+	repoURL string,
+	itemID string,
+	code string,
+	runtimeStr string,
+	locale string,
+	installedMap map[string]installedExtensionMeta,
+) adminCatalogEntry {
+	dispName := strings.TrimSpace(extpkg.ResolveLocalizedAny(it.Name, locale))
+	if dispName == "" {
+		dispName = itemID
+	}
+	dispSummary := strings.TrimSpace(extpkg.ResolveLocalizedAny(it.Summary, locale))
+	if dispSummary == "" {
+		dispSummary = strings.TrimSpace(extpkg.ResolveLocalizedAny(it.Description, locale))
+	}
+	inst, isInst := installedMap[itemID]
+	hasUpd := false
+	if isInst && !inst.builtin {
+		if cmp, ok := extpkg.CompareSemVer(inst.version, it.Version); ok && cmp < 0 {
+			hasUpd = true
+		}
+	}
+	return adminCatalogEntry{
+		ID:                   itemID,
+		Code:                 code,
+		Version:              strings.TrimSpace(it.Version),
+		MinHostVersion:       strings.TrimSpace(it.MinHostVersion),
+		Runtime:              runtimeStr,
+		Distribution:         strings.TrimSpace(it.Distribution),
+		BundledInCoreArchive: it.BundledInCoreArchive,
+		BundledInDockerImage: it.BundledInDockerImage,
+		DownloadURL:          extpkg.SanitizeHTTPURL(it.DownloadURL),
+		ChecksumURL:          extpkg.SanitizeHTTPURL(it.ChecksumURL),
+		AssetName:            strings.TrimSpace(it.ReleaseAsset),
+		SHA256:               strings.TrimSpace(it.SHA256),
+		ReleaseURL:           extpkg.ResolveCatalogReleaseURL(repoURL, it),
+		Homepage:             extpkg.SanitizeHTTPURL(it.Homepage),
+		ApproxZipMB:          it.ApproxZipMB,
+		ApproxSizeBytes:      it.ApproxSizeBytes,
+		DisplayName:          dispName,
+		DisplaySummary:       dispSummary,
+		Installed:            isInst,
+		InstalledVersion:     inst.version,
+		IsBuiltin:            inst.builtin,
+		HasUpdate:            hasUpd,
+		CompatibleWithHost:   extpkg.IsHostCompatible(s.effectiveAppVersion(), it.MinHostVersion),
+	}
+}
+
+func (s *AppServer) writeAdminCatalogResponse(w http.ResponseWriter, items []adminCatalogEntry, source, warning string) {
+	if items == nil {
+		items = []adminCatalogEntry{}
+	}
+	resp := map[string]any{
+		"items":        items,
+		"source":       source,
+		"host_version": s.effectiveAppVersion(),
+	}
+	if warning != "" {
+		resp["warning"] = warning
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
 func (s *AppServer) handleAdminPluginsCatalog(w http.ResponseWriter, r *http.Request, locale string) {
-	refresh := r.URL.Query().Get("refresh") == "1" || strings.EqualFold(r.URL.Query().Get("refresh"), "true")
+	refresh := queryBool(r, "refresh")
 	localPath := ""
 	if dir := s.pluginsDir(); dir != "" {
 		localPath = filepath.Join(dir, "catalog.json")
@@ -191,15 +262,7 @@ func (s *AppServer) handleAdminPluginsCatalog(w http.ResponseWriter, r *http.Req
 
 	raw, source, warning := s.loadCatalogBytes(r.Context(), localPath, remoteURL, refresh)
 	if len(raw) == 0 {
-		resp := map[string]any{
-			"items":        []adminCatalogEntry{},
-			"source":       source,
-			"host_version": s.deps.Version,
-		}
-		if warning != "" {
-			resp["warning"] = warning
-		}
-		writeJSON(w, http.StatusOK, resp)
+		s.writeAdminCatalogResponse(w, nil, source, warning)
 		return
 	}
 
@@ -209,14 +272,10 @@ func (s *AppServer) handleAdminPluginsCatalog(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	type installedMeta struct {
-		version string
-		builtin bool
-	}
-	installedMap := make(map[string]installedMeta)
+	installedMap := make(map[string]installedExtensionMeta)
 	if s.deps.Plugins != nil {
 		for _, p := range s.deps.Plugins.List(locale) {
-			installedMap[p.ID] = installedMeta{
+			installedMap[p.ID] = installedExtensionMeta{
 				version: p.Version,
 				builtin: strings.EqualFold(p.Kind, "builtin"),
 			}
@@ -225,64 +284,17 @@ func (s *AppServer) handleAdminPluginsCatalog(w http.ResponseWriter, r *http.Req
 
 	out := make([]adminCatalogEntry, 0, len(catItems))
 	for _, it := range catItems {
-		id := strings.TrimSpace(it.ID)
-		if id == "" {
+		itemID := strings.TrimSpace(it.ID)
+		if itemID == "" {
 			continue
 		}
-		dispName := strings.TrimSpace(extpkg.ResolveLocalizedAny(it.Name, locale))
-		if dispName == "" {
-			dispName = id
-		}
-		dispSummary := strings.TrimSpace(extpkg.ResolveLocalizedAny(it.Summary, locale))
-		if dispSummary == "" {
-			dispSummary = strings.TrimSpace(extpkg.ResolveLocalizedAny(it.Description, locale))
-		}
-		inst, isInst := installedMap[id]
-		hasUpd := false
-		if isInst && !inst.builtin {
-			if cmp, ok := extpkg.CompareSemVer(inst.version, it.Version); ok && cmp < 0 {
-				hasUpd = true
-			}
-		}
-		out = append(out, adminCatalogEntry{
-			ID:                   id,
-			Version:              strings.TrimSpace(it.Version),
-			MinHostVersion:       strings.TrimSpace(it.MinHostVersion),
-			Runtime:              strings.TrimSpace(it.Runtime),
-			Distribution:         strings.TrimSpace(it.Distribution),
-			BundledInCoreArchive: it.BundledInCoreArchive,
-			BundledInDockerImage: it.BundledInDockerImage,
-			DownloadURL:          extpkg.SanitizeHTTPURL(it.DownloadURL),
-			ChecksumURL:          extpkg.SanitizeHTTPURL(it.ChecksumURL),
-			AssetName:            strings.TrimSpace(it.ReleaseAsset),
-			SHA256:               strings.TrimSpace(it.SHA256),
-			ReleaseURL:           extpkg.ResolveCatalogReleaseURL(repoURL, it),
-			Homepage:             extpkg.SanitizeHTTPURL(it.Homepage),
-			ApproxZipMB:          it.ApproxZipMB,
-			ApproxSizeBytes:      it.ApproxSizeBytes,
-			DisplayName:          dispName,
-			DisplaySummary:       dispSummary,
-			Installed:            isInst,
-			InstalledVersion:     inst.version,
-			IsBuiltin:            inst.builtin,
-			HasUpdate:            hasUpd,
-			CompatibleWithHost:   extpkg.IsHostCompatible(s.deps.Version, it.MinHostVersion),
-		})
+		out = append(out, s.buildAdminCatalogEntry(it, repoURL, itemID, "", strings.TrimSpace(it.Runtime), locale, installedMap))
 	}
-
-	resp := map[string]any{
-		"items":        out,
-		"source":       source,
-		"host_version": s.deps.Version,
-	}
-	if warning != "" {
-		resp["warning"] = warning
-	}
-	writeJSON(w, http.StatusOK, resp)
+	s.writeAdminCatalogResponse(w, out, source, warning)
 }
 
 func (s *AppServer) handleAdminThemesCatalog(w http.ResponseWriter, r *http.Request, locale string) {
-	refresh := r.URL.Query().Get("refresh") == "1" || strings.EqualFold(r.URL.Query().Get("refresh"), "true")
+	refresh := queryBool(r, "refresh")
 	localPath := ""
 	if dir := s.themesDir(); dir != "" {
 		localPath = filepath.Join(dir, "catalog.json")
@@ -294,15 +306,7 @@ func (s *AppServer) handleAdminThemesCatalog(w http.ResponseWriter, r *http.Requ
 
 	raw, source, warning := s.loadCatalogBytes(r.Context(), localPath, remoteURL, refresh)
 	if len(raw) == 0 {
-		resp := map[string]any{
-			"items":        []adminCatalogEntry{},
-			"source":       source,
-			"host_version": s.deps.Version,
-		}
-		if warning != "" {
-			resp["warning"] = warning
-		}
-		writeJSON(w, http.StatusOK, resp)
+		s.writeAdminCatalogResponse(w, nil, source, warning)
 		return
 	}
 
@@ -312,14 +316,10 @@ func (s *AppServer) handleAdminThemesCatalog(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	type installedMeta struct {
-		version string
-		builtin bool
-	}
-	installedMap := make(map[string]installedMeta)
+	installedMap := make(map[string]installedExtensionMeta)
 	if s.deps.Themes != nil {
 		for _, th := range s.deps.Themes.ListLocalized(locale) {
-			installedMap[th.ID] = installedMeta{
+			installedMap[th.ID] = installedExtensionMeta{
 				version: th.Version,
 				builtin: th.IsBuiltin,
 			}
@@ -328,63 +328,17 @@ func (s *AppServer) handleAdminThemesCatalog(w http.ResponseWriter, r *http.Requ
 
 	out := make([]adminCatalogEntry, 0, len(catItems))
 	for _, it := range catItems {
-		id := strings.TrimSpace(it.ID)
-		if id == "" {
+		itemID := strings.TrimSpace(it.ID)
+		if itemID == "" {
 			continue
 		}
-		dispName := strings.TrimSpace(extpkg.ResolveLocalizedAny(it.Name, locale))
-		if dispName == "" {
-			dispName = id
-		}
-		dispSummary := strings.TrimSpace(extpkg.ResolveLocalizedAny(it.Summary, locale))
-		if dispSummary == "" {
-			dispSummary = strings.TrimSpace(extpkg.ResolveLocalizedAny(it.Description, locale))
-		}
-		inst, isInst := installedMap[id]
-		hasUpd := false
-		if isInst && !inst.builtin {
-			if cmp, ok := extpkg.CompareSemVer(inst.version, it.Version); ok && cmp < 0 {
-				hasUpd = true
-			}
-		}
-		out = append(out, adminCatalogEntry{
-			ID:                   id,
-			Version:              strings.TrimSpace(it.Version),
-			MinHostVersion:       strings.TrimSpace(it.MinHostVersion),
-			Distribution:         strings.TrimSpace(it.Distribution),
-			BundledInCoreArchive: it.BundledInCoreArchive,
-			BundledInDockerImage: it.BundledInDockerImage,
-			DownloadURL:          extpkg.SanitizeHTTPURL(it.DownloadURL),
-			ChecksumURL:          extpkg.SanitizeHTTPURL(it.ChecksumURL),
-			AssetName:            strings.TrimSpace(it.ReleaseAsset),
-			SHA256:               strings.TrimSpace(it.SHA256),
-			ReleaseURL:           extpkg.ResolveCatalogReleaseURL(repoURL, it),
-			Homepage:             extpkg.SanitizeHTTPURL(it.Homepage),
-			ApproxZipMB:          it.ApproxZipMB,
-			ApproxSizeBytes:      it.ApproxSizeBytes,
-			DisplayName:          dispName,
-			DisplaySummary:       dispSummary,
-			Installed:            isInst,
-			InstalledVersion:     inst.version,
-			IsBuiltin:            inst.builtin,
-			HasUpdate:            hasUpd,
-			CompatibleWithHost:   extpkg.IsHostCompatible(s.deps.Version, it.MinHostVersion),
-		})
+		out = append(out, s.buildAdminCatalogEntry(it, repoURL, itemID, "", "", locale, installedMap))
 	}
-
-	resp := map[string]any{
-		"items":        out,
-		"source":       source,
-		"host_version": s.deps.Version,
-	}
-	if warning != "" {
-		resp["warning"] = warning
-	}
-	writeJSON(w, http.StatusOK, resp)
+	s.writeAdminCatalogResponse(w, out, source, warning)
 }
 
 func (s *AppServer) handleAdminLocalesCatalog(w http.ResponseWriter, r *http.Request, locale string) {
-	refresh := r.URL.Query().Get("refresh") == "1" || strings.EqualFold(r.URL.Query().Get("refresh"), "true")
+	refresh := queryBool(r, "refresh")
 	localPath := ""
 	if dir := s.localesDir(); dir != "" {
 		cand := filepath.Join(dir, "catalog.json")
@@ -406,15 +360,7 @@ func (s *AppServer) handleAdminLocalesCatalog(w http.ResponseWriter, r *http.Req
 
 	raw, source, warning := s.loadCatalogBytes(r.Context(), localPath, remoteURL, refresh)
 	if len(raw) == 0 {
-		resp := map[string]any{
-			"items":        []adminCatalogEntry{},
-			"source":       source,
-			"host_version": s.deps.Version,
-		}
-		if warning != "" {
-			resp["warning"] = warning
-		}
-		writeJSON(w, http.StatusOK, resp)
+		s.writeAdminCatalogResponse(w, nil, source, warning)
 		return
 	}
 
@@ -424,18 +370,14 @@ func (s *AppServer) handleAdminLocalesCatalog(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	type installedLocaleMeta struct {
-		version string
-		builtin bool
-	}
-	installedMap := make(map[string]installedLocaleMeta)
+	installedMap := make(map[string]installedExtensionMeta)
 	if s.deps.Catalog != nil {
 		for _, p := range s.deps.Catalog.Packs() {
 			ver := strings.TrimSpace(p.Version)
 			if ver == "" {
 				ver = "1.0.0"
 			}
-			installedMap[p.Code] = installedLocaleMeta{
+			installedMap[p.Code] = installedExtensionMeta{
 				version: ver,
 				builtin: p.Builtin && !p.HasOverride,
 			}
@@ -452,56 +394,9 @@ func (s *AppServer) handleAdminLocalesCatalog(w http.ResponseWriter, r *http.Req
 		if vErr != nil {
 			continue
 		}
-		dispName := strings.TrimSpace(extpkg.ResolveLocalizedAny(it.Name, locale))
-		if dispName == "" {
-			dispName = code
-		}
-		dispSummary := strings.TrimSpace(extpkg.ResolveLocalizedAny(it.Summary, locale))
-		if dispSummary == "" {
-			dispSummary = strings.TrimSpace(extpkg.ResolveLocalizedAny(it.Description, locale))
-		}
-		inst, isInst := installedMap[code]
-		hasUpd := false
-		if isInst && !inst.builtin {
-			if cmp, ok := extpkg.CompareSemVer(inst.version, it.Version); ok && cmp < 0 {
-				hasUpd = true
-			}
-		}
-		out = append(out, adminCatalogEntry{
-			ID:                   code,
-			Code:                 code,
-			Version:              strings.TrimSpace(it.Version),
-			MinHostVersion:       strings.TrimSpace(it.MinHostVersion),
-			Distribution:         strings.TrimSpace(it.Distribution),
-			BundledInCoreArchive: it.BundledInCoreArchive,
-			BundledInDockerImage: it.BundledInDockerImage,
-			DownloadURL:          extpkg.SanitizeHTTPURL(it.DownloadURL),
-			ChecksumURL:          extpkg.SanitizeHTTPURL(it.ChecksumURL),
-			AssetName:            strings.TrimSpace(it.ReleaseAsset),
-			SHA256:               strings.TrimSpace(it.SHA256),
-			ReleaseURL:           extpkg.ResolveCatalogReleaseURL(repoURL, it),
-			Homepage:             extpkg.SanitizeHTTPURL(it.Homepage),
-			ApproxZipMB:          it.ApproxZipMB,
-			ApproxSizeBytes:      it.ApproxSizeBytes,
-			DisplayName:          dispName,
-			DisplaySummary:       dispSummary,
-			Installed:            isInst,
-			InstalledVersion:     inst.version,
-			IsBuiltin:            inst.builtin,
-			HasUpdate:            hasUpd,
-			CompatibleWithHost:   extpkg.IsHostCompatible(s.deps.Version, it.MinHostVersion),
-		})
+		out = append(out, s.buildAdminCatalogEntry(it, repoURL, code, code, "", locale, installedMap))
 	}
-
-	resp := map[string]any{
-		"items":        out,
-		"source":       source,
-		"host_version": s.deps.Version,
-	}
-	if warning != "" {
-		resp["warning"] = warning
-	}
-	writeJSON(w, http.StatusOK, resp)
+	s.writeAdminCatalogResponse(w, out, source, warning)
 }
 
 func (s *AppServer) resolveInstallSHA256(ctx context.Context, rawSHA256, checksumURL, assetName, rawURL string) (string, error) {
@@ -530,12 +425,10 @@ func (s *AppServer) handleAdminPluginInstallURL(w http.ResponseWriter, r *http.R
 		return
 	}
 	if !req.Overwrite {
-		owQ := strings.TrimSpace(r.URL.Query().Get("overwrite"))
-		req.Overwrite = owQ == "1" || strings.EqualFold(owQ, "true")
+		req.Overwrite = queryBool(r, "overwrite")
 	}
 	if !req.Enable {
-		enQ := strings.TrimSpace(r.URL.Query().Get("enable"))
-		req.Enable = enQ == "1" || strings.EqualFold(enQ, "true")
+		req.Enable = queryBool(r, "enable")
 	}
 
 	resolvedSHA, csErr := s.resolveInstallSHA256(r.Context(), req.SHA256, req.ChecksumURL, req.AssetName, req.URL)
@@ -547,10 +440,7 @@ func (s *AppServer) handleAdminPluginInstallURL(w http.ResponseWriter, r *http.R
 	if writeExtensionOpError(w, err, req.Overwrite) {
 		return
 	}
-	s.invalidateMediaRefCache()
-	if s.deps.Content != nil {
-		s.deps.Content.PurgeRuntimeCaches()
-	}
+	s.invalidateContentAndMediaCaches()
 	s.recordAuditLog(r, actor, "plugin.install_url", "plugin", sum.ID, map[string]any{
 		"version":   sum.Version,
 		"url":       strings.TrimSpace(req.URL),
@@ -581,12 +471,10 @@ func (s *AppServer) handleAdminThemeInstallURL(w http.ResponseWriter, r *http.Re
 		return
 	}
 	if !req.Overwrite {
-		owQ := strings.TrimSpace(r.URL.Query().Get("overwrite"))
-		req.Overwrite = owQ == "1" || strings.EqualFold(owQ, "true")
+		req.Overwrite = queryBool(r, "overwrite")
 	}
 	if !req.Activate {
-		actQ := strings.TrimSpace(r.URL.Query().Get("activate"))
-		req.Activate = actQ == "1" || strings.EqualFold(actQ, "true")
+		req.Activate = queryBool(r, "activate")
 	}
 
 	resolvedSHA, csErr := s.resolveInstallSHA256(r.Context(), req.SHA256, req.ChecksumURL, req.AssetName, req.URL)
@@ -610,30 +498,14 @@ func (s *AppServer) handleAdminThemeInstallURL(w http.ResponseWriter, r *http.Re
 			_, _, _ = s.deps.Settings.PatchDomain(r.Context(), domain.SettingsDomainAppearance, patchBytes, 0)
 		}
 	}
-	s.invalidateMediaRefCache()
-	if s.deps.Content != nil {
-		s.deps.Content.PurgeRuntimeCaches()
-	}
+	s.invalidateContentAndMediaCaches()
 	s.recordAuditLog(r, actor, "theme.install_url", "theme", mf.ID, map[string]any{
 		"version":   mf.Version,
 		"url":       strings.TrimSpace(req.URL),
 		"overwrite": req.Overwrite,
 		"activate":  req.Activate,
 	})
-	var appVer int64
-	if s.deps.Settings != nil {
-		_, appVer, _ = s.deps.Settings.GetDomain(r.Context(), domain.SettingsDomainAppearance)
-	}
-	normApp := s.redactAppearanceThemeSecrets(s.normalizeAppearanceNavConfigs(r.Context(), locale, s.deps.Settings.Snapshot().Appearance))
-	writeJSON(w, http.StatusCreated, map[string]any{
-		"theme":              mf,
-		"active_theme":       normApp.ActiveTheme,
-		"mobile_theme":       normApp.MobileTheme,
-		"appearance":         normApp,
-		"appearance_version": appVer,
-		"version":            appVer,
-		"themes":             s.enrichThemesWithCustomNav(r.Context(), locale, s.deps.Themes.ListLocalized(locale)),
-	})
+	s.writeAppearanceThemeResponse(w, r.Context(), http.StatusCreated, locale, false, mf)
 }
 
 func (s *AppServer) handleAdminLocaleInstallURL(w http.ResponseWriter, r *http.Request, actor *domain.User, locale string) {
@@ -650,8 +522,7 @@ func (s *AppServer) handleAdminLocaleInstallURL(w http.ResponseWriter, r *http.R
 		return
 	}
 	if !req.Overwrite {
-		owQ := strings.TrimSpace(r.URL.Query().Get("overwrite"))
-		req.Overwrite = owQ == "1" || strings.EqualFold(owQ, "true")
+		req.Overwrite = queryBool(r, "overwrite")
 	}
 	extDir := s.ensureLocalesDirReady()
 	if extDir == "" || s.deps.Catalog == nil {

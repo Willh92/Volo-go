@@ -16,7 +16,6 @@ var (
 	existingIDAttrRe      = regexp.MustCompile(`(?i)\s*\bid="([^"]*)"`)
 	genericHeadingRe      = regexp.MustCompile(`(?i)^heading(?:-\d+)?$`)
 	headingSlugClean      = regexp.MustCompile(`[^\p{L}\p{M}\p{N}_-]+`)
-	tableBlockRe          = regexp.MustCompile(`(?is)<table\b[^>]*>.*?</table>`)
 	trBlockRe             = regexp.MustCompile(`(?is)<tr\b[^>]*>(.*?)</tr>`)
 	thCellRe              = regexp.MustCompile(`(?is)<th\b[^>]*>(.*?)</th>`)
 	tdFullRe              = regexp.MustCompile(`(?is)<td(\b[^>]*)>(.*?)</td>`)
@@ -140,6 +139,10 @@ func slugifyHeadingText(plain string) string {
 // so comment, summary, basic, and notice-board tables never overflow narrow 320px viewports, while skipping
 // code/script/style blocks and tables already wrapped in .volo-table-scroll.
 func wrapTablesInScroll(htmlSrc string) string {
+	return wrapTablesWithTransform(htmlSrc, nil)
+}
+
+func wrapTablesWithTransform(htmlSrc string, transform func(tbl string) string) string {
 	if !strings.Contains(htmlSrc, "<table") && !strings.Contains(htmlSrc, "<TABLE") {
 		return htmlSrc
 	}
@@ -161,12 +164,13 @@ func wrapTablesInScroll(htmlSrc string) string {
 			continue
 		}
 
-		end := strings.IndexByte(htmlSrc[i:], '>')
-		if end < 0 {
-			out.WriteString(htmlSrc[i:])
-			break
+		tagEnd := scanHTMLTagOrCommentEnd(htmlSrc, i)
+		if tagEnd < 0 {
+			out.WriteByte(htmlSrc[i])
+			i++
+			continue
 		}
-		tag := htmlSrc[i : i+end+1]
+		tag := htmlSrc[i:tagEnd]
 		lowerTag := strings.ToLower(tag)
 
 		if skipCloseTag != "" {
@@ -174,7 +178,7 @@ func wrapTablesInScroll(htmlSrc string) string {
 				skipCloseTag = ""
 			}
 			out.WriteString(tag)
-			i += end + 1
+			i = tagEnd
 			continue
 		}
 
@@ -186,7 +190,7 @@ func wrapTablesInScroll(htmlSrc string) string {
 		}
 		if skipCloseTag != "" {
 			out.WriteString(tag)
-			i += end + 1
+			i = tagEnd
 			continue
 		}
 
@@ -197,7 +201,7 @@ func wrapTablesInScroll(htmlSrc string) string {
 				scrollDivDepth--
 			}
 			out.WriteString(tag)
-			i += end + 1
+			i = tagEnd
 			continue
 		}
 
@@ -205,14 +209,14 @@ func wrapTablesInScroll(htmlSrc string) string {
 			(strings.Contains(lowerTag, "volo-table-scroll") || strings.Contains(lowerTag, "volo-github-repos-wrap")) {
 			scrollDivDepth = 1
 			out.WriteString(tag)
-			i += end + 1
+			i = tagEnd
 			continue
 		}
 
 		if hasHTMLTagOpen(lowerTag, "table") && !strings.HasSuffix(lowerTag, "/>") {
 			// Find matching </table> while handling nested tables.
 			tableDepth := 1
-			scan := i + end + 1
+			scan := tagEnd
 			tableEnd := -1
 			for scan < len(htmlSrc) {
 				nextLt := strings.IndexByte(htmlSrc[scan:], '<')
@@ -220,33 +224,39 @@ func wrapTablesInScroll(htmlSrc string) string {
 					break
 				}
 				tPos := scan + nextLt
-				tClose := strings.IndexByte(htmlSrc[tPos:], '>')
-				if tClose < 0 {
-					break
+				tEnd := scanHTMLTagOrCommentEnd(htmlSrc, tPos)
+				if tEnd < 0 {
+					scan = tPos + 1
+					continue
 				}
-				innerLower := strings.ToLower(htmlSrc[tPos : tPos+tClose+1])
+				innerLower := strings.ToLower(htmlSrc[tPos:tEnd])
 				if hasHTMLTagOpen(innerLower, "table") && !strings.HasSuffix(innerLower, "/>") {
 					tableDepth++
 				} else if strings.HasPrefix(innerLower, "</table") {
 					tableDepth--
 					if tableDepth == 0 {
-						tableEnd = tPos + tClose + 1
+						tableEnd = tEnd
 						break
 					}
 				}
-				scan = tPos + tClose + 1
+				scan = tEnd
 			}
 			if tableEnd > i {
-				out.WriteString(`<div class="volo-table-scroll">`)
-				out.WriteString(htmlSrc[i:tableEnd])
-				out.WriteString(`</div>`)
+				tbl := htmlSrc[i:tableEnd]
+				if transform != nil {
+					out.WriteString(transform(tbl))
+				} else {
+					out.WriteString(`<div class="volo-table-scroll">`)
+					out.WriteString(tbl)
+					out.WriteString(`</div>`)
+				}
 				i = tableEnd
 				continue
 			}
 		}
 
 		out.WriteString(tag)
-		i += end + 1
+		i = tagEnd
 	}
 
 	return out.String()
@@ -290,8 +300,8 @@ func enhanceTablesAndGitHubShowcase(rendered string) string {
 	}
 
 	// 2. Transform GitHub showcase 5-column tables (`仓库 / 项目简介 / Stars / Forks / 编程语言`)
-	//    and wrap all other prose tables in `<div class="volo-table-scroll">`.
-	out = tableBlockRe.ReplaceAllStringFunc(out, func(tbl string) string {
+	//    and wrap all other prose tables in `<div class="volo-table-scroll">` using tag-aware scanning.
+	out = wrapTablesWithTransform(out, func(tbl string) string {
 		if isGitHubReposTable(tbl) {
 			return transformGitHubReposTable(tbl)
 		}
@@ -328,12 +338,12 @@ func cleanCellText(rawHTML string) string {
 
 func transformGitHubReposTable(tbl string) string {
 	// Add `class="volo-github-repos-table"` to opening `<table...>`
-	openEnd := strings.IndexByte(tbl, '>')
+	openEnd := scanHTMLTagOrCommentEnd(tbl, 0)
 	if openEnd <= 0 {
 		return tbl
 	}
-	openTag := tbl[:openEnd+1]
-	bodyAndClose := tbl[openEnd+1:]
+	openTag := tbl[:openEnd]
+	bodyAndClose := tbl[openEnd:]
 	if strings.Contains(openTag, `class="`) {
 		openTag = strings.Replace(openTag, `class="`, `class="volo-github-repos-table `, 1)
 	} else {
@@ -535,7 +545,7 @@ func isBlockBoundaryTag(lowerTag string) bool {
 	switch trimmed[:end] {
 	case "p", "div", "li", "ul", "ol", "dl", "dt", "dd",
 		"table", "thead", "tbody", "tfoot", "tr", "th", "td",
-		"blockquote", "pre", "hr", "br",
+		"blockquote", "pre", "hr",
 		"h1", "h2", "h3", "h4", "h5", "h6",
 		"section", "aside", "figure", "figcaption", "details", "summary", "nav":
 		return true
@@ -1096,7 +1106,7 @@ func rewriteCrossTagHighlights(htmlSrc string) string {
 					finalOut.WriteString(tag)
 					continue
 				}
-			} else {
+			} else if !isVoidHTMLElement(extractLowerTagName(lowerTag)) {
 				inlineDepth++
 			}
 		}
@@ -1104,6 +1114,20 @@ func rewriteCrossTagHighlights(htmlSrc string) string {
 	}
 	abortOpenMark()
 	return finalOut.String()
+}
+
+func extractLowerTagName(lowerTag string) string {
+	s := strings.TrimPrefix(lowerTag, "</")
+	s = strings.TrimPrefix(s, "<")
+	i := 0
+	for i < len(s) {
+		c := s[i]
+		if c == '>' || c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '/' {
+			break
+		}
+		i++
+	}
+	return s[:i]
 }
 
 // enhanceStandaloneMediaLinks upgrades standalone single-anchor paragraphs pointing to audio/video files

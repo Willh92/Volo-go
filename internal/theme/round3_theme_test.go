@@ -2,6 +2,7 @@ package theme
 
 import (
 	"bytes"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -579,5 +580,131 @@ func TestRound3_VoloStudioSourceTemplates_RenderAllFeatures(t *testing.T) {
 		if kind != "tags" && !strings.Contains(recTax.Body.String(), `js-collection-filter`) {
 			t.Fatalf("expected /%s to render .js-collection-filter", kind)
 		}
+	}
+
+	// 7. Book Reader pagination: both M1-paginated and unpaginated large FlatChapters (>100) + volume classes.
+	manyChaps := make([]domain.BookChapter, 0, 250)
+	for i := 0; i < 250; i++ {
+		if i%50 == 0 {
+			manyChaps = append(manyChaps, domain.BookChapter{
+				ID:    fmt.Sprintf("vol_%d", i/50+1),
+				Title: fmt.Sprintf("Volume %d", i/50+1),
+				Depth: 0,
+			})
+			continue
+		}
+		manyChaps = append(manyChaps, domain.BookChapter{
+			ID:    fmt.Sprintf("ch_%03d", i),
+			Title: fmt.Sprintf("Chapter %03d", i),
+			URL:   fmt.Sprintf("/posts/ch-%03d", i),
+			Depth: 1,
+		})
+	}
+	// 7a. Unpaginated fallback: active chapter at index 150 -> defaults to cpage=2 (chapters 100..199).
+	recUnpag := httptest.NewRecorder()
+	if err := eng.Render(recUnpag, http.StatusOK, studioSrcID, "book_reader.html", PageContext{
+		Locale:      "en-US",
+		CurrentPath: "/books/encyclopedia",
+		RawQuery:    "ch=ch_151",
+		BookDetail: content.BookDetailView{
+			Book:         domain.Book{ID: "b_big", Title: "Encyclopedia", Slug: "encyclopedia", EmbedMode: "inline", ChapterCount: 250},
+			FlatChapters: manyChaps,
+		},
+		ActiveChapter: &manyChaps[151],
+	}); err != nil {
+		t.Fatalf("Render unpaginated large book_reader.html: %v", err)
+	}
+	outUnpag := recUnpag.Body.String()
+	for _, needle := range []string{
+		`250 chapters`,
+		`pagination--compact`,
+		`book-reader-toc__page-info`,
+		`Page 2 of 3`,
+		`cpage=1`,
+		`ch=ch_151`,
+		`book-reader-toc__volume-summary`,
+		`book-reader-toc__volume-chevron`,
+		`book-reader-toc__volume-items`,
+		`data-chapter-id="ch_151"`,
+	} {
+		if !strings.Contains(outUnpag, needle) {
+			t.Fatalf("expected unpaginated large book_reader output to contain %q", needle)
+		}
+	}
+	if strings.Contains(outUnpag, `data-chapter-id="ch_001"`) || strings.Contains(outUnpag, `data-chapter-id="ch_249"`) {
+		t.Fatalf("expected unpaginated book_reader window on cpage=2 to exclude ch_001 and ch_249")
+	}
+
+	// 7b. M1-paginated path: TotalPages=3, Page=2, 100-item slice, ChapterCount=250.
+	recPag := httptest.NewRecorder()
+	if err := eng.Render(recPag, http.StatusOK, studioSrcID, "book_reader.html", PageContext{
+		Locale:      "en-US",
+		CurrentPath: "/books/encyclopedia",
+		RawQuery:    "ch=ch_151&cpage=2",
+		Page:        2,
+		TotalPages:  3,
+		Pagination:  BuildPagination(2, 3, 100, 250, 5),
+		BookDetail: content.BookDetailView{
+			Book:         domain.Book{ID: "b_big", Title: "Encyclopedia", Slug: "encyclopedia", EmbedMode: "inline", ChapterCount: 250},
+			FlatChapters: manyChaps[100:200],
+		},
+		ActiveChapter: &manyChaps[151],
+	}); err != nil {
+		t.Fatalf("Render M1-paginated large book_reader.html: %v", err)
+	}
+	outPag := recPag.Body.String()
+	for _, needle := range []string{
+		`250 chapters`,
+		`Page 2 of 3`,
+		`cpage=1`,
+		`cpage=3`,
+		`data-chapter-id="ch_151"`,
+	} {
+		if !strings.Contains(outPag, needle) {
+			t.Fatalf("expected M1-paginated book_reader output to contain %q", needle)
+		}
+	}
+
+	// 7c. Split-volume carry-over: Volume 3 starts at index 80 and spans across index 100; active chapter at index 110.
+	splitChaps := make([]domain.BookChapter, 0, 140)
+	for i := 0; i < 140; i++ {
+		if i == 0 || i == 40 || i == 80 || i == 120 {
+			volNum := i/40 + 1
+			splitChaps = append(splitChaps, domain.BookChapter{
+				ID:    fmt.Sprintf("svol_%d", volNum),
+				Title: fmt.Sprintf("Split Volume %d", volNum),
+				Depth: 0,
+			})
+			continue
+		}
+		splitChaps = append(splitChaps, domain.BookChapter{
+			ID:    fmt.Sprintf("sch_%03d", i),
+			Title: fmt.Sprintf("Split Chapter %03d", i),
+			URL:   fmt.Sprintf("/posts/sch-%03d", i),
+			Depth: 1,
+		})
+	}
+	recSplit := httptest.NewRecorder()
+	if err := eng.Render(recSplit, http.StatusOK, studioSrcID, "book_reader.html", PageContext{
+		Locale:      "en-US",
+		CurrentPath: "/books/split-book",
+		RawQuery:    "ch=sch_110",
+		BookDetail: content.BookDetailView{
+			Book:         domain.Book{ID: "b_split", Title: "Split Book", Slug: "split-book", EmbedMode: "inline", ChapterCount: 140},
+			FlatChapters: splitChaps,
+		},
+		ActiveChapter: &splitChaps[110],
+	}); err != nil {
+		t.Fatalf("Render split-volume book_reader.html: %v", err)
+	}
+	outSplit := recSplit.Body.String()
+	vol3Marker := `<details class="book-reader-toc__volume" open data-default-open="1">`
+	idxVol3 := strings.Index(outSplit, vol3Marker)
+	if idxVol3 < 0 || !strings.Contains(outSplit[idxVol3:], "Split Volume 3") || !strings.Contains(outSplit[idxVol3:], `data-chapter-id="sch_110"`) {
+		t.Fatalf("expected cpage=2 to carry over enclosing Split Volume 3 as <details class=\"book-reader-toc__volume\" open data-default-open=\"1\"> wrapping sch_110")
+	}
+	idxVol4 := strings.Index(outSplit, "<span>Split Volume 4</span>")
+	if strings.Count(outSplit, vol3Marker) != 1 || idxVol4 < idxVol3 || !strings.Contains(outSplit[idxVol3:idxVol4], `<details class="book-reader-toc__volume">`) {
+		t.Fatalf("expected Split Volume 4 to remain collapsed when sch_110 is in Split Volume 3")
 	}
 }

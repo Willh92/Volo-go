@@ -39,7 +39,7 @@ func loadV1SchemaTemplate() string {
 }
 
 // CurrentSchemaVersion is the canonical normalized schema version of Volo-go.
-const CurrentSchemaVersion = 9
+const CurrentSchemaVersion = 10
 
 type migrationStep struct {
 	Version     int
@@ -92,6 +92,11 @@ var steps = []migrationStep{
 		Version:     9,
 		Description: "Add composite sort and incremental sync indexes on comments, follows, and series",
 		Statements:  buildV9CommentsFollowsSeriesIndexes,
+	},
+	{
+		Version:     10,
+		Description: "Add composite query and cleanup indexes across pages, follow_items, webhooks, media_assets, nav_items, links, redirects, analytics_top_items, security_ip_bans, and categories",
+		Statements:  buildV10QueryIndexes,
 	},
 }
 
@@ -210,6 +215,29 @@ func buildV9CommentsFollowsSeriesIndexes(_ dialect.Dialect) []string {
 		`CREATE INDEX idx_comments_del_updated ON comments (is_deleted, updated_at, id)`,
 		`CREATE INDEX idx_follows_sort_created ON follows (sort_order, created_at)`,
 		`CREATE INDEX idx_series_sort_created ON series (sort_order, created_at)`,
+	}
+}
+
+func buildV10QueryIndexes(_ dialect.Dialect) []string {
+	return []string{
+		`CREATE INDEX idx_pages_pub_slug ON pages (is_published, slug)`,
+		`CREATE INDEX idx_pages_author_updated ON pages (author_id, updated_at)`,
+		`CREATE INDEX idx_follow_items_follow_pub_id ON follow_items (follow_id, published_at, id)`,
+		`CREATE INDEX idx_webhooks_enabled_created ON webhooks (is_enabled, created_at)`,
+		`CREATE INDEX idx_webhooks_created ON webhooks (created_at)`,
+		`CREATE INDEX idx_media_dims_created ON media_assets (width, height, created_at)`,
+		`CREATE INDEX idx_media_uploader_mime_created ON media_assets (uploader_id, mime_type, created_at)`,
+		`CREATE INDEX idx_media_sha256 ON media_assets (sha256)`,
+		`CREATE INDEX idx_nav_items_enabled_order ON nav_items (is_enabled, sort_order, created_at)`,
+		`CREATE INDEX idx_nav_items_parent_order ON nav_items (parent_id, sort_order)`,
+		`CREATE INDEX idx_links_cat_order_created ON links (category_name, sort_order, created_at)`,
+		`CREATE INDEX idx_links_health_order_created ON links (health_status, sort_order, created_at)`,
+		`CREATE INDEX idx_redirects_hits_created ON redirects (hit_count, created_at)`,
+		`CREATE INDEX idx_redirects_legacy_created ON redirects (is_system_legacy, created_at)`,
+		`CREATE INDEX idx_analytics_top_kind_date ON analytics_top_items (kind, stat_date)`,
+		`CREATE INDEX idx_ip_bans_expires ON security_ip_bans (expires_at)`,
+		`CREATE INDEX idx_ip_bans_created ON security_ip_bans (created_at)`,
+		`CREATE INDEX idx_categories_order_created ON categories (sort_order, created_at)`,
 	}
 }
 

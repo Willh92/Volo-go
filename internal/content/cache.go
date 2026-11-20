@@ -100,10 +100,23 @@ type cachedArticleDetail struct {
 	ogImageURL     string
 	licenseText    string
 	toc            []render.TOCItem
+	tags           []domain.Tag
+	translations   []visibility.TranslationAlternate
+	prev           *visibility.PublicNeighbor
+	next           *visibility.PublicNeighbor
+	backlinks      []visibility.PublicNeighbor
 	wordCount      int
 	readingMinutes int
 	needsMath      bool
 	needsMermaid   bool
+}
+
+func cloneNeighborPtr(n *visibility.PublicNeighbor) *visibility.PublicNeighbor {
+	if n == nil {
+		return nil
+	}
+	cp := *n
+	return &cp
 }
 
 type serviceCacheState struct {
@@ -159,6 +172,17 @@ func (c *serviceCacheState) getArticleHTML(key string) (cachedArticleDetail, boo
 		if len(val.toc) > 0 {
 			out.toc = append([]render.TOCItem(nil), val.toc...)
 		}
+		if len(val.tags) > 0 {
+			out.tags = append([]domain.Tag(nil), val.tags...)
+		}
+		if len(val.translations) > 0 {
+			out.translations = append([]visibility.TranslationAlternate(nil), val.translations...)
+		}
+		out.prev = cloneNeighborPtr(val.prev)
+		out.next = cloneNeighborPtr(val.next)
+		if len(val.backlinks) > 0 {
+			out.backlinks = append([]visibility.PublicNeighbor(nil), val.backlinks...)
+		}
 		return out, true
 	}
 	return cachedArticleDetail{}, false
@@ -168,11 +192,26 @@ func (c *serviceCacheState) putArticleHTML(entry cachedArticleDetail) {
 	if c == nil {
 		return
 	}
-	tocBytes := 0
+	extraBytes := 0
 	for _, t := range entry.toc {
-		tocBytes += len(t.ID) + len(t.Text) + 24
+		extraBytes += len(t.ID) + len(t.Text) + 24
 	}
-	cost := len(entry.key) + len(entry.html) + len(entry.summary) + len(entry.coverURL) + len(entry.ogImageURL) + len(entry.licenseText) + tocBytes + 160
+	for _, tg := range entry.tags {
+		extraBytes += len(tg.ID) + len(tg.Name) + len(tg.Slug) + 32
+	}
+	for _, al := range entry.translations {
+		extraBytes += len(al.Lang) + len(al.Title) + len(al.Slug) + len(al.URL) + 32
+	}
+	if entry.prev != nil {
+		extraBytes += len(entry.prev.ID) + len(entry.prev.Title) + len(entry.prev.Slug) + len(entry.prev.URL) + 32
+	}
+	if entry.next != nil {
+		extraBytes += len(entry.next.ID) + len(entry.next.Title) + len(entry.next.Slug) + len(entry.next.URL) + 32
+	}
+	for _, bl := range entry.backlinks {
+		extraBytes += len(bl.ID) + len(bl.Title) + len(bl.Slug) + len(bl.URL) + 32
+	}
+	cost := len(entry.key) + len(entry.html) + len(entry.summary) + len(entry.coverURL) + len(entry.ogImageURL) + len(entry.licenseText) + extraBytes + 160
 	if cost <= 0 || cost > maxArticleHTMLCacheBytes/4 {
 		return
 	}
@@ -180,6 +219,17 @@ func (c *serviceCacheState) putArticleHTML(entry cachedArticleDetail) {
 	cp.cost = cost
 	if len(entry.toc) > 0 {
 		cp.toc = append([]render.TOCItem(nil), entry.toc...)
+	}
+	if len(entry.tags) > 0 {
+		cp.tags = append([]domain.Tag(nil), entry.tags...)
+	}
+	if len(entry.translations) > 0 {
+		cp.translations = append([]visibility.TranslationAlternate(nil), entry.translations...)
+	}
+	cp.prev = cloneNeighborPtr(entry.prev)
+	cp.next = cloneNeighborPtr(entry.next)
+	if len(entry.backlinks) > 0 {
+		cp.backlinks = append([]visibility.PublicNeighbor(nil), entry.backlinks...)
 	}
 
 	c.articleHTMLMu.Lock()

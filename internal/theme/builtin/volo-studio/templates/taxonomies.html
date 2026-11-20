@@ -17,38 +17,48 @@
     </section>
 
     {{if eq .TaxonomyKind "categories"}}
-      {{if .Categories}}
+      {{if or .Categories .TagQuery}}
         {{$shownCatLen := len .Categories}}
         {{$totalCatLen := $shownCatLen}}
         {{if gt .Pagination.TotalItems $totalCatLen}}{{$totalCatLen = .Pagination.TotalItems}}{{end}}
         <div class="studio-article studio-card-pad" data-collection-root="categories">
           <div class="studio-collection-toolbar studio-collection-toolbar--inline">
-            <div class="studio-collection-search-wrap">
-              <input type="search" class="volo-input studio-collection-filter js-collection-filter" placeholder="{{t .Locale "studio.filter_placeholder"}}" aria-label="{{t .Locale "nav.categories"}}" autocomplete="off">
-              <span class="volo-badge studio-collection-count js-collection-count" data-total="{{$totalCatLen}}">{{if gt $totalCatLen $shownCatLen}}{{$shownCatLen}} / {{$totalCatLen}}{{else}}{{$totalCatLen}}{{end}}</span>
-            </div>
-            {{if gt (len .Categories) 1}}
+            <form class="studio-tax-search studio-collection-search-wrap" method="get" action="/categories">
+              <input type="search" name="q" value="{{.TagQuery}}" data-server-filter="1" class="volo-input studio-tax-search__input studio-collection-filter js-collection-filter" placeholder="{{t .Locale "studio.filter_placeholder"}}" aria-label="{{t .Locale "nav.categories"}}" autocomplete="off">
+              <a class="studio-icon-btn studio-tag-clear js-collection-filter-clear" href="/categories" data-server-query="{{.TagQuery}}" {{if not .TagQuery}}hidden{{end}} title="{{t .Locale "studio.clear_filter"}}" aria-label="{{t .Locale "studio.clear_filter"}}"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"/></svg><span>×</span></a>
+              <button class="volo-btn studio-tax-search__btn" type="submit" aria-label="{{t .Locale "nav.categories"}}">↵</button>
+              <span class="volo-badge studio-collection-count js-collection-count" data-total="{{$totalCatLen}}">{{if and (gt $totalCatLen $shownCatLen) (gt $shownCatLen 0)}}{{$shownCatLen}} / {{$totalCatLen}}{{else}}{{$shownCatLen}}{{end}}</span>
+            </form>
+            {{if gt $shownCatLen 1}}
               <nav class="studio-jump-pills" aria-label="{{t .Locale "nav.categories"}}">
                 {{range $i, $c := .Categories}}
-                  {{if lt $i 18}}
-                    <a class="studio-jump-pill" href="#cat-card-{{$c.Slug}}">{{$c.Name}} <small>{{$c.ArticleCount}}</small></a>
-                  {{end}}
+                  <a class="studio-jump-pill" href="#cat-card-{{$c.Slug}}"{{if ge $i 18}} data-extra-pill hidden{{end}}>{{$c.Name}} <small>{{$c.ArticleCount}}</small></a>
+                {{end}}
+                {{if gt $shownCatLen 18}}
+                  <button type="button" class="studio-jump-pill studio-tags-more-btn js-jump-pills-toggle"
+                          aria-expanded="false"
+                          data-more-label="+{{sub $shownCatLen 18}}"
+                          data-less-label="{{t .Locale "studio.show_less"}}">+{{sub $shownCatLen 18}}</button>
                 {{end}}
               </nav>
             {{end}}
           </div>
-          <div class="bookshelf-grid">
-            {{range .Categories}}
-              <a id="cat-card-{{.Slug}}" class="book-card studio-tax-card studio-cat-card" href="/categories/{{.Slug}}" data-collection-item="{{lower .Name}} {{lower .Slug}} {{lower .Description}}">
-                <div class="studio-tax-card__head">
-                  <strong>{{.Name}}</strong>
-                  <span class="volo-badge">{{.ArticleCount}}</span>
-                </div>
-                {{if .Description}}<p class="studio-tax-card__desc">{{.Description}}</p>{{end}}
-              </a>
-            {{end}}
-          </div>
-          <p class="studio-muted-empty js-collection-empty" hidden>{{t .Locale "studio.filter_empty"}}</p>
+          {{if .Categories}}
+            <div class="bookshelf-grid">
+              {{range .Categories}}
+                <a id="cat-card-{{.Slug}}" class="book-card studio-tax-card studio-cat-card" href="/categories/{{.Slug}}" data-collection-item="{{lower .Name}} {{lower .Slug}} {{lower .Description}}">
+                  <div class="studio-tax-card__head">
+                    <strong>{{.Name}}</strong>
+                    <span class="volo-badge">{{.ArticleCount}}</span>
+                  </div>
+                  {{if .Description}}<p class="studio-tax-card__desc">{{.Description}}</p>{{end}}
+                </a>
+              {{end}}
+            </div>
+            <p class="studio-muted-empty js-collection-empty" hidden>{{t .Locale "studio.filter_empty"}}</p>
+          {{else}}
+            <p class="studio-muted-empty">{{t .Locale "studio.filter_empty"}}</p>
+          {{end}}
         </div>
         {{template "pagination" .}}
       {{else}}
@@ -165,17 +175,21 @@
         <div class="studio-article studio-card-pad" data-collection-root="series">
           <div class="studio-collection-toolbar studio-collection-toolbar--inline">
             <form class="studio-tax-search studio-collection-search-wrap" method="get" action="/series">
-              <input type="search" name="q" value="{{.TagQuery}}" class="volo-input studio-tax-search__input studio-collection-filter js-collection-filter js-series-filter-input" placeholder="{{t .Locale "studio.filter_placeholder"}}" aria-label="{{.HeroTitle}}" autocomplete="off">
-              <a class="studio-icon-btn studio-tag-clear js-series-filter-clear" href="/series" data-server-query="{{.TagQuery}}" {{if not .TagQuery}}hidden{{end}} title="{{t .Locale "studio.clear_filter"}}" aria-label="{{t .Locale "studio.clear_filter"}}"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"/></svg><span>×</span></a>
+              <input type="search" name="q" value="{{.TagQuery}}" data-server-filter="1" class="volo-input studio-tax-search__input studio-collection-filter js-collection-filter js-series-filter-input" placeholder="{{t .Locale "studio.filter_placeholder"}}" aria-label="{{.HeroTitle}}" autocomplete="off">
+              <a class="studio-icon-btn studio-tag-clear js-collection-filter-clear js-series-filter-clear" href="/series" data-server-query="{{.TagQuery}}" {{if not .TagQuery}}hidden{{end}} title="{{t .Locale "studio.clear_filter"}}" aria-label="{{t .Locale "studio.clear_filter"}}"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"/></svg><span>×</span></a>
               <button class="volo-btn studio-tax-search__btn" type="submit" aria-label="{{.HeroTitle}}">↵</button>
-              <span class="volo-badge studio-collection-count js-collection-count" data-total="{{$totalSeriesLen}}">{{if and (gt $totalSeriesLen $shownSeriesLen) (not .TagQuery)}}{{$shownSeriesLen}} / {{$totalSeriesLen}}{{else}}{{$shownSeriesLen}}{{end}}</span>
+              <span class="volo-badge studio-collection-count js-collection-count" data-total="{{$totalSeriesLen}}">{{if and (gt $totalSeriesLen $shownSeriesLen) (gt $shownSeriesLen 0)}}{{$shownSeriesLen}} / {{$totalSeriesLen}}{{else}}{{$shownSeriesLen}}{{end}}</span>
             </form>
-            {{if gt (len .SeriesList) 1}}
+            {{if gt $shownSeriesLen 1}}
               <nav class="studio-jump-pills" aria-label="{{.HeroTitle}}">
                 {{range $i, $s := .SeriesList}}
-                  {{if lt $i 18}}
-                    <a class="studio-jump-pill" href="#series-card-{{$s.Slug}}">{{$s.Title}}</a>
-                  {{end}}
+                  <a class="studio-jump-pill" href="#series-card-{{$s.Slug}}"{{if ge $i 18}} data-extra-pill hidden{{end}}>{{$s.Title}}</a>
+                {{end}}
+                {{if gt $shownSeriesLen 18}}
+                  <button type="button" class="studio-jump-pill studio-tags-more-btn js-jump-pills-toggle"
+                          aria-expanded="false"
+                          data-more-label="+{{sub $shownSeriesLen 18}}"
+                          data-less-label="{{t .Locale "studio.show_less"}}">+{{sub $shownSeriesLen 18}}</button>
                 {{end}}
               </nav>
             {{end}}
@@ -191,7 +205,7 @@
             </div>
             <p class="studio-muted-empty js-collection-empty" hidden>{{t .Locale "studio.filter_empty"}}</p>
           {{else}}
-            <p class="studio-muted-empty">{{t .Locale "search.empty"}}</p>
+            <p class="studio-muted-empty">{{t .Locale "studio.filter_empty"}}</p>
           {{end}}
         </div>
         {{template "pagination" .}}

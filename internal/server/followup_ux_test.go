@@ -6,6 +6,7 @@ import (
 	"image"
 	"image/color"
 	"image/png"
+	"io"
 	"mime/multipart"
 	"net/http"
 	"os"
@@ -741,5 +742,188 @@ func TestFollowUp_PermissionsPolicyLegacyImageShimAndIPBanReasonSearch(t *testin
 	qResp, qRaw := doJSONReq(t, http.MethodGet, env.ts.URL+"/api/admin/security/ip-bans?q=script_scan", nil, cookies, nil)
 	if qResp.StatusCode != http.StatusOK || !strings.Contains(string(qRaw), "198.51.100.201/32") {
 		t.Fatalf("expected reason_code search to find 198.51.100.201/32, got %d: %s", qResp.StatusCode, string(qRaw))
+	}
+}
+
+func doRawBodyReq(t *testing.T, method, urlStr, rawJSON string, cookies []*http.Cookie, headers map[string]string) (*http.Response, []byte) {
+	t.Helper()
+	req, err := http.NewRequest(method, urlStr, strings.NewReader(rawJSON))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	for _, c := range cookies {
+		req.AddCookie(c)
+	}
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	return resp, body
+}
+
+func TestAdversarial_ThemeConfigEmptyNullPreservationAndSettingsNullPatch(t *testing.T) {
+	env := setupM5TestEnv(t, "/console")
+	t.Cleanup(func() { _ = env.app.Close(env.ctx) })
+
+	if err := env.catalog.Reload("../../locales"); err != nil {
+		t.Fatalf("catalog.Reload: %v", err)
+	}
+	thEng, err := theme.NewEngine(env.catalog, env.cfg.ThemesDir)
+	if err != nil {
+		t.Fatalf("theme.NewEngine: %v", err)
+	}
+	thEng.SetSecretSealer(env.cfg.KeyRing)
+
+	appSrv, err := server.NewAppServer(server.AppDeps{
+		Config:    env.cfg,
+		Store:     env.store,
+		Settings:  env.settings,
+		Catalog:   env.catalog,
+		Auth:      env.authSvc,
+		Content:   env.content,
+		Themes:    thEng,
+		StartedAt: time.Now(),
+	})
+	if err != nil {
+		t.Fatalf("NewAppServer: %v", err)
+	}
+	t.Cleanup(func() { _ = appSrv.Close(env.ctx) })
+	env.ts.Config.Handler = appSrv.Handler()
+
+	cookies, headers := bootstrapAuthenticatedAdmin(t, env)
+
+	// Install a theme with both public and encrypted secret schema fields into isolated temp ThemesDir
+	secZip := buildSecretThemeZipBytes(t, "t5-secret-theme", "1.0.0")
+	instResp, instRaw := postMultipartZip(t, env.ts.URL+"/api/admin/themes/install", secZip, "t5-secret-theme.zip", cookies, headers)
+	if instResp.StatusCode != http.StatusOK && instResp.StatusCode != http.StatusCreated {
+		t.Fatalf("install secret theme = %d: %s", instResp.StatusCode, string(instRaw))
+	}
+
+	// 1. Seed volo-studio and t5-secret-theme configs
+	seedJ, seedJRaw := doJSONReq(t, http.MethodPatch, env.ts.URL+"/api/admin/themes/volo-studio/config", map[string]any{
+		"journal_motto": "KeepMe",
+		"hero_badge":    "Badge1",
+	}, cookies, headers)
+	if seedJ.StatusCode != http.StatusOK {
+		t.Fatalf("seed volo-studio config = %d: %s", seedJ.StatusCode, string(seedJRaw))
+	}
+	seedS, seedSRaw := doJSONReq(t, http.MethodPatch, env.ts.URL+"/api/admin/themes/t5-secret-theme/config", map[string]any{
+		"analytics_token": "tok-super-secret-123",
+		"banner_text":     "KeepBanner",
+	}, cookies, headers)
+	if seedS.StatusCode != http.StatusOK {
+		t.Fatalf("seed t5-secret-theme config = %d: %s", seedS.StatusCode, string(seedSRaw))
+	}
+
+	assertJournalAndSecretIntact := func(ctxLabel string) {
+		t.Helper()
+		getResp, getRaw := doJSONReq(t, http.MethodGet, env.ts.URL+"/api/admin/settings/appearance", nil, cookies, nil)
+		if getResp.StatusCode != http.StatusOK {
+			t.Fatalf("%s: GET appearance = %d", ctxLabel, getResp.StatusCode)
+		}
+		var out struct {
+			Value struct {
+				ThemeConfigs map[string]map[string]any `json:"theme_configs"`
+			} `json:"value"`
+		}
+		if err := json.Unmarshal(getRaw, &out); err != nil {
+			t.Fatalf("%s: decode appearance: %v", ctxLabel, err)
+		}
+		jCfg := out.Value.ThemeConfigs["volo-studio"]
+		if jCfg["journal_motto"] != "KeepMe" || jCfg["hero_badge"] != "Badge1" {
+			t.Fatalf("%s: volo-studio config wiped or mutated: %+v", ctxLabel, jCfg)
+		}
+		sCfg := out.Value.ThemeConfigs["t5-secret-theme"]
+		if sCfg["banner_text"] != "KeepBanner" || sCfg["analytics_token"] != theme.SecretMask {
+			t.Fatalf("%s: t5-secret-theme config/secret wiped or mutated: %+v", ctxLabel, sCfg)
+		}
+		snapCfg := env.settings.Snapshot().Appearance.ThemeConfigs["t5-secret-theme"]
+		if enc, _ := snapCfg["analytics_token"].(string); !strings.HasPrefix(enc, "enc:v1:") {
+			t.Fatalf("%s: expected sealed enc:v1 secret preserved in snapshot, got %q", ctxLabel, enc)
+		}
+	}
+
+	// 2. Empty object PUT {} -> 200 and preserves existing keys & secret
+	rPutEmpty, rawPutEmpty := doRawBodyReq(t, http.MethodPut, env.ts.URL+"/api/admin/themes/volo-studio/config", `{}`, cookies, headers)
+	if rPutEmpty.StatusCode != http.StatusOK {
+		t.Fatalf("PUT {} = %d: %s", rPutEmpty.StatusCode, string(rawPutEmpty))
+	}
+	rPutSecretEmpty, rawPutSecretEmpty := doRawBodyReq(t, http.MethodPut, env.ts.URL+"/api/admin/themes/t5-secret-theme/config", `{}`, cookies, headers)
+	if rPutSecretEmpty.StatusCode != http.StatusOK {
+		t.Fatalf("PUT secret {} = %d: %s", rPutSecretEmpty.StatusCode, string(rawPutSecretEmpty))
+	}
+	assertJournalAndSecretIntact("after PUT {}")
+
+	// 3. Nested {"values":{}} -> 200 and preserves existing keys & secret
+	rValuesEmpty, rawValuesEmpty := doRawBodyReq(t, http.MethodPatch, env.ts.URL+"/api/admin/themes/volo-studio/config", `{"values":{}}`, cookies, headers)
+	if rValuesEmpty.StatusCode != http.StatusOK {
+		t.Fatalf("PATCH {values:{}} = %d: %s", rValuesEmpty.StatusCode, string(rawValuesEmpty))
+	}
+	rSecretValuesEmpty, _ := doRawBodyReq(t, http.MethodPatch, env.ts.URL+"/api/admin/themes/t5-secret-theme/config", `{"values":{}}`, cookies, headers)
+	if rSecretValuesEmpty.StatusCode != http.StatusOK {
+		t.Fatalf("PATCH secret {values:{}} = %d", rSecretValuesEmpty.StatusCode)
+	}
+	assertJournalAndSecretIntact("after PATCH {values:{}}")
+
+	// 4. PATCH /api/admin/settings/appearance with {"theme_configs":{"volo-studio":{},"t5-secret-theme":{}}} -> 200 and preserves keys & secret
+	rAppEmpty, rawAppEmpty := doRawBodyReq(t, http.MethodPatch, env.ts.URL+"/api/admin/settings/appearance",
+		`{"theme_configs":{"volo-studio":{},"t5-secret-theme":{}}}`, cookies, headers)
+	if rAppEmpty.StatusCode != http.StatusOK {
+		t.Fatalf("PATCH appearance empty theme_configs = %d: %s", rAppEmpty.StatusCode, string(rawAppEmpty))
+	}
+	assertJournalAndSecretIntact("after PATCH appearance empty theme_configs")
+
+	// 5. Reject JSON null / non-object values / non-object theme_configs[tid] with 400 Bad Request
+	for _, badCase := range []struct {
+		method string
+		path   string
+		body   string
+	}{
+		{http.MethodPatch, "/api/admin/themes/volo-studio/config", `null`},
+		{http.MethodPut, "/api/admin/themes/t5-secret-theme/config", `null`},
+		{http.MethodPatch, "/api/admin/themes/volo-studio/config", `{"values":null}`},
+		{http.MethodPatch, "/api/admin/themes/volo-studio/config", `{"values":"bad"}`},
+		{http.MethodPatch, "/api/admin/settings/appearance", `{"theme_configs":null}`},
+		{http.MethodPatch, "/api/admin/settings/appearance", `{"theme_configs":{"volo-studio":null}}`},
+		{http.MethodPatch, "/api/admin/settings/appearance", `{"theme_configs":{"t5-secret-theme":123}}`},
+		{http.MethodPatch, "/api/admin/settings/appearance", `{"theme_configs":"bad"}`},
+	} {
+		resp, raw := doRawBodyReq(t, badCase.method, env.ts.URL+badCase.path, badCase.body, cookies, headers)
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("%s %s body=%s expected 400, got %d: %s", badCase.method, badCase.path, badCase.body, resp.StatusCode, string(raw))
+		}
+	}
+	assertJournalAndSecretIntact("after invalid 400 requests")
+
+	// 6. Bug 2: PATCH /api/admin/settings/{domain} rejects JSON null with 400 and does NOT bump version
+	_, siteBeforeRaw := doJSONReq(t, http.MethodGet, env.ts.URL+"/api/admin/settings/site", nil, cookies, nil)
+	var siteBefore struct {
+		Version int64 `json:"version"`
+	}
+	if err := json.Unmarshal(siteBeforeRaw, &siteBefore); err != nil {
+		t.Fatalf("decode site before: %v", err)
+	}
+	nullSiteResp, nullSiteRaw := doRawBodyReq(t, http.MethodPatch, env.ts.URL+"/api/admin/settings/site", `null`, cookies, headers)
+	if nullSiteResp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("PATCH /api/admin/settings/site null expected 400, got %d: %s", nullSiteResp.StatusCode, string(nullSiteRaw))
+	}
+	_, siteAfterRaw := doJSONReq(t, http.MethodGet, env.ts.URL+"/api/admin/settings/site", nil, cookies, nil)
+	var siteAfter struct {
+		Version int64 `json:"version"`
+	}
+	if err := json.Unmarshal(siteAfterRaw, &siteAfter); err != nil {
+		t.Fatalf("decode site after: %v", err)
+	}
+	if siteAfter.Version != siteBefore.Version {
+		t.Fatalf("expected site version unchanged (%d) after rejected null patch, got %d", siteBefore.Version, siteAfter.Version)
+	}
+	if _, _, repoErr := env.settings.PatchDomain(env.ctx, domain.SettingsDomainSite, []byte("null"), 0); repoErr == nil {
+		t.Fatalf("expected SettingsManager.PatchDomain to reject JSON null")
 	}
 }

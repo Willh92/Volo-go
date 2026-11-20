@@ -326,7 +326,9 @@ func (s *AppServer) handleAdminSystemRoutes(w http.ResponseWriter, r *http.Reque
 			IncludeForks   *bool  `json:"include_forks"`
 			PublishArticle bool   `json:"publish_article"`
 		}
-		_ = json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&req)
+		if !decodeOptJSONBody(w, r, 4096, &req) {
+			return
+		}
 		if req.IncludeForks != nil {
 			patchForks, _ := json.Marshal(map[string]any{"github_include_forks": *req.IncludeForks})
 			_, _, _ = s.deps.Settings.PatchDomain(r.Context(), domain.SettingsDomainSEO, patchForks, 0)
@@ -423,7 +425,7 @@ func (s *AppServer) handleAdminSystemRoutes(w http.ResponseWriter, r *http.Reque
 			"sys_bytes":        ms.Sys,
 			"uptime_sec":       int64(time.Since(s.deps.StartedAt).Seconds()),
 			"go_version":       runtime.Version(),
-			"version":          s.deps.Version,
+			"version":          s.effectiveAppVersion(),
 		})
 
 	case sub == "runtime-logs" && r.Method == http.MethodDelete:
@@ -720,12 +722,27 @@ func (s *AppServer) handleAdminNav(w http.ResponseWriter, r *http.Request, _ *do
 	if rest == "" {
 		switch r.Method {
 		case http.MethodGet:
+			page, perPage := parseAdminPageParams(r, 100, 500)
+			q := strings.TrimSpace(r.URL.Query().Get("q"))
+			var whereSQL string
+			var whereArgs []any
+			if q != "" {
+				pat := "%" + escapeLikePattern(q) + "%"
+				whereSQL = " WHERE (LOWER(title) LIKE LOWER(?) ESCAPE '!' OR LOWER(url) LIKE LOWER(?) ESCAPE '!')"
+				whereArgs = []any{pat, pat}
+			}
+			var total int
+			_ = s.deps.Store.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM nav_items`+whereSQL, whereArgs...).Scan(&total)
 			var rows []domain.NavItem
-			_ = sqlx.SelectInto(r.Context(), s.deps.Store, &rows, `SELECT * FROM nav_items ORDER BY sort_order ASC, created_at ASC`)
+			if total > 0 && (page-1) <= (total-1)/perPage {
+				baseSQL := `SELECT * FROM nav_items` + whereSQL + ` ORDER BY sort_order ASC, created_at ASC`
+				pageSQL, queryArgs := s.paginateQuery(baseSQL, whereArgs, page, perPage)
+				_ = sqlx.SelectInto(r.Context(), s.deps.Store, &rows, pageSQL, queryArgs...)
+			}
 			if rows == nil {
 				rows = []domain.NavItem{}
 			}
-			writeJSON(w, http.StatusOK, map[string]any{"items": rows, "nav_items": rows, "total": len(rows)})
+			writePagedJSON(w, "nav_items", rows, total, page, perPage)
 		case http.MethodPost:
 			var in domain.NavItem
 			if !decodeJSONBody(w, r, 16384, &in) {
@@ -767,10 +784,7 @@ func (s *AppServer) handleAdminNav(w http.ResponseWriter, r *http.Request, _ *do
 			if writeBadErr(w, err) {
 				return
 			}
-			s.invalidateMediaRefCache()
-			if s.deps.Content != nil {
-				s.deps.Content.PurgeRuntimeCaches()
-			}
+			s.invalidateContentAndMediaCaches()
 			writeJSON(w, http.StatusCreated, map[string]any{"item": in})
 		default:
 			w.WriteHeader(http.StatusMethodNotAllowed)
@@ -804,10 +818,7 @@ func (s *AppServer) handleAdminNav(w http.ResponseWriter, r *http.Request, _ *do
 		if writeBadErr(w, err) {
 			return
 		}
-		s.invalidateMediaRefCache()
-		if s.deps.Content != nil {
-			s.deps.Content.PurgeRuntimeCaches()
-		}
+		s.invalidateContentAndMediaCaches()
 		writeOKJSON(w)
 	case http.MethodDelete:
 		var delRows []struct {
@@ -824,10 +835,7 @@ func (s *AppServer) handleAdminNav(w http.ResponseWriter, r *http.Request, _ *do
 			}
 			s.pruneDeletedNavFromThemeConfigs(r.Context(), delIDs)
 		}
-		s.invalidateMediaRefCache()
-		if s.deps.Content != nil {
-			s.deps.Content.PurgeRuntimeCaches()
-		}
+		s.invalidateContentAndMediaCaches()
 		writeOKJSON(w)
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
@@ -2239,14 +2247,7 @@ func (s *AppServer) handleAdminWebhooks(w http.ResponseWriter, r *http.Request, 
 				wh.SecretCiphertext = ""
 				out = append(out, map[string]any{"webhook": wh, "secret_set": hasSec})
 			}
-			writeJSON(w, http.StatusOK, map[string]any{
-				"items":     out,
-				"webhooks":  out,
-				"total":     total,
-				"page":      page,
-				"per_page":  perPage,
-				"page_size": perPage,
-			})
+			writePagedJSON(w, "webhooks", out, total, page, perPage)
 
 		case http.MethodPost:
 			var in struct {
@@ -2326,14 +2327,7 @@ func (s *AppServer) handleAdminWebhooks(w http.ResponseWriter, r *http.Request, 
 		if rows == nil {
 			rows = []domain.WebhookDelivery{}
 		}
-		writeJSON(w, http.StatusOK, map[string]any{
-			"items":      rows,
-			"deliveries": rows,
-			"total":      total,
-			"page":       page,
-			"per_page":   perPage,
-			"page_size":  perPage,
-		})
+		writePagedJSON(w, "deliveries", rows, total, page, perPage)
 		return
 	}
 	if len(parts) == 4 && parts[1] == "deliveries" && parts[3] == "replay" && r.Method == http.MethodPost {
@@ -2708,6 +2702,29 @@ func isAlreadyExistsInstallErr(err error) bool {
 	return strings.Contains(low, "already exists") || strings.Contains(low, "already installed")
 }
 
+func (s *AppServer) writeAppearanceThemeResponse(w http.ResponseWriter, ctx context.Context, status int, locale string, includeOK bool, themeAny any) {
+	var appVer int64
+	if s.deps.Settings != nil {
+		_, appVer, _ = s.deps.Settings.GetDomain(ctx, domain.SettingsDomainAppearance)
+	}
+	normApp := s.redactAppearanceThemeSecrets(s.normalizeAppearanceNavConfigs(ctx, locale, s.deps.Settings.Snapshot().Appearance))
+	resp := map[string]any{
+		"active_theme":       normApp.ActiveTheme,
+		"mobile_theme":       normApp.MobileTheme,
+		"appearance":         normApp,
+		"appearance_version": appVer,
+		"version":            appVer,
+		"themes":             s.enrichThemesWithCustomNav(ctx, locale, s.deps.Themes.ListLocalized(locale)),
+	}
+	if includeOK {
+		resp["ok"] = true
+	}
+	if themeAny != nil {
+		resp["theme"] = themeAny
+	}
+	writeJSON(w, status, resp)
+}
+
 func (s *AppServer) handleAdminThemes(w http.ResponseWriter, r *http.Request, actor *domain.User, rest string) {
 	rest = strings.TrimPrefix(rest, "/")
 	locale := actor.PreferredLocale
@@ -2719,14 +2736,7 @@ func (s *AppServer) handleAdminThemes(w http.ResponseWriter, r *http.Request, ac
 	}
 
 	if rest == "" && r.Method == http.MethodGet {
-		snap := s.deps.Settings.Snapshot()
-		normApp := s.redactAppearanceThemeSecrets(s.normalizeAppearanceNavConfigs(r.Context(), locale, snap.Appearance))
-		writeJSON(w, http.StatusOK, map[string]any{
-			"active_theme": normApp.ActiveTheme,
-			"mobile_theme": normApp.MobileTheme,
-			"appearance":   normApp,
-			"themes":       s.enrichThemesWithCustomNav(r.Context(), locale, s.deps.Themes.ListLocalized(locale)),
-		})
+		s.writeAppearanceThemeResponse(w, r.Context(), http.StatusOK, locale, false, nil)
 		return
 	}
 
@@ -2737,21 +2747,7 @@ func (s *AppServer) handleAdminThemes(w http.ResponseWriter, r *http.Request, ac
 		if s.deps.Content != nil {
 			s.deps.Content.PurgeRuntimeCaches()
 		}
-		var appVer int64
-		if s.deps.Settings != nil {
-			_, appVer, _ = s.deps.Settings.GetDomain(r.Context(), domain.SettingsDomainAppearance)
-		}
-		snap := s.deps.Settings.Snapshot()
-		normApp := s.redactAppearanceThemeSecrets(s.normalizeAppearanceNavConfigs(r.Context(), locale, snap.Appearance))
-		writeJSON(w, http.StatusOK, map[string]any{
-			"ok":                 true,
-			"active_theme":       normApp.ActiveTheme,
-			"mobile_theme":       normApp.MobileTheme,
-			"appearance":         normApp,
-			"appearance_version": appVer,
-			"version":            appVer,
-			"themes":             s.enrichThemesWithCustomNav(r.Context(), locale, s.deps.Themes.ListLocalized(locale)),
-		})
+		s.writeAppearanceThemeResponse(w, r.Context(), http.StatusOK, locale, true, nil)
 		return
 	}
 
@@ -2878,25 +2874,9 @@ func (s *AppServer) handleAdminThemes(w http.ResponseWriter, r *http.Request, ac
 				_, _, _ = s.deps.Settings.PatchDomain(r.Context(), domain.SettingsDomainAppearance, patchBytes, 0)
 			}
 		}
-		s.invalidateMediaRefCache()
-		if s.deps.Content != nil {
-			s.deps.Content.PurgeRuntimeCaches()
-		}
+		s.invalidateContentAndMediaCaches()
 		s.recordAuditLog(r, actor, "theme.install", "theme", mf.ID, map[string]any{"version": mf.Version})
-		var appVer int64
-		if s.deps.Settings != nil {
-			_, appVer, _ = s.deps.Settings.GetDomain(r.Context(), domain.SettingsDomainAppearance)
-		}
-		normApp := s.redactAppearanceThemeSecrets(s.normalizeAppearanceNavConfigs(r.Context(), locale, s.deps.Settings.Snapshot().Appearance))
-		writeJSON(w, http.StatusCreated, map[string]any{
-			"theme":              mf,
-			"active_theme":       normApp.ActiveTheme,
-			"mobile_theme":       normApp.MobileTheme,
-			"appearance":         normApp,
-			"appearance_version": appVer,
-			"version":            appVer,
-			"themes":             s.enrichThemesWithCustomNav(r.Context(), locale, s.deps.Themes.ListLocalized(locale)),
-		})
+		s.writeAppearanceThemeResponse(w, r.Context(), http.StatusCreated, locale, false, mf)
 		return
 	}
 
@@ -2935,26 +2915,9 @@ func (s *AppServer) handleAdminThemes(w http.ResponseWriter, r *http.Request, ac
 		if writeExtensionOpError(w, err, true) {
 			return
 		}
-		s.invalidateMediaRefCache()
-		if s.deps.Content != nil {
-			s.deps.Content.PurgeRuntimeCaches()
-		}
+		s.invalidateContentAndMediaCaches()
 		s.recordAuditLog(r, actor, "theme.upgrade", "theme", mf.ID, map[string]any{"version": mf.Version})
-		var appVer int64
-		if s.deps.Settings != nil {
-			_, appVer, _ = s.deps.Settings.GetDomain(r.Context(), domain.SettingsDomainAppearance)
-		}
-		normApp := s.redactAppearanceThemeSecrets(s.normalizeAppearanceNavConfigs(r.Context(), locale, s.deps.Settings.Snapshot().Appearance))
-		writeJSON(w, http.StatusOK, map[string]any{
-			"ok":                 true,
-			"theme":              mf,
-			"active_theme":       normApp.ActiveTheme,
-			"mobile_theme":       normApp.MobileTheme,
-			"appearance":         normApp,
-			"appearance_version": appVer,
-			"version":            appVer,
-			"themes":             s.enrichThemesWithCustomNav(r.Context(), locale, s.deps.Themes.ListLocalized(locale)),
-		})
+		s.writeAppearanceThemeResponse(w, r.Context(), http.StatusOK, locale, true, mf)
 		return
 	}
 
@@ -3004,7 +2967,16 @@ func (s *AppServer) handleAdminThemes(w http.ResponseWriter, r *http.Request, ac
 		if !decodeJSONBody(w, r, 65536, &cfgPatch) {
 			return
 		}
-		if nested, ok := cfgPatch["values"].(map[string]any); ok && len(cfgPatch) == 1 {
+		if cfgPatch == nil {
+			writeErrJSON(w, http.StatusBadRequest, "config payload must be a JSON object")
+			return
+		}
+		if rawVals, hasVals := cfgPatch["values"]; hasVals && len(cfgPatch) == 1 {
+			nested, ok := rawVals.(map[string]any)
+			if !ok || nested == nil {
+				writeErrJSON(w, http.StatusBadRequest, "config values must be a JSON object")
+				return
+			}
 			cfgPatch = nested
 		}
 		if rawItems, exists := cfgPatch["header_nav_items"]; exists {
@@ -3036,10 +3008,7 @@ func (s *AppServer) handleAdminThemes(w http.ResponseWriter, r *http.Request, ac
 		if writeBadErr(w, err) {
 			return
 		}
-		s.invalidateMediaRefCache()
-		if s.deps.Content != nil {
-			s.deps.Content.PurgeRuntimeCaches()
-		}
+		s.invalidateContentAndMediaCaches()
 		s.recordAuditLog(r, actor, "theme.config", "theme", themeID, nil)
 		outApp := s.deps.Settings.Snapshot().Appearance
 		normApp := s.redactAppearanceThemeSecrets(s.normalizeAppearanceNavConfigs(r.Context(), locale, outApp))
@@ -3063,26 +3032,9 @@ func (s *AppServer) handleAdminThemes(w http.ResponseWriter, r *http.Request, ac
 			patchBytes, _ := json.Marshal(patchReset)
 			_, _, _ = s.deps.Settings.PatchDomain(r.Context(), domain.SettingsDomainAppearance, patchBytes, 0)
 		}
-		s.invalidateMediaRefCache()
-		if s.deps.Content != nil {
-			s.deps.Content.PurgeRuntimeCaches()
-		}
+		s.invalidateContentAndMediaCaches()
 		s.recordAuditLog(r, actor, "theme.uninstall", "theme", themeID, nil)
-		var appVer int64
-		if s.deps.Settings != nil {
-			_, appVer, _ = s.deps.Settings.GetDomain(r.Context(), domain.SettingsDomainAppearance)
-		}
-		nextApp := s.deps.Settings.Snapshot().Appearance
-		normApp := s.redactAppearanceThemeSecrets(s.normalizeAppearanceNavConfigs(r.Context(), locale, nextApp))
-		writeJSON(w, http.StatusOK, map[string]any{
-			"ok":                 true,
-			"active_theme":       normApp.ActiveTheme,
-			"mobile_theme":       normApp.MobileTheme,
-			"appearance":         normApp,
-			"appearance_version": appVer,
-			"version":            appVer,
-			"themes":             s.enrichThemesWithCustomNav(r.Context(), locale, s.deps.Themes.ListLocalized(locale)),
-		})
+		s.writeAppearanceThemeResponse(w, r.Context(), http.StatusOK, locale, true, nil)
 		return
 	}
 
@@ -3367,10 +3319,7 @@ func (s *AppServer) handleAdminPlugins(w http.ResponseWriter, r *http.Request, a
 		if writeBadErr(w, err) {
 			return
 		}
-		s.invalidateMediaRefCache()
-		if s.deps.Content != nil {
-			s.deps.Content.PurgeRuntimeCaches()
-		}
+		s.invalidateContentAndMediaCaches()
 		s.recordAuditLog(r, actor, "plugin.reorder", "plugin", "chain", map[string]any{"count": len(ids)})
 		writeJSON(w, http.StatusOK, map[string]any{
 			"ok":        true,
@@ -3467,10 +3416,7 @@ func (s *AppServer) handleAdminPlugins(w http.ResponseWriter, r *http.Request, a
 			}
 			sum, _ = s.deps.Plugins.Get(sum.ID, locale)
 		}
-		s.invalidateMediaRefCache()
-		if s.deps.Content != nil {
-			s.deps.Content.PurgeRuntimeCaches()
-		}
+		s.invalidateContentAndMediaCaches()
 		s.recordAuditLog(r, actor, "plugin.install", "plugin", sum.ID, map[string]any{"version": sum.Version})
 		list := s.deps.Plugins.List(locale)
 		writeJSON(w, http.StatusCreated, map[string]any{
@@ -3515,10 +3461,7 @@ func (s *AppServer) handleAdminPlugins(w http.ResponseWriter, r *http.Request, a
 			if writeExtensionOpError(w, err, true) {
 				return
 			}
-			s.invalidateMediaRefCache()
-			if s.deps.Content != nil {
-				s.deps.Content.PurgeRuntimeCaches()
-			}
+			s.invalidateContentAndMediaCaches()
 			s.recordAuditLog(r, actor, "plugin.upgrade", "plugin", sum.ID, map[string]any{"version": sum.Version})
 			list := s.deps.Plugins.List(locale)
 			writeJSON(w, http.StatusOK, map[string]any{
@@ -3617,10 +3560,7 @@ func (s *AppServer) handleAdminPlugins(w http.ResponseWriter, r *http.Request, a
 			if writeBadErr(w, err) {
 				return
 			}
-			s.invalidateMediaRefCache()
-			if s.deps.Content != nil {
-				s.deps.Content.PurgeRuntimeCaches()
-			}
+			s.invalidateContentAndMediaCaches()
 			s.recordAuditLog(r, actor, "plugin.config_patch", "plugin", pid, nil)
 			writeJSON(w, http.StatusOK, map[string]any{"plugin": sum})
 		case parts[1] == "priority" && (r.Method == http.MethodPost || r.Method == http.MethodPatch || r.Method == http.MethodPut):
@@ -3634,10 +3574,7 @@ func (s *AppServer) handleAdminPlugins(w http.ResponseWriter, r *http.Request, a
 			if writeBadErr(w, err) {
 				return
 			}
-			s.invalidateMediaRefCache()
-			if s.deps.Content != nil {
-				s.deps.Content.PurgeRuntimeCaches()
-			}
+			s.invalidateContentAndMediaCaches()
 			s.recordAuditLog(r, actor, "plugin.priority", "plugin", pid, map[string]any{"priority": sum.Priority})
 			list := s.deps.Plugins.List(locale)
 			writeJSON(w, http.StatusOK, map[string]any{"ok": true, "plugin": sum, "items": list, "plugins": list})
@@ -3668,11 +3605,13 @@ func (s *AppServer) handleAdminPlugins(w http.ResponseWriter, r *http.Request, a
 			writeJSON(w, http.StatusOK, map[string]any{"items": jobs, "cron_jobs": jobs})
 		case (parts[1] == "cron" || parts[1] == "trigger-cron") && r.Method == http.MethodPost:
 			jobName := strings.TrimSpace(r.URL.Query().Get("name"))
-			if jobName == "" && r.ContentLength != 0 {
+			if jobName == "" {
 				var body struct {
 					Name string `json:"name"`
 				}
-				_ = json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&body)
+				if !decodeOptJSONBody(w, r, 4096, &body) {
+					return
+				}
 				jobName = strings.TrimSpace(body.Name)
 			}
 			triggered := s.deps.Plugins.TriggerCronJob(pid, jobName)
@@ -3692,10 +3631,7 @@ func (s *AppServer) handleAdminPlugins(w http.ResponseWriter, r *http.Request, a
 		if writeBadErr(w, s.deps.Plugins.Uninstall(r.Context(), pid)) {
 			return
 		}
-		s.invalidateMediaRefCache()
-		if s.deps.Content != nil {
-			s.deps.Content.PurgeRuntimeCaches()
-		}
+		s.invalidateContentAndMediaCaches()
 		s.recordAuditLog(r, actor, "plugin.uninstall", "plugin", pid, nil)
 		writeOKJSON(w)
 		return
@@ -3834,7 +3770,9 @@ func (s *AppServer) handleAdminSettings(w http.ResponseWriter, r *http.Request, 
 			Settings  *domain.StorageSettings `json:"settings"`
 			SecretKey string                  `json:"s3_secret_key"`
 		}
-		_ = json.NewDecoder(http.MaxBytesReader(w, r.Body, 16384)).Decode(&req)
+		if !decodeOptJSONBody(w, r, 16384, &req) {
+			return
+		}
 		drv := ""
 		if req.Settings != nil {
 			drv = strings.ToLower(strings.TrimSpace(req.Settings.ActiveDriver))
@@ -3937,32 +3875,45 @@ func (s *AppServer) handleAdminSettings(w http.ResponseWriter, r *http.Request, 
 		var meta struct {
 			ExpectedVersion int64 `json:"expected_version"`
 		}
-		_ = json.Unmarshal(rawBytes, &meta)
+		if err := json.Unmarshal(rawBytes, &meta); err != nil {
+			writeErrJSON(w, http.StatusBadRequest, "invalid json")
+			return
+		}
 		var patchMap map[string]any
 		if err := json.Unmarshal(rawBytes, &patchMap); err != nil {
 			writeErrJSON(w, http.StatusBadRequest, "invalid json")
 			return
 		}
+		if patchMap == nil {
+			writeErrJSON(w, http.StatusBadRequest, "invalid json: expected object")
+			return
+		}
 		delete(patchMap, "expected_version")
 		if rest == domain.SettingsDomainAppearance && s.deps.Themes != nil && s.deps.Settings != nil {
-			if rawTC, hasTC := patchMap["theme_configs"]; hasTC && rawTC != nil {
-				if tcMap, ok := rawTC.(map[string]any); ok {
-					curConfigs := s.deps.Settings.Snapshot().Appearance.ThemeConfigs
-					mergedTC := make(map[string]map[string]any, len(curConfigs)+len(tcMap))
-					for tid, existing := range curConfigs {
-						copied := make(map[string]any, len(existing))
-						for k, v := range existing {
-							copied[k] = v
-						}
-						mergedTC[tid] = copied
-					}
-					for tid, incomingAny := range tcMap {
-						if incomingCfg, ok := incomingAny.(map[string]any); ok {
-							mergedTC[tid] = s.deps.Themes.MergeThemeConfigSecrets(tid, incomingCfg, curConfigs[tid])
-						}
-					}
-					patchMap["theme_configs"] = mergedTC
+			if rawTC, hasTC := patchMap["theme_configs"]; hasTC {
+				tcMap, ok := rawTC.(map[string]any)
+				if !ok {
+					writeErrJSON(w, http.StatusBadRequest, "theme_configs must be a JSON object")
+					return
 				}
+				curConfigs := s.deps.Settings.Snapshot().Appearance.ThemeConfigs
+				mergedTC := make(map[string]map[string]any, len(curConfigs)+len(tcMap))
+				for tid, existing := range curConfigs {
+					copied := make(map[string]any, len(existing))
+					for k, v := range existing {
+						copied[k] = v
+					}
+					mergedTC[tid] = copied
+				}
+				for tid, incomingAny := range tcMap {
+					incomingCfg, ok := incomingAny.(map[string]any)
+					if !ok || incomingCfg == nil {
+						writeErrJSON(w, http.StatusBadRequest, "theme_configs entries must be JSON objects")
+						return
+					}
+					mergedTC[tid] = s.deps.Themes.MergeThemeConfigSecrets(tid, incomingCfg, curConfigs[tid])
+				}
+				patchMap["theme_configs"] = mergedTC
 			}
 		}
 		var prevStorage domain.StorageSettings

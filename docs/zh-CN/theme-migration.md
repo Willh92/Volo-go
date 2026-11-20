@@ -164,10 +164,11 @@ Volo-go 主题引擎同时支持现代母版继承、传统 `.ftl` 独立页面�
 | `mostUsedCategories` / `mostUsedTags` / `archiveDates` | `.SidebarCategories` / `.SidebarTags` / `.SidebarArchives` | 侧边栏分类、热门标签、按月归档 |
 | `recentArticles` / `mostViewCountArticles` / `mostCommentArticles` | `.RecentPosts` / `.MostViewedPosts` / `.MostCommentedPosts` | 侧边栏最新、热门阅读、热议文章榜单 |
 | `recentComments` | `.RecentComments` | 最新公开评论动态 |
+| 友链分组 / 检索词 | `.LinkGroups` / `.TagQuery` | `/links` 有序分类友链分组及 `/categories`、`/links` 当前 `?q=` 检索词 |
 
 ### 5.3 内置模板函数库 (`FuncMap`)
 
-- **多语言、站点变量与资源**：`t`、`tt`、`customVar`、`assetURL`、`coverSVG`、`pageURL`
+- **多语言、站点变量与资源**：`t`、`tt`、`customVar`、`assetURL`、`coverSVG`、`pageURL`、`cpageURL`（保留原有查询参数并更新 `?cpage=`）、`bookTOCWindow`（为 `book_reader.html` 生成有界章节目录窗口与页码）
 - **主题配置**：`themeCfg`、`themeCfgBool`（别名 `themeBool`）、`themeCfgInt`（别名 `themeInt`）
 - **日期时间**：`formatDate` (`YYYY-MM-DD`)、`formatDotDate` (`YYYY.MM.DD`)、`formatDateTime`、`formatMonthDay`、`formatTime`、`nowYear`
 - **集合与字典**：`dict`（向局部模板传参，如 `{{template "card" (dict "Post" . "Root" $)}}`）、`slice`、`seq`、`first`、`default`、`coalesce`

@@ -29,7 +29,7 @@ echo "[1/4] Building pure-Go static binary (CGO_ENABLED=0)..."
     -gcflags="github.com/Willh92/Volo-go/internal/render/...=-l=4" \
     -gcflags="github.com/Willh92/Volo-go/internal/security/...=-l=4" \
     -gcflags="github.com/Willh92/Volo-go/pkg/plugin/...=-l=4" \
-    -ldflags="-s -w -funcalign=8 -buildid= -X main.Version=v1.0.2-verify" \
+    -ldflags="-s -w -funcalign=8 -buildid= -X main.Version=v1.0.4-verify" \
     -o "${BIN_PATH}" ./cmd/volo
 )
 

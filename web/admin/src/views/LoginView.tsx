@@ -1,6 +1,7 @@
 import { useEffect, useState } from "preact/hooks";
 import {
   apiFetch,
+  appVersion,
   b64urlToBytes,
   bootConfig,
   bytesToB64url,
@@ -8,6 +9,7 @@ import {
   currentUserSig,
   effectiveDarkSig,
   refreshMe,
+  safeHref,
   showToast,
   StaffUser,
   toggleEffectiveTheme,
@@ -283,7 +285,7 @@ export function LoginView({ initialChallengeToken = "", initialOidcError = "" }:
             <div>
               <div class="volo-auth-card-top">
                 <span class="volo-auth-kicker">{t("auth.kicker")}</span>
-                <span class="volo-auth-version">VOLO v1.0.0</span>
+                <span class="volo-auth-version">VOLO {appVersion}</span>
               </div>
 
               <h2>{t("auth.welcome_title")}</h2>
@@ -415,21 +417,25 @@ export function LoginView({ initialChallengeToken = "", initialOidcError = "" }:
                       </SvgIcon>
                       <span>{t("auth.passkey")}</span>
                     </button>
-                    {oidcProviders.map((p) => (
-                      <a
-                        key={p.name}
-                        href={p.start_url}
-                        class="volo-btn volo-sso-btn"
-                        style={{ width: "100%", minHeight: "40px" }}
-                      >
-                        <SvgIcon size={15} sw={1.85}>
-                          <path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4" />
-                          <polyline points="10 17 15 12 10 7" />
-                          <line x1="15" y1="12" x2="3" y2="12" />
-                        </SvgIcon>
-                        <span>{t("auth.sso_continue", { provider: p.display_name || p.name })}</span>
-                      </a>
-                    ))}
+                    {oidcProviders.map((p) => {
+                      const startHref = safeHref(p.start_url);
+                      if (!startHref) return null;
+                      return (
+                        <a
+                          key={p.name}
+                          href={startHref}
+                          class="volo-btn volo-sso-btn"
+                          style={{ width: "100%", minHeight: "40px" }}
+                        >
+                          <SvgIcon size={15} sw={1.85}>
+                            <path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4" />
+                            <polyline points="10 17 15 12 10 7" />
+                            <line x1="15" y1="12" x2="3" y2="12" />
+                          </SvgIcon>
+                          <span>{t("auth.sso_continue", { provider: p.display_name || p.name })}</span>
+                        </a>
+                      );
+                    })}
                   </div>
                 </form>
               ) : (

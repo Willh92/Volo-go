@@ -474,10 +474,6 @@ func (e *Engine) Render(markdownSrc string, opts Options) Output {
 	// Transform extended inline Markdown syntax (==highlight==, ^sup^, ~sub~) outside code, math, and URLs.
 	rendered = enhanceExtendedInlineFormatting(rendered)
 
-	// Enhance <img> tags with intrinsic dimensions & lazy decoding and capture FirstImageURL from unlocked content.
-	var firstImg string
-	rendered = enhanceImages(rendered, opts.LookupMediaDims, &firstImg)
-
 	// Enhance standalone media links (.mp4/.webm/.m4v, .mp3/.m4a/.ogg/.wav/.weba, Bilibili, YouTube) and responsive tables in web mode.
 	if opts.Mode == RenderModeWeb {
 		rendered = enhanceStandaloneMediaLinks(rendered)
@@ -491,6 +487,12 @@ func (e *Engine) Render(markdownSrc string, opts Options) Output {
 
 	// Sanitize through the HTML5 fragment sanitizer to neutralize script/event-handler/scheme XSS vectors.
 	safeHTML := e.sanitizeArticleHTML(rendered, opts.PreserveDirectives)
+
+	// Enhance <img> tags post-sanitization (when '>' in attributes are escaped and schemes are validated),
+	// skipping <pre>/<code> blocks and capturing FirstImageURL from unlocked safe content.
+	var firstImg string
+	safeHTML = enhanceImages(safeHTML, opts.LookupMediaDims, &firstImg)
+
 	if opts.Mode == RenderModeWeb {
 		safeHTML = assignReadableHeadingIDs(safeHTML)
 	}
@@ -940,7 +942,7 @@ func preprocessDirectives(src string, opts Options) preprocessResult {
 				lang := strings.Fields(infoStr)
 				langName := ""
 				if len(lang) > 0 {
-					langName = strings.ToLower(lang[0])
+					langName = normalizeCodeLangKey(lang[0])
 				}
 				i++
 				var codeLines []string
@@ -1351,12 +1353,18 @@ type blockLineTracker struct {
 }
 
 func scanBlockquotePrefix(line string) (quoteDepth int, pos int) {
+	quoteDepth, pos, _ = scanBlockquotePrefixCols(line)
+	return quoteDepth, pos
+}
+
+func scanBlockquotePrefixCols(line string) (quoteDepth int, pos int, markerCols []int) {
 	for pos < len(line) {
 		sp := 0
 		for sp < 4 && pos+sp < len(line) && line[pos+sp] == ' ' {
 			sp++
 		}
 		if sp <= 3 && pos+sp < len(line) && line[pos+sp] == '>' {
+			markerCols = append(markerCols, sp)
 			pos += sp + 1
 			if pos < len(line) && line[pos] == ' ' {
 				pos++
@@ -1366,7 +1374,7 @@ func scanBlockquotePrefix(line string) (quoteDepth int, pos int) {
 		}
 		break
 	}
-	return quoteDepth, pos
+	return quoteDepth, pos, markerCols
 }
 
 func measureLeadingIndent(s string) (cols int, bytesConsumed int) {
@@ -1457,11 +1465,21 @@ func interruptsLazyListContinuation(trimmed string) bool {
 }
 
 func (t *blockLineTracker) next(line string) blockLineInfo {
-	quoteDepth, pos := scanBlockquotePrefix(line)
+	quoteDepth, pos, markerCols := scanBlockquotePrefixCols(line)
 
 	// Pop lists nested inside deeper blockquotes that have ended.
 	for len(t.stack) > 0 && t.stack[len(t.stack)-1].quoteDepth > quoteDepth {
 		t.stack = t.stack[:len(t.stack)-1]
+	}
+	// Pop outer lists interrupted by an insufficiently indented blockquote marker per CommonMark §5.2.
+	if quoteDepth > 0 && len(t.stack) > 0 {
+		for i := 0; i < len(t.stack); i++ {
+			entry := t.stack[i]
+			if entry.quoteDepth < len(markerCols) && markerCols[entry.quoteDepth] < entry.contentIndent {
+				t.stack = t.stack[:i]
+				break
+			}
+		}
 	}
 
 	afterQuote := line[pos:]
@@ -1980,20 +1998,71 @@ func renderBookshelfGrid(opts Options, limit int, directiveB64 string) string {
 }
 
 var (
-	imgTagRe   = regexp.MustCompile(`<img\b[^>]*>`)
-	imgSrcRe   = regexp.MustCompile(`\bsrc="([^"]+)"`)
-	imgWidthRe = regexp.MustCompile(`\bwidth="[^"]*"`)
+	imgSrcRe            = regexp.MustCompile(`(?i)\bsrc="([^"]+)"`)
+	imgLoadingRe        = regexp.MustCompile(`(?i)\bloading=`)
+	imgDecodingRe       = regexp.MustCompile(`(?i)\bdecoding=`)
+	imgReferrerPolicyRe = regexp.MustCompile(`(?i)\breferrerpolicy=`)
+	imgWidthRe          = regexp.MustCompile(`(?i)\bwidth=`)
 )
 
 func enhanceImages(htmlSrc string, lookupDims func(string) (int, int, bool), firstImg *string) string {
+	if !strings.Contains(htmlSrc, "<img") && !strings.Contains(htmlSrc, "<IMG") {
+		return htmlSrc
+	}
+	var out strings.Builder
+	out.Grow(len(htmlSrc) + 64)
 	proseImgCount := 0
-	return imgTagRe.ReplaceAllStringFunc(htmlSrc, func(tag string) string {
+	skipCloseTag := ""
+
+	for i := 0; i < len(htmlSrc); {
+		if htmlSrc[i] != '<' {
+			next := strings.IndexByte(htmlSrc[i:], '<')
+			if next < 0 {
+				out.WriteString(htmlSrc[i:])
+				break
+			}
+			out.WriteString(htmlSrc[i : i+next])
+			i += next
+			continue
+		}
+		end := strings.IndexByte(htmlSrc[i:], '>')
+		if end < 0 {
+			out.WriteString(htmlSrc[i:])
+			break
+		}
+		tag := htmlSrc[i : i+end+1]
+		lowerTag := strings.ToLower(tag)
+		i += end + 1
+
+		if skipCloseTag != "" {
+			if strings.HasPrefix(lowerTag, skipCloseTag) {
+				skipCloseTag = ""
+			}
+			out.WriteString(tag)
+			continue
+		}
+		for _, rawName := range []string{"pre", "code", "script", "style", "textarea"} {
+			if hasHTMLTagOpen(lowerTag, rawName) && !strings.HasSuffix(lowerTag, "/>") {
+				skipCloseTag = "</" + rawName
+				break
+			}
+		}
+		if skipCloseTag != "" {
+			out.WriteString(tag)
+			continue
+		}
+		if !hasHTMLTagOpen(lowerTag, "img") {
+			out.WriteString(tag)
+			continue
+		}
+
 		m := imgSrcRe.FindStringSubmatch(tag)
 		if len(m) < 2 {
-			return tag
+			out.WriteString(tag)
+			continue
 		}
 		src := html.UnescapeString(m[1])
-		isEmbedCover := strings.Contains(tag, "volo-embed-book__cover")
+		isEmbedCover := strings.Contains(lowerTag, "volo-embed-book__cover")
 		if !isEmbedCover {
 			proseImgCount++
 		}
@@ -2001,13 +2070,13 @@ func enhanceImages(htmlSrc string, lookupDims func(string) (int, int, bool), fir
 			*firstImg = src
 		}
 		var attrs strings.Builder
-		if !strings.Contains(tag, "loading=") && (isEmbedCover || proseImgCount > 1) {
+		if !imgLoadingRe.MatchString(tag) && (isEmbedCover || proseImgCount > 1) {
 			attrs.WriteString(` loading="lazy"`)
 		}
-		if !strings.Contains(tag, "decoding=") {
+		if !imgDecodingRe.MatchString(tag) {
 			attrs.WriteString(` decoding="async"`)
 		}
-		if (strings.HasPrefix(src, "https://") || strings.HasPrefix(src, "http://")) && !strings.Contains(tag, "referrerpolicy=") {
+		if (strings.HasPrefix(src, "https://") || strings.HasPrefix(src, "http://")) && !imgReferrerPolicyRe.MatchString(tag) {
 			attrs.WriteString(` referrerpolicy="no-referrer"`)
 		}
 		if lookupDims != nil && !imgWidthRe.MatchString(tag) {
@@ -2016,13 +2085,20 @@ func enhanceImages(htmlSrc string, lookupDims func(string) (int, int, bool), fir
 			}
 		}
 		if attrs.Len() == 0 {
-			return tag
+			out.WriteString(tag)
+			continue
 		}
 		if strings.HasSuffix(tag, "/>") {
-			return strings.TrimSuffix(tag, "/>") + attrs.String() + " />"
+			out.WriteString(strings.TrimSuffix(tag, "/>"))
+			out.WriteString(attrs.String())
+			out.WriteString(" />")
+			continue
 		}
-		return strings.TrimSuffix(tag, ">") + attrs.String() + ">"
-	})
+		out.WriteString(strings.TrimSuffix(tag, ">"))
+		out.WriteString(attrs.String())
+		out.WriteByte('>')
+	}
+	return out.String()
 }
 
 func isSafeImageSrc(src string) bool {

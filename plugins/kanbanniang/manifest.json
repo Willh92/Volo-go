@@ -1,6 +1,6 @@
 {
   "id": "kanbanniang",
-  "version": "2.0.5",
+  "version": "2.0.6",
   "min_host_version": "0.1.0",
   "runtime": "goja",
   "entry": "main.js",
@@ -21,7 +21,6 @@
   "permissions": [
     "kv",
     "ratelimit",
-    "site:read",
     "slots:public.footer",
     "slots:admin.dashboard_card",
     "http:routes"

@@ -3,13 +3,19 @@
  * integrated with Volo-go theme tokens, dock offsets, reduced-motion, and print media.
  */
 
+:root {
+  --kbn-dock-reserve-right: 300px;
+}
+
 .volo-kbn-dock.solo-kanbanniang {
+  --kbn-width: 280px;
+  --kbn-height: 250px;
   position: fixed;
   bottom: max(16px, calc(env(safe-area-inset-bottom, 0px) + 12px));
   left: 16px;
   right: auto;
-  width: 280px;
-  height: 250px;
+  width: var(--kbn-width);
+  height: var(--kbn-height);
   z-index: 42;
   cursor: grab;
   -webkit-user-select: none;
@@ -46,8 +52,8 @@
 
 .solo-kanbanniang canvas {
   display: block;
-  width: 280px;
-  height: 250px;
+  width: 100%;
+  height: 100%;
   pointer-events: auto;
   opacity: 1;
   transition: opacity 0.22s ease;
@@ -162,7 +168,8 @@ body.has-podcast-mini .solo-kanbanniang[data-position="right"]:not([data-dragged
 }
 
 /* Dark Theme Surface Adaptation (preserve sakura.webp petal visibility — never multiply to black) */
-html[data-theme="dark"] .volo-kbn-dock.solo-kanbanniang {
+html[data-theme="dark"] .volo-kbn-dock.solo-kanbanniang,
+:root:has(> head > meta[name="color-scheme"][content="dark"]) .volo-kbn-dock.solo-kanbanniang {
   background-color: rgba(34, 40, 42, 0.72);
   background-color: color-mix(in srgb, var(--volo-raised, #242b2d) 72%, transparent);
   border-color: rgba(255, 255, 255, 0.14);
@@ -170,14 +177,15 @@ html[data-theme="dark"] .volo-kbn-dock.solo-kanbanniang {
   background-blend-mode: normal;
 }
 
-html[data-theme="dark"] .volo-kbn-dock.solo-kanbanniang.has-bg {
+html[data-theme="dark"] .volo-kbn-dock.solo-kanbanniang.has-bg,
+:root:has(> head > meta[name="color-scheme"][content="dark"]) .volo-kbn-dock.solo-kanbanniang.has-bg {
   background-color: rgba(34, 40, 42, 0.52);
   background-color: color-mix(in srgb, var(--volo-raised, #242b2d) 52%, transparent);
   background-blend-mode: normal;
 }
 
 @media (prefers-color-scheme: dark) {
-  html:not([data-theme="light"]) .volo-kbn-dock.solo-kanbanniang {
+  html:not([data-theme="light"]):not(:has(> head > meta[name="color-scheme"][content="light"])) .volo-kbn-dock.solo-kanbanniang {
     background-color: rgba(34, 40, 42, 0.72);
     background-color: color-mix(in srgb, var(--volo-raised, #242b2d) 72%, transparent);
     border-color: rgba(255, 255, 255, 0.14);
@@ -185,7 +193,7 @@ html[data-theme="dark"] .volo-kbn-dock.solo-kanbanniang.has-bg {
     background-blend-mode: normal;
   }
 
-  html:not([data-theme="light"]) .volo-kbn-dock.solo-kanbanniang.has-bg {
+  html:not([data-theme="light"]):not(:has(> head > meta[name="color-scheme"][content="light"])) .volo-kbn-dock.solo-kanbanniang.has-bg {
     background-color: rgba(34, 40, 42, 0.52);
     background-color: color-mix(in srgb, var(--volo-raised, #242b2d) 52%, transparent);
     background-blend-mode: normal;
@@ -235,16 +243,16 @@ html[data-theme="dark"] .volo-kbn-dock.solo-kanbanniang.has-bg {
   place-items: center;
   width: 28px;
   height: 28px;
-  padding: 5px;
+  padding: 4px;
   margin: 0;
-  border: 0;
+  border: 1px solid var(--volo-line, rgba(0, 0, 0, 0.1));
   border-radius: 7px;
   background: var(--volo-surface, #ffffff);
   color: var(--volo-muted, #52665a);
   box-shadow: 0 1px 4px rgba(0, 0, 0, 0.14);
   cursor: pointer;
   touch-action: manipulation;
-  transition: color 0.16s ease, background-color 0.16s ease, transform 0.14s ease;
+  transition: color 0.16s ease, border-color 0.16s ease, background-color 0.16s ease, transform 0.14s ease;
 }
 
 .solo-kanbanniang__tool button:hover,
@@ -279,6 +287,7 @@ html[data-theme="dark"] .volo-kbn-dock.solo-kanbanniang.has-bg {
   bottom: calc(100% + 6px);
   top: auto;
   left: 0;
+  translate: var(--kbn-tip-shift-x, 0px) 0;
   width: 260px;
   max-width: calc(100vw - 32px);
   max-height: calc(1.55em * 4 + 16px);
@@ -305,7 +314,14 @@ html[data-theme="dark"] .volo-kbn-dock.solo-kanbanniang.has-bg {
   transition: opacity 0.2s ease, visibility 0.2s ease;
 }
 
+.solo-kanbanniang.volo-kbn-right .solo-kanbanniang__tip,
+.solo-kanbanniang[data-position="right"] .solo-kanbanniang__tip {
+  left: auto;
+  right: 0;
+}
+
 .solo-kanbanniang__tip.is-visible {
+  opacity: 1;
   visibility: visible;
 }
 
@@ -385,7 +401,7 @@ html:has(.lightbox-overlay.is-open) .solo-kanbanniang,
 html:has(#volo-lightbox.is-open) .solo-kanbanniang,
 html:has([data-search-modal]:not([hidden])) .solo-kanbanniang,
 html:has(#volo-search-modal:not([hidden])) .solo-kanbanniang,
-html:has(#volo-toc-drawer:not([hidden])) .solo-kanbanniang,
+html:not([data-volo-skin="volo-journal"]):has(#volo-toc-drawer:not([hidden])) .solo-kanbanniang,
 html:has(.studio-reader-drawer.is-open) .solo-kanbanniang,
 html:has(.volo-comment-composer.is-open) .solo-kanbanniang,
 html:has(dialog[open]) .solo-kanbanniang,
@@ -396,13 +412,21 @@ html:has(.lightbox-overlay.is-open) .solo-kanbanniang-summon,
 html:has(#volo-lightbox.is-open) .solo-kanbanniang-summon,
 html:has([data-search-modal]:not([hidden])) .solo-kanbanniang-summon,
 html:has(#volo-search-modal:not([hidden])) .solo-kanbanniang-summon,
-html:has(#volo-toc-drawer:not([hidden])) .solo-kanbanniang-summon,
+html:not([data-volo-skin="volo-journal"]):has(#volo-toc-drawer:not([hidden])) .solo-kanbanniang-summon,
 html:has(.studio-reader-drawer.is-open) .solo-kanbanniang-summon,
 html:has(.volo-comment-composer.is-open) .solo-kanbanniang-summon,
 html:has(dialog[open]) .solo-kanbanniang-summon,
 body.modal-open .solo-kanbanniang-summon {
   visibility: hidden;
   pointer-events: none;
+}
+
+@media (max-width: 1023px) {
+  html[data-volo-skin="volo-journal"]:has(#volo-toc-drawer:not([hidden])) .solo-kanbanniang,
+  html[data-volo-skin="volo-journal"]:has(#volo-toc-drawer:not([hidden])) .solo-kanbanniang-summon {
+    visibility: hidden;
+    pointer-events: none;
+  }
 }
 
 /* Compact Corner Restore Pill (.solo-kanbanniang-summon) */
@@ -502,7 +526,8 @@ body.has-podcast-mini .solo-kanbanniang-summon[data-position="right"] {
   }
 }
 
-html[data-theme="dark"] .solo-kanbanniang-summon {
+html[data-theme="dark"] .solo-kanbanniang-summon,
+:root:has(> head > meta[name="color-scheme"][content="dark"]) .solo-kanbanniang-summon {
   background: rgba(34, 40, 42, 0.88);
   background: color-mix(in srgb, var(--volo-raised, #242b2d) 88%, transparent);
   border-color: var(--volo-line, rgba(255, 255, 255, 0.16));
@@ -510,7 +535,7 @@ html[data-theme="dark"] .solo-kanbanniang-summon {
 }
 
 @media (prefers-color-scheme: dark) {
-  html:not([data-theme="light"]) .solo-kanbanniang-summon {
+  html:not([data-theme="light"]):not(:has(> head > meta[name="color-scheme"][content="light"])) .solo-kanbanniang-summon {
     background: rgba(34, 40, 42, 0.88);
     background: color-mix(in srgb, var(--volo-raised, #242b2d) 88%, transparent);
     border-color: var(--volo-line, rgba(255, 255, 255, 0.16));
@@ -525,16 +550,45 @@ html[data-theme="dark"] .solo-kanbanniang-summon {
   }
 }
 
+@media (max-width: 640px) {
+  .volo-kbn-dock.solo-kanbanniang {
+    --kbn-width: 210px;
+    --kbn-height: 188px;
+  }
+  .solo-kanbanniang.volo-kbn-left:not([data-dragged="1"]),
+  .solo-kanbanniang[data-position="left"]:not([data-dragged="1"]) {
+    left: 12px;
+  }
+  .solo-kanbanniang.volo-kbn-right:not([data-dragged="1"]),
+  .solo-kanbanniang[data-position="right"]:not([data-dragged="1"]) {
+    right: 12px;
+    bottom: calc(max(14px, env(safe-area-inset-bottom, 0px)) + 100px);
+  }
+  .solo-kanbanniang__tip {
+    width: 224px;
+    max-width: calc(100vw - 24px);
+    margin: 0 4px;
+  }
+}
+
+@media (max-width: 420px) {
+  .volo-kbn-dock.solo-kanbanniang {
+    --kbn-width: 176px;
+    --kbn-height: 158px;
+  }
+}
+
 @media (prefers-reduced-motion: reduce) {
   .solo-kanbanniang {
     background-image: none !important;
   }
+  .solo-kanbanniang__retry:active,
   .solo-kanbanniang__tool button:active,
   .solo-kanbanniang-summon:active {
     transform: none;
   }
   .solo-kanbanniang-summon {
-    transition: none;
+    transition: color 0.16s ease, border-color 0.16s ease, background-color 0.16s ease;
   }
 }
 

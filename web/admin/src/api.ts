@@ -8,9 +8,24 @@ import {
   t,
   tOpt,
 } from "./i18n";
+import { extractColonDetail, inferToastKind, trimEndChars, type ToastKind } from "./toastKind";
+
+export { trimEndChars } from "./toastKind";
+export { safeHref, safeHttpUrl, safeMediaSrc } from "./urlSanitize";
+export type { ToastKind };
+
+export const ACCENT_OPTIONS: ReadonlyArray<{ id: string; swatch: string }> = [
+  { id: "forest", swatch: "#246b51" },
+  { id: "ocean", swatch: "#2d6583" },
+  { id: "teal", swatch: "#286c70" },
+  { id: "amber", swatch: "#855c27" },
+  { id: "plum", swatch: "#70517d" },
+  { id: "rose", swatch: "#87525f" },
+];
 
 export interface BootConfig {
   mode: "console" | "setup";
+  version?: string;
   admin_path: string;
   base_admin_path?: string;
   public_url: string;
@@ -40,7 +55,7 @@ export function sanitizeAdminPath(raw?: string): string {
   const trimmed = String(raw || "").trim();
   if (!trimmed) return "/console";
   const withSlash = trimmed.startsWith("/") ? trimmed : `/${trimmed}`;
-  const clean = withSlash.length > 1 ? withSlash.replace(/\/+$/, "") : withSlash;
+  const clean = withSlash.length > 1 ? trimEndChars(withSlash, "/") : withSlash;
   if (clean === "/" || !/^\/[A-Za-z0-9/_-]+$/.test(clean) || clean.includes("//") || clean.includes("..")) {
     return "/console";
   }
@@ -76,11 +91,11 @@ export function readBootConfig(): BootConfig {
 }
 
 export const bootConfig = readBootConfig();
+export const appVersion = (bootConfig.version || "").trim() || "v1.0.4";
 if (bootConfig.locales) {
   registerExternalLocales(bootConfig.locales);
 }
 
-export type ToastKind = "ok" | "err" | "warn";
 export interface ToastItem {
   id: number;
   text: string;
@@ -103,6 +118,9 @@ export const toastSig = signal<ToastItem | null>(null);
 export const confirmSig = signal<(ConfirmOptions & { resolve: (ok: boolean) => void }) | null>(null);
 export const dirtyEditorSig = signal<boolean>(false);
 export const busyCountSig = signal<number>(0);
+const decBusy = () => {
+  busyCountSig.value = Math.max(0, busyCountSig.value - 1);
+};
 function readInitialThemeMode(): string {
   try {
     const shared = localStorage.getItem("volo_theme_mode");
@@ -173,41 +191,22 @@ let toastTimer: number | undefined;
 let toastCloseTimer: number | undefined;
 let toastSeq = 0;
 
-function inferToastKind(msg: string): ToastKind {
-  if (
-    /(HTTP \d{3}|fail|error|invalid|denied|forbid|unauthorized|too many|rate limit|too large|unsupported|mismatch|expired|aborted|timeout|cannot|unable|失败|错误|无效|拒绝|无法|未能|不可用|受限|异常|超时|必填|不能为空|未登录|未授权|权限不足|频繁|过大|不支持|不匹配|过期|中断|失敗|錯誤|無效|拒絕|無法|異常|逾時|過大|頻繁|不支援|未授權|權限不足)/i.test(
-      msg
-    )
-  ) {
-    return "err";
-  }
-  if (/(not detected|no .* device|未检测到|未偵測到)/i.test(msg)) {
-    return "warn";
-  }
-  return "ok";
-}
-
 function scheduleToastDismiss(delayMs: number) {
-  if (toastTimer) window.clearTimeout(toastTimer);
-  toastTimer = window.setTimeout(() => {
-    dismissToast();
-  }, delayMs);
+  clearTimeout(toastTimer);
+  toastTimer = window.setTimeout(dismissToast, delayMs);
 }
 
 export function showToast(msg: string, kind?: ToastKind) {
   if (!msg) return;
-  if (toastTimer) window.clearTimeout(toastTimer);
-  if (toastCloseTimer) window.clearTimeout(toastCloseTimer);
+  clearTimeout(toastTimer);
+  clearTimeout(toastCloseTimer);
   const resolvedKind = kind || inferToastKind(msg);
   toastSig.value = { id: ++toastSeq, text: msg, kind: resolvedKind, closing: false };
   scheduleToastDismiss(resolvedKind === "err" ? 4600 : resolvedKind === "warn" ? 4200 : 3400);
 }
 
 export function pauseToast() {
-  if (toastTimer) {
-    window.clearTimeout(toastTimer);
-    toastTimer = undefined;
-  }
+  clearTimeout(toastTimer);
 }
 
 export function resumeToast() {
@@ -216,14 +215,11 @@ export function resumeToast() {
 }
 
 export function dismissToast() {
-  if (toastTimer) {
-    window.clearTimeout(toastTimer);
-    toastTimer = undefined;
-  }
+  clearTimeout(toastTimer);
   const cur = toastSig.value;
   if (!cur || cur.closing) return;
   toastSig.value = { ...cur, closing: true };
-  if (toastCloseTimer) window.clearTimeout(toastCloseTimer);
+  clearTimeout(toastCloseTimer);
   toastCloseTimer = window.setTimeout(() => {
     toastSig.value = null;
   }, 160);
@@ -255,8 +251,6 @@ export function applyThemeAttributes(mode: string, accent: string, persistMode =
     }
   }
 }
-
-export const applyConsoleAppearance = applyThemeAttributes;
 
 export function toggleEffectiveTheme(): "light" | "dark" {
   const next = resolveEffectiveTheme(themeModeSig.value) === "dark" ? "light" : "dark";
@@ -365,49 +359,50 @@ const EXACT_ADMIN_ERROR_KEYS: Record<string, string | number> = {
   "upload aborted": "api.err_upload_aborted",
 };
 
+const ADMIN_ERROR_PREFIX_KEYS: Record<string, string | number> = {
+  settings: "api.err_settings_prefix",
+  validation: "api.err_validation_prefix",
+  database: "api.err_db_prefix",
+  backup: "api.err_backup_prefix",
+  plugin: "api.err_plugin_prefix",
+  theme: "api.err_theme_prefix",
+};
+
 export function localizeAdminError(rawMsg: string): string {
   const trimmed = String(rawMsg || "").trim();
   if (!trimmed) return t("api.err_internal");
 
-  const norm = trimmed.replace(/[.!]+$/, "").trim().toLowerCase();
+  const norm = trimEndChars(trimmed, ".!").trim().toLowerCase();
   const exactKey = EXACT_ADMIN_ERROR_KEYS[norm];
   if (exactKey !== undefined) {
     const val = tOpt(exactKey);
     if (val) return val;
   }
 
-  const authMatch = /^auth:\s*(.+)$/i.exec(trimmed);
-  if (authMatch && authMatch[1]) {
-    const inner = localizeAdminError(authMatch[1]);
-    if (inner !== authMatch[1].trim()) return inner;
-  }
-
-  const httpMatch = /^http\s+(\d{3})$/i.exec(trimmed);
-  if (httpMatch) {
-    const code = httpMatch[1];
-    if (code === "401") return t("api.err_unauthorized");
-    if (code === "403") return t("api.err_forbidden");
-    if (code === "404") return t("api.err_not_found");
-    if (code === "413") return t("api.err_file_too_large");
-    if (code === "415") return t("api.err_unsupported_media");
-    if (code === "429") return t("api.err_rate_limit");
-    return t("api.err_http_status", { status: code });
-  }
-
-  const prefixRules: Array<[RegExp, string | number]> = [
-    [/^settings:\s*(.+)$/i, "api.err_settings_prefix"],
-    [/^validation(?:\s+failed)?:\s*(.+)$/i, "api.err_validation_prefix"],
-    [/^database:\s*(.+)$/i, "api.err_db_prefix"],
-    [/^backup:\s*(.+)$/i, "api.err_backup_prefix"],
-    [/^plugin:\s*(.+)$/i, "api.err_plugin_prefix"],
-    [/^theme:\s*(.+)$/i, "api.err_theme_prefix"],
-  ];
-  for (const [re, key] of prefixRules) {
-    const m = re.exec(trimmed);
-    if (m && m[1]) {
-      const inner = localizeAdminError(m[1]);
-      const val = tOpt(key, { detail: inner });
-      if (val) return val;
+  const colonHit = extractColonDetail(trimmed);
+  if (colonHit) {
+    const [prefix, detail] = colonHit;
+    if (prefix === "auth") {
+      const inner = localizeAdminError(detail);
+      if (inner !== detail) return inner;
+    } else {
+      const key = ADMIN_ERROR_PREFIX_KEYS[prefix];
+      if (key !== undefined) {
+        const val = tOpt(key, { detail: localizeAdminError(detail) });
+        if (val) return val;
+      }
+    }
+  } else {
+    const httpMatch = /^http\s+(\d{3})$/i.exec(trimmed);
+    if (httpMatch) {
+      const code = httpMatch[1];
+      if (code === "401") return t("api.err_unauthorized");
+      if (code === "403") return t("api.err_forbidden");
+      if (code === "404") return t("api.err_not_found");
+      if (code === "413") return t("api.err_file_too_large");
+      if (code === "415") return t("api.err_unsupported_media");
+      if (code === "429") return t("api.err_rate_limit");
+      return t("api.err_http_status", { status: code });
     }
   }
 
@@ -463,7 +458,7 @@ export async function apiFetch<T = any>(
     headers.set("X-CSRF-Token", csrfTokenSig.value);
   }
   const trackBusy = !url.endsWith("/articles/preview") && !url.endsWith("/render/preview");
-  if (trackBusy) busyCountSig.value = busyCountSig.value + 1;
+  if (trackBusy) busyCountSig.value++;
   try {
     const res = await fetch(url, {
       ...opts,
@@ -479,12 +474,12 @@ export async function apiFetch<T = any>(
       payload = await res.text().catch(() => "");
     }
     if (!res.ok) {
-      const rawMsg = (payload && typeof payload === "object" && payload.error) || `HTTP ${res.status}`;
+      const rawMsg = payload?.error || `HTTP ${res.status}`;
       throw new ApiError(res.status, localizeAdminError(String(rawMsg)), payload);
     }
     return payload as T;
   } finally {
-    if (trackBusy) busyCountSig.value = Math.max(0, busyCountSig.value - 1);
+    if (trackBusy) decBusy();
   }
 }
 
@@ -535,17 +530,14 @@ export async function refreshMe(): Promise<StaffUser | null> {
 export function b64urlToBytes(b64url: string): ArrayBuffer {
   const pad = "=".repeat((4 - (b64url.length % 4)) % 4);
   const b64 = (b64url + pad).replace(/-/g, "+").replace(/_/g, "/");
-  const bin = atob(b64);
-  const out = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
-  return out.buffer as ArrayBuffer;
+  return Uint8Array.from(atob(b64), (c) => c.charCodeAt(0)).buffer as ArrayBuffer;
 }
 
 export function bytesToB64url(buf: ArrayBuffer): string {
   const bytes = new Uint8Array(buf);
   let bin = "";
   for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
-  return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+  return trimEndChars(btoa(bin).replace(/\+/g, "-").replace(/\//g, "_"), "=");
 }
 
 // IndexedDB Crash-Safe Draft Vault (`volo_drafts_v1`)
@@ -579,7 +571,7 @@ export function uploadWithProgress<T = any>(
   if (signal?.aborted) {
     return Promise.reject(new ApiError(499, localizeAdminError("upload aborted"), { canceled: true }));
   }
-  busyCountSig.value = busyCountSig.value + 1;
+  busyCountSig.value++;
   if (onProgress) onProgress(0);
   return new Promise<T>((resolve, reject) => {
     const xhr = new XMLHttpRequest();
@@ -608,7 +600,7 @@ export function uploadWithProgress<T = any>(
     }
     xhr.onload = () => {
       cleanup();
-      busyCountSig.value = Math.max(0, busyCountSig.value - 1);
+      decBusy();
       const ct = xhr.getResponseHeader("Content-Type") || "";
       let payload: any = null;
       if (ct.includes("application/json")) {
@@ -624,18 +616,18 @@ export function uploadWithProgress<T = any>(
         if (onProgress) onProgress(100);
         resolve(payload as T);
       } else {
-        const rawMsg = (payload && typeof payload === "object" && payload.error) || `HTTP ${xhr.status || 0}`;
+        const rawMsg = payload?.error || `HTTP ${xhr.status || 0}`;
         reject(new ApiError(xhr.status || 0, localizeAdminError(String(rawMsg)), payload));
       }
     };
     xhr.onerror = () => {
       cleanup();
-      busyCountSig.value = Math.max(0, busyCountSig.value - 1);
+      decBusy();
       reject(new ApiError(0, localizeAdminError("network error")));
     };
     xhr.onabort = () => {
       cleanup();
-      busyCountSig.value = Math.max(0, busyCountSig.value - 1);
+      decBusy();
       reject(new ApiError(499, localizeAdminError("upload aborted"), { canceled: true }));
     };
     if (signal?.aborted) {
@@ -667,78 +659,32 @@ export interface LocalDraft {
   translation_group?: string;
 }
 
-export async function saveLocalDraft(key: string, draft: LocalDraft): Promise<void> {
+async function runDraftTx<T>(
+  mode: IDBTransactionMode,
+  fn: (store: IDBObjectStore) => IDBRequest | void,
+  fallback: T
+): Promise<T> {
   try {
     const db = await openDraftDB();
-    await new Promise<void>((resolve, reject) => {
-      const tx = db.transaction(DRAFT_STORE, "readwrite");
-      tx.objectStore(DRAFT_STORE).put(draft, key);
-      tx.oncomplete = () => {
-        db.close();
-        resolve();
-      };
-      tx.onerror = () => {
-        db.close();
-        reject(tx.error);
-      };
-      tx.onabort = () => {
-        db.close();
-        reject(tx.error);
-      };
+    return await new Promise<T>((resolve) => {
+      const tx = db.transaction(DRAFT_STORE, mode);
+      let out = fallback;
+      const req = fn(tx.objectStore(DRAFT_STORE));
+      if (req) req.onsuccess = () => { out = (req.result as T) || fallback; };
+      const done = (v: T) => { db.close(); resolve(v); };
+      tx.oncomplete = () => done(out);
+      tx.onerror = tx.onabort = () => done(fallback);
     });
   } catch {
-    // Ignore private-browsing IndexedDB quota restrictions
+    return fallback;
   }
 }
 
-export async function loadLocalDraft(key: string): Promise<LocalDraft | null> {
-  try {
-    const db = await openDraftDB();
-    return await new Promise<LocalDraft | null>((resolve) => {
-      const tx = db.transaction(DRAFT_STORE, "readonly");
-      const req = tx.objectStore(DRAFT_STORE).get(key);
-      let out: LocalDraft | null = null;
-      req.onsuccess = () => {
-        out = (req.result as LocalDraft) || null;
-      };
-      tx.oncomplete = () => {
-        db.close();
-        resolve(out);
-      };
-      tx.onerror = () => {
-        db.close();
-        resolve(null);
-      };
-      tx.onabort = () => {
-        db.close();
-        resolve(null);
-      };
-    });
-  } catch {
-    return null;
-  }
-}
+export const saveLocalDraft = (key: string, draft: LocalDraft): Promise<void> =>
+  runDraftTx<void>("readwrite", (s) => { s.put(draft, key); }, undefined);
 
-export async function clearLocalDraft(key: string): Promise<void> {
-  try {
-    const db = await openDraftDB();
-    await new Promise<void>((resolve) => {
-      const tx = db.transaction(DRAFT_STORE, "readwrite");
-      tx.objectStore(DRAFT_STORE).delete(key);
-      tx.oncomplete = () => {
-        db.close();
-        resolve();
-      };
-      tx.onerror = () => {
-        db.close();
-        resolve();
-      };
-      tx.onabort = () => {
-        db.close();
-        resolve();
-      };
-    });
-  } catch {
-    // No-op
-  }
-}
+export const loadLocalDraft = (key: string): Promise<LocalDraft | null> =>
+  runDraftTx<LocalDraft | null>("readonly", (s) => s.get(key), null);
+
+export const clearLocalDraft = (key: string): Promise<void> =>
+  runDraftTx<void>("readwrite", (s) => { s.delete(key); }, undefined);

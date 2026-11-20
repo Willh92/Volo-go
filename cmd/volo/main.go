@@ -46,8 +46,8 @@ import (
 	"github.com/Willh92/Volo-go/pkg/plugin"
 )
 
-// Version can be overridden at link time via -ldflags="-X main.Version=v1.0.2".
-var Version = "v1.0.2"
+// Version can be overridden at link time via -ldflags="-X main.Version=v1.0.4".
+var Version = "v1.0.4"
 
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

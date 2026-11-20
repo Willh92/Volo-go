@@ -1,5 +1,5 @@
 import { useEffect, useState } from "preact/hooks";
-import { apiFetch, showToast, storageDriverSig, uploadWithProgress } from "../api";
+import { apiFetch, safeMediaSrc, showToast, storageDriverSig, uploadWithProgress } from "../api";
 import { t } from "../i18n";
 import {
   AnimatedModal,
@@ -302,7 +302,8 @@ export function MediaLibraryModal({
               const isImg = (m.mime_type || "").startsWith("image/");
               const isVideo = (m.mime_type || "").startsWith("video/");
               const isAudio = (m.mime_type || "").startsWith("audio/");
-              const isBroken = Boolean(brokenIds[m.id]);
+              const mediaSrc = safeMediaSrc(m.public_url);
+              const isBroken = Boolean(brokenIds[m.id]) || !mediaSrc;
               const isSmallImg = m.width > 0 && m.width <= 160 && m.height > 0 && m.height <= 140;
               return (
                 <button
@@ -317,7 +318,7 @@ export function MediaLibraryModal({
                   <div class="volo-media-picker-thumb">
                     {isImg && !isBroken ? (
                       <img
-                        src={m.public_url}
+                        src={mediaSrc}
                         alt={m.alt_text || m.original_name}
                         loading="lazy"
                         decoding="async"
@@ -326,7 +327,7 @@ export function MediaLibraryModal({
                       />
                     ) : isVideo && !isBroken ? (
                       <video
-                        src={m.public_url}
+                        src={mediaSrc}
                         preload="metadata"
                         muted
                         playsInline

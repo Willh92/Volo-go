@@ -450,10 +450,15 @@ func newWebDAVClient(rawBase string, safeDialer *security.OutboundSafeDialer, ti
 	if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" {
 		return nil, nil, fmt.Errorf("invalid webdav_url %q", base)
 	}
-	if safeDialer != nil {
-		if _, err := safeDialer.ValidateOutboundURL(u.String()); err != nil {
-			return nil, nil, err
+	if safeDialer == nil {
+		dialTimeout := timeout
+		if dialTimeout <= 0 || dialTimeout > 15*time.Second {
+			dialTimeout = 15 * time.Second
 		}
+		safeDialer = &security.OutboundSafeDialer{Timeout: dialTimeout}
+	}
+	if _, err := safeDialer.ValidateOutboundURL(u.String()); err != nil {
+		return nil, nil, err
 	}
 
 	tr := &http.Transport{
@@ -462,9 +467,7 @@ func newWebDAVClient(rawBase string, safeDialer *security.OutboundSafeDialer, ti
 		},
 		TLSHandshakeTimeout:   10 * time.Second,
 		ResponseHeaderTimeout: 30 * time.Second,
-	}
-	if safeDialer != nil {
-		tr.DialContext = safeDialer.DialContext
+		DialContext:           safeDialer.DialContext,
 	}
 	client := &http.Client{
 		Transport: tr,
@@ -476,9 +479,13 @@ func newWebDAVClient(rawBase string, safeDialer *security.OutboundSafeDialer, ti
 			if len(via) > 0 && strings.EqualFold(via[len(via)-1].URL.Scheme, "https") && !strings.EqualFold(req.URL.Scheme, "https") {
 				return errors.New("webdav: refusing insecure https to http scheme downgrade redirect")
 			}
-			if safeDialer != nil {
-				_, vErr := safeDialer.ValidateOutboundURL(req.URL.String())
+			if _, vErr := safeDialer.ValidateOutboundURL(req.URL.String()); vErr != nil {
 				return vErr
+			}
+			if len(via) > 0 && (!strings.EqualFold(via[0].URL.Host, req.URL.Host) || !strings.EqualFold(via[len(via)-1].URL.Host, req.URL.Host)) {
+				req.Header.Del("Authorization")
+				req.Header.Del("Proxy-Authorization")
+				req.Header.Del("Cookie")
 			}
 			return nil
 		},

@@ -6,6 +6,20 @@ All notable changes to `Volo-go` are documented in this file. Format follows [Ke
 
 ---
 
+## [1.0.4] - 2026-11-20
+
+### Added
+- **Consolidated Extensions Release (`extensions-v1.0.4`) & Locale Parity**: Updated official extensions under the unified `extensions-v1.0.4` bundle (`kanbanniang v2.0.6`, `volo-journal v1.1.2`, `zh-TW v1.0.1`, `ja-JP v1.0.1`, and `sensitive-words v1.1.0`) with pruned 2,181-key locale parity across all 4 languages; added an inline error banner with 1-click Retry recovery in `AboutHelpWorkspace` when `/api/admin/about/project-info` fails, plus bounded server-side pagination & query filtering across `/api/admin/categories`, `/api/admin/nav`, `/categories`, `/links`, and `/books/{slug}` (`?cpage=`).
+
+### Changed & Optimized
+- **Backend Perf, Lazy Admin SPA Chunking & Size Restraint**: Deduplicated orphan media scanning via `singleflight`/mutex revision checks (`collectMediaRefCountsCached`), optimized `RenderArticleDetail` metadata caching and composite DB indexes, and converted `lazyWorkspaces.ts` & `SetupWizard` to true dynamic `import()` chunks — keeping the embedded Admin SPA at `358,235 B` (`~349.8 KiB`, `< 358,400 B`) and static `linux/amd64` binary at `20.46 MiB` (`< 22.00 MiB`).
+- **Themes, `kanbanniang v2.0.6` & `volo-journal v1.1.2` Polish**: Aligned `>=1440px` `wide` layout widths, fixed `book_reader.html` volume classes/chevron SVG and `volo-studio.css` `.chroma .line` horizontal highlight scrolling, prevented desktop `.volo-toc-drawer` vs right-docked `kanbanniang` overlap, lossless-deduplicated `ShizukuTalk` textures (`~34.94 MiB`), and fixed multi-row `.lntable` code copy newlines & comment wrapping.
+
+### Security & Fixes
+- **CM6 `IR -> WYSIWYG` Hydration Race & CodeQL Zero-Alert Remediation**: Fixed the `IR -> WYSIWYG` hydration wipe race in `CM6EditorCore.tsx` via `wysiwygHydrating` locking and `previewSourceRef` cache validation; replaced `DOMParser.parseFromString` on untrusted clipboard HTML with a pure-TS non-DOM HTML tokenizer/tree parser (`clipboardHtmlParser.ts`); fixed empty/null theme config patches wiping saved theme settings & secrets, rejected JSON `null` bodies on `PATCH /api/admin/settings/{domain}`, hardened `pkg/plugin` KV `Delete`/`ClearPluginKV` ordering vs `IncrBuffered` and `wrapGoFuncVal` interrupt propagation inside JS `try/catch`, enforced `OutboundSafeDialer` fallbacks, and cleared all 7 CodeQL findings (`go`, `javascript-typescript`, `actions`) to zero alerts.
+
+---
+
 ## [1.0.3] - 2026-11-15
 
 ### Added

@@ -12,9 +12,19 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/Willh92/Volo-go/internal/content"
 	"github.com/Willh92/Volo-go/internal/domain"
 	"github.com/Willh92/Volo-go/internal/render"
 )
+
+// BookTOCWindow holds a bounded chapter slice and pagination metadata for book_reader.html.
+type BookTOCWindow struct {
+	Chapters      []domain.BookChapter
+	TotalChapters int
+	Page          int
+	TotalPages    int
+	Pagination    PaginationView
+}
 
 // LoadSiteLocation resolves an IANA timezone or UTC/GMT offset with caching, falling back safely to time.UTC.
 func LoadSiteLocation(tz string) *time.Location {
@@ -184,6 +194,10 @@ func (e *Engine) templateFuncMap(themeID string, assets map[string]cachedAsset, 
 		"pageURL": func(rawPathAndQuery string, page int) string {
 			return buildThemePageURL(rawPathAndQuery, page)
 		},
+		"cpageURL": func(rawPathAndQuery string, page int) string {
+			return buildThemeCPageURL(rawPathAndQuery, page)
+		},
+		"bookTOCWindow": buildBookTOCWindow,
 		"safeHTML": func(s string) template.HTML {
 			return template.HTML(s)
 		},
@@ -603,6 +617,142 @@ func buildThemePageURL(rawPathAndQuery string, page int) string {
 		out += "#" + u.EscapedFragment()
 	}
 	return out
+}
+
+func buildThemeCPageURL(rawPathAndQuery string, page int) string {
+	cleaned := strings.TrimSpace(stripThemeASCIIControls(rawPathAndQuery))
+	if cleaned == "" {
+		cleaned = "/"
+	}
+	u, err := url.Parse(cleaned)
+	if err != nil {
+		if page <= 1 {
+			return "/"
+		}
+		return "/?cpage=" + strconv.Itoa(page)
+	}
+	basePath := u.Path
+	if basePath == "" {
+		basePath = "/"
+	}
+	q := u.Query()
+	if page <= 1 && strings.TrimSpace(q.Get("ch")) == "" {
+		q.Del("cpage")
+	} else {
+		if page < 1 {
+			page = 1
+		}
+		q.Set("cpage", strconv.Itoa(page))
+	}
+	out := basePath
+	if enc := q.Encode(); enc != "" {
+		out += "?" + enc
+	}
+	if u.Fragment != "" {
+		out += "#" + u.EscapedFragment()
+	}
+	return out
+}
+
+func buildBookTOCWindow(bk content.BookDetailView, active *domain.BookChapter, rawQuery string, page int, totalPages int, pagination PaginationView) BookTOCWindow {
+	const tocPageSize = 100
+	totalChaps := len(bk.FlatChapters)
+	if bk.ChapterCount > totalChaps {
+		totalChaps = bk.ChapterCount
+	}
+	if pagination.TotalItems > totalChaps {
+		totalChaps = pagination.TotalItems
+	}
+	if totalPages > 1 {
+		curPage := page
+		if curPage < 1 {
+			curPage = 1
+		}
+		if curPage > totalPages {
+			curPage = totalPages
+		}
+		pg := pagination
+		if len(pg.PageNumbers) == 0 {
+			pg = BuildPagination(curPage, totalPages, tocPageSize, totalChaps, 5)
+		}
+		return BookTOCWindow{
+			Chapters:      bk.FlatChapters,
+			TotalChapters: totalChaps,
+			Page:          curPage,
+			TotalPages:    totalPages,
+			Pagination:    pg,
+		}
+	}
+	n := len(bk.FlatChapters)
+	if n <= tocPageSize {
+		return BookTOCWindow{
+			Chapters:      bk.FlatChapters,
+			TotalChapters: totalChaps,
+			Page:          1,
+			TotalPages:    1,
+		}
+	}
+	tp := (n + tocPageSize - 1) / tocPageSize
+	cp := 0
+	if rawQuery != "" {
+		if qv, err := url.ParseQuery(rawQuery); err == nil {
+			if rawCP := strings.TrimSpace(qv.Get("cpage")); rawCP != "" {
+				if parsed, pErr := strconv.Atoi(rawCP); pErr == nil && parsed >= 1 {
+					cp = parsed
+				}
+			}
+		}
+	}
+	if cp <= 0 && active != nil && active.ID != "" {
+		for i, ch := range bk.FlatChapters {
+			if ch.ID == active.ID {
+				cp = i/tocPageSize + 1
+				break
+			}
+		}
+	}
+	if cp < 1 {
+		cp = 1
+	}
+	if cp > tp {
+		cp = tp
+	}
+	start := (cp - 1) * tocPageSize
+	end := start + tocPageSize
+	if end > n {
+		end = n
+	}
+	window := bk.FlatChapters[start:end]
+	if start > 0 && len(window) > 0 {
+		hasGrp, minGrpDepth := false, 0
+		for _, ch := range bk.FlatChapters {
+			if strings.TrimSpace(ch.URL) == "" {
+				if !hasGrp || ch.Depth < minGrpDepth {
+					minGrpDepth = ch.Depth
+					hasGrp = true
+				}
+			}
+		}
+		first := window[0]
+		if hasGrp && !(strings.TrimSpace(first.URL) == "" && first.Depth <= minGrpDepth) {
+			for i := start - 1; i >= 0; i-- {
+				if strings.TrimSpace(bk.FlatChapters[i].URL) == "" && bk.FlatChapters[i].Depth <= minGrpDepth {
+					carried := make([]domain.BookChapter, 0, 1+len(window))
+					carried = append(carried, bk.FlatChapters[i])
+					carried = append(carried, window...)
+					window = carried
+					break
+				}
+			}
+		}
+	}
+	return BookTOCWindow{
+		Chapters:      window,
+		TotalChapters: totalChaps,
+		Page:          cp,
+		TotalPages:    tp,
+		Pagination:    BuildPagination(cp, tp, tocPageSize, n, 5),
+	}
 }
 
 func sanitizeStyleContent(css string) string {

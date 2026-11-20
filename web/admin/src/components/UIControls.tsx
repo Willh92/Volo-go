@@ -1,7 +1,7 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "preact/hooks";
 import { createPortal } from "preact";
 import type { CSSProperties, ComponentChildren } from "preact";
-import { apiFetch, confirmSig, resolveConfirm, showToast } from "../api";
+import { apiFetch, confirmSig, resolveConfirm, safeHref, safeMediaSrc, showToast } from "../api";
 import type { LocaleOption } from "../i18n";
 import { t } from "../i18n";
 
@@ -59,6 +59,124 @@ export const POPOVER_CLOSE_EVENT = "volo:close-popovers";
 export function notifyClosePopovers(exceptId = 0, immediate = false) {
   if (typeof window === "undefined") return;
   window.dispatchEvent(new CustomEvent(POPOVER_CLOSE_EVENT, { detail: { exceptId, immediate } }));
+}
+
+function usePopoverLifecycle(opts: {
+  closeDelay: number;
+  wrapRef: { current: HTMLElement | null };
+  menuRef: { current: HTMLElement | null };
+  onRelayout: () => void;
+  extraKey?: unknown;
+  escCapture?: boolean;
+  onAfterClose?: () => void;
+  onAfterOpen?: () => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const [closing, setClosing] = useState(false);
+  const [flipUp, setFlipUp] = useState(false);
+  const popIdRef = useRef(0);
+  if (!popIdRef.current) popIdRef.current = ++popoverSeq;
+  const closeTimerRef = useRef<number | undefined>(undefined);
+  const closingRef = useRef(false);
+  closingRef.current = closing;
+  const optsRef = useRef(opts);
+  optsRef.current = opts;
+
+  const clearTimer = () => {
+    if (closeTimerRef.current) window.clearTimeout(closeTimerRef.current);
+  };
+
+  const closeImmediate = () => {
+    clearTimer();
+    closingRef.current = false;
+    setOpen(false);
+    setClosing(false);
+    optsRef.current.onAfterClose?.();
+  };
+
+  const closeAnimated = () => {
+    if (!open || closingRef.current) return;
+    closingRef.current = true;
+    setClosing(true);
+    clearTimer();
+    closeTimerRef.current = window.setTimeout(() => {
+      closingRef.current = false;
+      setOpen(false);
+      setClosing(false);
+      optsRef.current.onAfterClose?.();
+    }, optsRef.current.closeDelay);
+  };
+
+  const prepareOpen = () => {
+    notifyClosePopovers(popIdRef.current, false);
+    clearTimer();
+    closingRef.current = false;
+    setClosing(false);
+  };
+
+  useEffect(() => clearTimer, []);
+
+  useEffect(() => {
+    if (open && !closing) optsRef.current.onAfterOpen?.();
+  }, [open, closing]);
+
+  useEffect(() => {
+    if (!open) return;
+    optsRef.current.onRelayout();
+    const raf = window.requestAnimationFrame(() => optsRef.current.onRelayout());
+    const onDocDown = (ev: MouseEvent) => {
+      const target = ev.target as Node;
+      if (optsRef.current.wrapRef.current?.contains(target) || optsRef.current.menuRef.current?.contains(target)) return;
+      closeAnimated();
+    };
+    const onPopClose = (ev: Event) => {
+      const detail = (ev as CustomEvent<{ exceptId?: number; immediate?: boolean }>).detail;
+      if (detail?.exceptId === popIdRef.current) return;
+      if (detail?.immediate) closeImmediate();
+      else closeAnimated();
+    };
+    const onEsc = (ev: KeyboardEvent) => {
+      if (ev.key === "Escape") {
+        if (optsRef.current.escCapture) ev.stopPropagation();
+        closeAnimated();
+      }
+    };
+    const onRelayoutEv = (ev: Event) => {
+      const menuEl = optsRef.current.menuRef.current;
+      if (ev.type === "scroll" && menuEl && ev.target instanceof Node && menuEl.contains(ev.target)) return;
+      optsRef.current.onRelayout();
+    };
+    const escCap = Boolean(optsRef.current.escCapture);
+    const vv = window.visualViewport;
+    document.addEventListener("mousedown", onDocDown, true);
+    document.addEventListener("keydown", onEsc, escCap);
+    window.addEventListener(POPOVER_CLOSE_EVENT, onPopClose);
+    window.addEventListener("resize", onRelayoutEv);
+    window.addEventListener("scroll", onRelayoutEv, true);
+    vv?.addEventListener("resize", onRelayoutEv);
+    vv?.addEventListener("scroll", onRelayoutEv);
+    return () => {
+      window.cancelAnimationFrame(raf);
+      document.removeEventListener("mousedown", onDocDown, true);
+      document.removeEventListener("keydown", onEsc, escCap);
+      window.removeEventListener(POPOVER_CLOSE_EVENT, onPopClose);
+      window.removeEventListener("resize", onRelayoutEv);
+      window.removeEventListener("scroll", onRelayoutEv, true);
+      vv?.removeEventListener("resize", onRelayoutEv);
+      vv?.removeEventListener("scroll", onRelayoutEv);
+    };
+  }, [open, opts.extraKey]);
+
+  return {
+    open,
+    setOpen,
+    closing,
+    setClosing,
+    flipUp,
+    setFlipUp,
+    closeAnimated,
+    prepareOpen,
+  };
 }
 
 export function useDebouncedValue<T>(value: T, delay = 250): T {
@@ -151,19 +269,13 @@ export function ConsoleSelect({
   searchable,
   searchPlaceholder,
 }: ConsoleSelectProps) {
-  const [open, setOpen] = useState(false);
-  const [closing, setClosing] = useState(false);
-  const [flipUp, setFlipUp] = useState(false);
   const [menuStyle, setMenuStyle] = useState<CSSProperties>({});
   const [focusIdx, setFocusIdx] = useState<number>(-1);
   const [searchQ, setSearchQ] = useState("");
-  const popIdRef = useRef(0);
-  if (!popIdRef.current) popIdRef.current = ++popoverSeq;
   const wrapRef = useRef<HTMLDivElement | null>(null);
   const btnRef = useRef<HTMLButtonElement | null>(null);
   const menuRef = useRef<HTMLDivElement | null>(null);
   const searchRef = useRef<HTMLInputElement | null>(null);
-  const closeTimerRef = useRef<number | undefined>(undefined);
   const onSearchRef = useRef(onSearch);
   onSearchRef.current = onSearch;
 
@@ -216,29 +328,28 @@ export function ConsoleSelect({
     setFlipUp(pos.flipUp);
   };
 
-  const closeImmediate = () => {
-    if (closeTimerRef.current) window.clearTimeout(closeTimerRef.current);
-    setOpen(false);
-    setClosing(false);
-    setSearchQ("");
-  };
-
-  const closeAnimated = () => {
-    if (!open || closing) return;
-    setClosing(true);
-    if (closeTimerRef.current) window.clearTimeout(closeTimerRef.current);
-    closeTimerRef.current = window.setTimeout(() => {
-      setOpen(false);
-      setClosing(false);
-      setSearchQ("");
-    }, 130);
-  };
-
-  useEffect(() => {
-    return () => {
-      if (closeTimerRef.current) window.clearTimeout(closeTimerRef.current);
-    };
-  }, []);
+  const {
+    open,
+    setOpen,
+    closing,
+    setClosing,
+    flipUp,
+    setFlipUp,
+    closeAnimated,
+    prepareOpen,
+  } = usePopoverLifecycle({
+    closeDelay: 130,
+    wrapRef,
+    menuRef,
+    onRelayout: updateMenuPosition,
+    extraKey: isSearchable,
+    onAfterClose: () => setSearchQ(""),
+    onAfterOpen: () => {
+      if (isSearchable && !window.matchMedia?.("(pointer: coarse)")?.matches) {
+        window.requestAnimationFrame(() => searchRef.current?.focus());
+      }
+    },
+  });
 
   useEffect(() => {
     if (!open || !onSearchRef.current) return;
@@ -256,63 +367,13 @@ export function ConsoleSelect({
     return () => window.cancelAnimationFrame(raf);
   }, [open, filteredOptions.length, isSearchable]);
 
-  useEffect(() => {
-    if (!open) return;
-    const onDocDown = (ev: MouseEvent) => {
-      const target = ev.target as Node;
-      if (wrapRef.current?.contains(target) || menuRef.current?.contains(target)) return;
-      closeAnimated();
-    };
-    const onPopClose = (ev: Event) => {
-      const detail = (ev as CustomEvent<{ exceptId?: number; immediate?: boolean }>).detail;
-      if (detail?.exceptId === popIdRef.current) return;
-      if (detail?.immediate) {
-        closeImmediate();
-      } else {
-        closeAnimated();
-      }
-    };
-    const onEsc = (ev: KeyboardEvent) => {
-      if (ev.key === "Escape") closeAnimated();
-    };
-    const onScrollOrResize = (ev: Event) => {
-      if (ev.type === "scroll" && menuRef.current && ev.target instanceof Node && menuRef.current.contains(ev.target)) {
-        return;
-      }
-      updateMenuPosition();
-    };
-    const vv = window.visualViewport;
-    document.addEventListener("mousedown", onDocDown, true);
-    document.addEventListener("keydown", onEsc);
-    window.addEventListener(POPOVER_CLOSE_EVENT, onPopClose);
-    window.addEventListener("resize", onScrollOrResize);
-    window.addEventListener("scroll", onScrollOrResize, true);
-    vv?.addEventListener("resize", onScrollOrResize);
-    vv?.addEventListener("scroll", onScrollOrResize);
-    const isCoarse = Boolean(window.matchMedia?.("(pointer: coarse)")?.matches);
-    if (isSearchable && !isCoarse) {
-      window.requestAnimationFrame(() => searchRef.current?.focus());
-    }
-    return () => {
-      document.removeEventListener("mousedown", onDocDown, true);
-      document.removeEventListener("keydown", onEsc);
-      window.removeEventListener(POPOVER_CLOSE_EVENT, onPopClose);
-      window.removeEventListener("resize", onScrollOrResize);
-      window.removeEventListener("scroll", onScrollOrResize, true);
-      vv?.removeEventListener("resize", onScrollOrResize);
-      vv?.removeEventListener("scroll", onScrollOrResize);
-    };
-  }, [open, closing, isSearchable]);
-
   const toggleOpen = () => {
     if (disabled) return;
     if (open && !closing) {
       closeAnimated();
       return;
     }
-    notifyClosePopovers(popIdRef.current, false);
-    if (closeTimerRef.current) window.clearTimeout(closeTimerRef.current);
-    setClosing(false);
+    prepareOpen();
     setSearchQ("");
     updateMenuPosition();
     const curIdx = options.findIndex((o) => o.value === value);
@@ -545,9 +606,6 @@ export function ConsoleDatePicker({
   style,
   ariaLabel,
 }: ConsoleDatePickerProps) {
-  const [open, setOpen] = useState(false);
-  const [closing, setClosing] = useState(false);
-  const [flipUp, setFlipUp] = useState(false);
   const [popStyle, setPopStyle] = useState<CSSProperties>({});
 
   const parsed = parseDatePickerValue(value, mode);
@@ -559,12 +617,9 @@ export function ConsoleDatePicker({
   const [hourInput, setHourInput] = useState(pad2(parsed.hh));
   const [minInput, setMinInput] = useState(pad2(parsed.mm));
 
-  const popIdRef = useRef(0);
-  if (!popIdRef.current) popIdRef.current = ++popoverSeq;
   const wrapRef = useRef<HTMLDivElement | null>(null);
   const btnRef = useRef<HTMLButtonElement | null>(null);
   const popRef = useRef<HTMLDivElement | null>(null);
-  const closeTimerRef = useRef<number | undefined>(undefined);
 
   const syncFromProp = () => {
     const p = parseDatePickerValue(value, mode);
@@ -609,77 +664,23 @@ export function ConsoleDatePicker({
     setFlipUp(pos.flipUp);
   };
 
-  const closeImmediate = () => {
-    if (closeTimerRef.current) window.clearTimeout(closeTimerRef.current);
-    setOpen(false);
-    setClosing(false);
-  };
-
-  const closeAnimated = () => {
-    if (!open || closing) return;
-    setClosing(true);
-    if (closeTimerRef.current) window.clearTimeout(closeTimerRef.current);
-    closeTimerRef.current = window.setTimeout(() => {
-      setOpen(false);
-      setClosing(false);
-    }, 130);
-  };
-
-  useEffect(() => {
-    return () => {
-      if (closeTimerRef.current) window.clearTimeout(closeTimerRef.current);
-    };
-  }, []);
-
-  useEffect(() => {
-    if (!open) return;
-    updatePosition();
-    const raf = window.requestAnimationFrame(updatePosition);
-    const onDocDown = (ev: MouseEvent) => {
-      const target = ev.target as Node;
-      if (wrapRef.current?.contains(target) || popRef.current?.contains(target)) return;
-      closeAnimated();
-    };
-    const onPopClose = (ev: Event) => {
-      const detail = (ev as CustomEvent<{ exceptId?: number; immediate?: boolean }>).detail;
-      if (detail?.exceptId === popIdRef.current) return;
-      if (detail?.immediate) {
-        closeImmediate();
-      } else {
-        closeAnimated();
-      }
-    };
-    const onEsc = (ev: KeyboardEvent) => {
-      if (ev.key === "Escape") {
-        ev.stopPropagation();
-        closeAnimated();
-      }
-    };
-    const onRelayout = (ev: Event) => {
-      if (ev.type === "scroll" && popRef.current && ev.target instanceof Node && popRef.current.contains(ev.target)) {
-        return;
-      }
-      updatePosition();
-    };
-    const vv = window.visualViewport;
-    document.addEventListener("mousedown", onDocDown, true);
-    document.addEventListener("keydown", onEsc, true);
-    window.addEventListener(POPOVER_CLOSE_EVENT, onPopClose);
-    window.addEventListener("resize", onRelayout);
-    window.addEventListener("scroll", onRelayout, true);
-    vv?.addEventListener("resize", onRelayout);
-    vv?.addEventListener("scroll", onRelayout);
-    return () => {
-      window.cancelAnimationFrame(raf);
-      document.removeEventListener("mousedown", onDocDown, true);
-      document.removeEventListener("keydown", onEsc, true);
-      window.removeEventListener(POPOVER_CLOSE_EVENT, onPopClose);
-      window.removeEventListener("resize", onRelayout);
-      window.removeEventListener("scroll", onRelayout, true);
-      vv?.removeEventListener("resize", onRelayout);
-      vv?.removeEventListener("scroll", onRelayout);
-    };
-  }, [open, closing, mode]);
+  const {
+    open,
+    setOpen,
+    closing,
+    setClosing,
+    flipUp,
+    setFlipUp,
+    closeAnimated,
+    prepareOpen,
+  } = usePopoverLifecycle({
+    closeDelay: 130,
+    wrapRef,
+    menuRef: popRef,
+    onRelayout: updatePosition,
+    extraKey: mode,
+    escCapture: true,
+  });
 
   const toggleOpen = () => {
     if (disabled) return;
@@ -687,10 +688,8 @@ export function ConsoleDatePicker({
       closeAnimated();
       return;
     }
-    notifyClosePopovers(popIdRef.current, false);
-    if (closeTimerRef.current) window.clearTimeout(closeTimerRef.current);
+    prepareOpen();
     syncFromProp();
-    setClosing(false);
     updatePosition();
     setOpen(true);
   };
@@ -1152,15 +1151,9 @@ export function ActionMenu({
   label?: string;
 }) {
   const visibleItems = items.filter((it) => !it.hidden);
-  const [open, setOpen] = useState(false);
-  const [closing, setClosing] = useState(false);
-  const [flipUp, setFlipUp] = useState(false);
   const [menuStyle, setMenuStyle] = useState<CSSProperties>({});
-  const popIdRef = useRef(0);
-  if (!popIdRef.current) popIdRef.current = ++popoverSeq;
   const btnRef = useRef<HTMLButtonElement | null>(null);
   const menuRef = useRef<HTMLDivElement | null>(null);
-  const closeTimerRef = useRef<number | undefined>(undefined);
 
   const updatePos = () => {
     if (!btnRef.current || !btnRef.current.isConnected) {
@@ -1183,73 +1176,22 @@ export function ActionMenu({
     setFlipUp(pos.flipUp);
   };
 
-  const closeImmediate = () => {
-    if (closeTimerRef.current) window.clearTimeout(closeTimerRef.current);
-    setOpen(false);
-    setClosing(false);
-  };
-
-  const closeAnimated = () => {
-    if (!open || closing) return;
-    setClosing(true);
-    if (closeTimerRef.current) window.clearTimeout(closeTimerRef.current);
-    closeTimerRef.current = window.setTimeout(() => {
-      setOpen(false);
-      setClosing(false);
-    }, 130);
-  };
-
-  useEffect(() => {
-    return () => {
-      if (closeTimerRef.current) window.clearTimeout(closeTimerRef.current);
-    };
-  }, []);
-
-  useEffect(() => {
-    if (!open) return;
-    const raf = window.requestAnimationFrame(() => updatePos());
-    const onDocDown = (ev: MouseEvent) => {
-      const target = ev.target as Node;
-      if (btnRef.current?.contains(target) || menuRef.current?.contains(target)) return;
-      closeAnimated();
-    };
-    const onPopClose = (ev: Event) => {
-      const detail = (ev as CustomEvent<{ exceptId?: number; immediate?: boolean }>).detail;
-      if (detail?.exceptId === popIdRef.current) return;
-      if (detail?.immediate) {
-        closeImmediate();
-      } else {
-        closeAnimated();
-      }
-    };
-    const onEsc = (ev: KeyboardEvent) => {
-      if (ev.key === "Escape") closeAnimated();
-    };
-    const onScrollOrResize = (ev: Event) => {
-      if (ev.type === "scroll" && menuRef.current && ev.target instanceof Node && menuRef.current.contains(ev.target)) {
-        return;
-      }
-      updatePos();
-    };
-    const vv = window.visualViewport;
-    document.addEventListener("mousedown", onDocDown, true);
-    document.addEventListener("keydown", onEsc);
-    window.addEventListener(POPOVER_CLOSE_EVENT, onPopClose);
-    window.addEventListener("resize", onScrollOrResize);
-    window.addEventListener("scroll", onScrollOrResize, true);
-    vv?.addEventListener("resize", onScrollOrResize);
-    vv?.addEventListener("scroll", onScrollOrResize);
-    return () => {
-      window.cancelAnimationFrame(raf);
-      document.removeEventListener("mousedown", onDocDown, true);
-      document.removeEventListener("keydown", onEsc);
-      window.removeEventListener(POPOVER_CLOSE_EVENT, onPopClose);
-      window.removeEventListener("resize", onScrollOrResize);
-      window.removeEventListener("scroll", onScrollOrResize, true);
-      vv?.removeEventListener("resize", onScrollOrResize);
-      vv?.removeEventListener("scroll", onScrollOrResize);
-    };
-  }, [open, closing, visibleItems.length]);
+  const {
+    open,
+    setOpen,
+    closing,
+    setClosing,
+    flipUp,
+    setFlipUp,
+    closeAnimated,
+    prepareOpen,
+  } = usePopoverLifecycle({
+    closeDelay: 130,
+    wrapRef: btnRef,
+    menuRef,
+    onRelayout: updatePos,
+    extraKey: visibleItems.length,
+  });
 
   if (visibleItems.length === 0) return null;
 
@@ -1257,9 +1199,7 @@ export function ActionMenu({
     if (open && !closing) {
       closeAnimated();
     } else {
-      notifyClosePopovers(popIdRef.current, false);
-      if (closeTimerRef.current) window.clearTimeout(closeTimerRef.current);
-      setClosing(false);
+      prepareOpen();
       updatePos();
       setOpen(true);
     }
@@ -1288,14 +1228,15 @@ export function ActionMenu({
             class={`volo-cselect-menu is-portal volo-action-menu ${flipUp ? "flip-up" : ""} ${closing ? "is-closing" : ""}`}
             style={menuStyle}
           >
-            {visibleItems.map((it, idx) =>
-              it.href ? (
+            {visibleItems.map((it, idx) => {
+              const itemHref = it.href ? safeHref(it.href) : "";
+              return itemHref ? (
                 <a
                   key={`${it.label}-${idx}`}
                   role="menuitem"
-                  href={it.href}
+                  href={itemHref}
                   target={it.target}
-                  rel={it.target === "_blank" ? "noreferrer" : undefined}
+                  rel={it.target === "_blank" ? "noopener noreferrer" : undefined}
                   download={it.download}
                   class={`volo-cselect-item ${it.danger ? "is-danger" : ""}`}
                   onClick={() => closeAnimated()}
@@ -1316,8 +1257,8 @@ export function ActionMenu({
                 >
                   <span class="volo-cselect-item-text">{it.label}</span>
                 </button>
-              )
-            )}
+              );
+            })}
           </div>,
           document.body
         )}
@@ -1333,16 +1274,10 @@ export interface LocalePopoverProps {
 }
 
 export function LocalePopover({ value, locales, onChange, pill = true }: LocalePopoverProps) {
-  const [open, setOpen] = useState(false);
-  const [closing, setClosing] = useState(false);
-  const [flipUp, setFlipUp] = useState(false);
   const [menuStyle, setMenuStyle] = useState<CSSProperties>({});
-  const popIdRef = useRef(0);
-  if (!popIdRef.current) popIdRef.current = ++popoverSeq;
   const wrapRef = useRef<HTMLDivElement | null>(null);
   const btnRef = useRef<HTMLButtonElement | null>(null);
   const menuRef = useRef<HTMLDivElement | null>(null);
-  const closeTimerRef = useRef<number | undefined>(undefined);
   const current = locales.find((l) => l.code === value) || locales[0];
 
   const updatePos = () => {
@@ -1359,81 +1294,28 @@ export function LocalePopover({ value, locales, onChange, pill = true }: LocaleP
     setFlipUp(pos.flipUp);
   };
 
-  const closeImmediate = () => {
-    if (closeTimerRef.current) window.clearTimeout(closeTimerRef.current);
-    setOpen(false);
-    setClosing(false);
-  };
-
-  const closeAnimated = () => {
-    if (!open || closing) return;
-    setClosing(true);
-    if (closeTimerRef.current) window.clearTimeout(closeTimerRef.current);
-    closeTimerRef.current = window.setTimeout(() => {
-      setOpen(false);
-      setClosing(false);
-    }, 140);
-  };
-
-  useEffect(() => {
-    return () => {
-      if (closeTimerRef.current) window.clearTimeout(closeTimerRef.current);
-    };
-  }, []);
-
-  useEffect(() => {
-    if (!open) return;
-    const raf = window.requestAnimationFrame(() => updatePos());
-    const onDocDown = (ev: MouseEvent) => {
-      const target = ev.target as Node;
-      if (wrapRef.current?.contains(target) || menuRef.current?.contains(target)) return;
-      closeAnimated();
-    };
-    const onPopClose = (ev: Event) => {
-      const detail = (ev as CustomEvent<{ exceptId?: number; immediate?: boolean }>).detail;
-      if (detail?.exceptId === popIdRef.current) return;
-      if (detail?.immediate) {
-        closeImmediate();
-      } else {
-        closeAnimated();
-      }
-    };
-    const onEsc = (ev: KeyboardEvent) => {
-      if (ev.key === "Escape") closeAnimated();
-    };
-    const onScrollOrResize = (ev: Event) => {
-      if (ev.type === "scroll" && menuRef.current && ev.target instanceof Node && menuRef.current.contains(ev.target)) {
-        return;
-      }
-      updatePos();
-    };
-    const vv = window.visualViewport;
-    document.addEventListener("mousedown", onDocDown, true);
-    document.addEventListener("keydown", onEsc);
-    window.addEventListener(POPOVER_CLOSE_EVENT, onPopClose);
-    window.addEventListener("resize", onScrollOrResize);
-    window.addEventListener("scroll", onScrollOrResize, true);
-    vv?.addEventListener("resize", onScrollOrResize);
-    vv?.addEventListener("scroll", onScrollOrResize);
-    return () => {
-      window.cancelAnimationFrame(raf);
-      document.removeEventListener("mousedown", onDocDown, true);
-      document.removeEventListener("keydown", onEsc);
-      window.removeEventListener(POPOVER_CLOSE_EVENT, onPopClose);
-      window.removeEventListener("resize", onScrollOrResize);
-      window.removeEventListener("scroll", onScrollOrResize, true);
-      vv?.removeEventListener("resize", onScrollOrResize);
-      vv?.removeEventListener("scroll", onScrollOrResize);
-    };
-  }, [open, closing, locales.length]);
+  const {
+    open,
+    setOpen,
+    closing,
+    setClosing,
+    flipUp,
+    setFlipUp,
+    closeAnimated,
+    prepareOpen,
+  } = usePopoverLifecycle({
+    closeDelay: 140,
+    wrapRef,
+    menuRef,
+    onRelayout: updatePos,
+    extraKey: locales.length,
+  });
 
   const toggle = () => {
     if (open && !closing) {
       closeAnimated();
     } else {
-      notifyClosePopovers(popIdRef.current, false);
-      if (closeTimerRef.current) window.clearTimeout(closeTimerRef.current);
-      setClosing(false);
+      prepareOpen();
       updatePos();
       setOpen(true);
     }
@@ -1534,6 +1416,48 @@ export interface AnimatedModalProps {
   variant?: "default" | "spotlight";
   children: ComponentChildren;
   footer?: ComponentChildren;
+}
+
+function ModalHead({
+  title,
+  subtitle,
+  headingId,
+  busy,
+  describedBy,
+  onCloseClick,
+}: {
+  title: string;
+  subtitle?: string;
+  headingId?: string;
+  busy?: boolean;
+  describedBy?: string;
+  onCloseClick: () => void;
+}) {
+  return (
+    <div class="volo-modal-head">
+      <div style={{ minWidth: 0 }}>
+        <h3 id={headingId} class="volo-card-title" style={{ fontSize: "16.5px" }}>
+          {title}
+        </h3>
+        {subtitle && (
+          <p class="volo-sec-desc" style={{ marginTop: "3px" }}>
+            {subtitle}
+          </p>
+        )}
+      </div>
+      <button
+        type="button"
+        class="volo-modal-close"
+        aria-label={t("common.close")}
+        title={t("common.close")}
+        aria-disabled={busy || undefined}
+        aria-describedby={describedBy}
+        onClick={onCloseClick}
+      >
+        <CloseIcon size={15} />
+      </button>
+    </div>
+  );
 }
 
 export function AnimatedModal({
@@ -1666,24 +1590,14 @@ export function AnimatedModal({
         aria-label={isSpotlight ? title : undefined}
       >
         {!isSpotlight && (
-          <div class="volo-modal-head">
-            <div style={{ minWidth: 0 }}>
-              <h3 class="volo-card-title" style={{ fontSize: "16.5px" }}>{title}</h3>
-              {subtitle && <p class="volo-sec-desc" style={{ marginTop: "3px" }}>{subtitle}</p>}
-            </div>
-            <button
-              type="button"
-              class="volo-modal-close"
-              aria-label={t("common.close")}
-              title={t("common.close")}
-              onClick={() => {
-                notifyClosePopovers(0, true);
-                onClose();
-              }}
-            >
-              <CloseIcon size={15} />
-            </button>
-          </div>
+          <ModalHead
+            title={title}
+            subtitle={subtitle}
+            onCloseClick={() => {
+              notifyClosePopovers(0, true);
+              onClose();
+            }}
+          />
         )}
         {isSpotlight ? children : <div class="volo-modal-body">{children}</div>}
         {!isSpotlight && footer && <div class="volo-form-actions">{footer}</div>}
@@ -1907,39 +1821,24 @@ export function NativeModalDialog({
       {...({ closedby: closedByVal } as any)}
       style={{ "--dialog-max-w": maxWidth } as CSSProperties}
     >
-      <div class="volo-modal-head">
-        <div style={{ minWidth: 0 }}>
-          <h3 id={headingId} class="volo-card-title" style={{ fontSize: "16.5px" }}>
-            {title}
-          </h3>
-          {subtitle && (
-            <p class="volo-sec-desc" style={{ marginTop: "3px" }}>
-              {subtitle}
-            </p>
-          )}
-        </div>
-        <button
-          type="button"
-          class="volo-modal-close"
-          aria-label={t("common.close")}
-          title={t("common.close")}
-          aria-disabled={busy || undefined}
-          aria-describedby={guardShown && busyGuardHint ? guardId : undefined}
-          onClick={() => {
-            if (busy) {
-              setGuardShown(true);
-              return;
-            }
-            if (dlgRef.current) {
-              void closeTopLayer(dlgRef.current);
-            } else {
-              onClose();
-            }
-          }}
-        >
-          <CloseIcon size={15} />
-        </button>
-      </div>
+      <ModalHead
+        title={title}
+        subtitle={subtitle}
+        headingId={headingId}
+        busy={busy}
+        describedBy={guardShown && busyGuardHint ? guardId : undefined}
+        onCloseClick={() => {
+          if (busy) {
+            setGuardShown(true);
+            return;
+          }
+          if (dlgRef.current) {
+            void closeTopLayer(dlgRef.current);
+          } else {
+            onClose();
+          }
+        }}
+      />
       <div class="volo-modal-body">
         {children}
         {busy && busyGuardHint && (
@@ -2011,6 +1910,108 @@ export function SwitchToggle({
         </span>
       )}
     </label>
+  );
+}
+
+export function ToggleGroup({
+  on,
+  onChange,
+  title,
+  desc,
+  noMargin,
+  children,
+}: {
+  on: boolean;
+  onChange: (next: boolean) => void;
+  title: string;
+  desc?: string;
+  noMargin?: boolean;
+  children?: ComponentChildren;
+}) {
+  return (
+    <div class={`volo-toggle-group ${on ? "is-on" : "is-off"}`} style={noMargin ? { marginBottom: 0 } : undefined}>
+      <div class="volo-toggle-group-head">
+        <div class="volo-toggle-group-copy">
+          <div class="volo-toggle-group-title">{title}</div>
+          {desc && <p class="volo-toggle-group-desc">{desc}</p>}
+        </div>
+        <SwitchToggle checked={on} onChange={onChange} />
+      </div>
+      {on && children && <div class="volo-toggle-group-body">{children}</div>}
+    </div>
+  );
+}
+
+export function FieldInput({
+  label,
+  value,
+  onValue,
+  area,
+  rows = 2,
+  type = "text",
+  mono,
+  hint,
+  style,
+  placeholder,
+  name,
+  autoComplete,
+  required,
+  min,
+  max,
+  disabled,
+  spellCheck,
+}: {
+  label: ComponentChildren;
+  value: string | number;
+  onValue: (v: string) => void;
+  area?: boolean;
+  rows?: number;
+  type?: string;
+  mono?: boolean;
+  hint?: ComponentChildren;
+  style?: CSSProperties;
+  placeholder?: string;
+  name?: string;
+  autoComplete?: string;
+  required?: boolean;
+  min?: number;
+  max?: number;
+  disabled?: boolean;
+  spellCheck?: boolean;
+}) {
+  const cls = `${area ? "volo-textarea" : "volo-input"}${mono ? " volo-mono" : ""}`;
+  return (
+    <div class="volo-field" style={style}>
+      <label>{label}</label>
+      {area ? (
+        <textarea
+          class={cls}
+          rows={rows}
+          value={value}
+          placeholder={placeholder}
+          name={name}
+          required={required}
+          disabled={disabled}
+          spellcheck={spellCheck}
+          onInput={(e) => onValue((e.currentTarget as HTMLTextAreaElement).value)}
+        />
+      ) : (
+        <input
+          type={(type === "text" ? undefined : type) as any}
+          class={cls}
+          value={value}
+          placeholder={placeholder}
+          name={name}
+          autoComplete={autoComplete}
+          required={required}
+          min={min}
+          max={max}
+          disabled={disabled}
+          onInput={(e) => onValue((e.currentTarget as HTMLInputElement).value)}
+        />
+      )}
+      {hint && <span class="volo-help">{hint}</span>}
+    </div>
   );
 }
 
@@ -2273,111 +2274,103 @@ export function NavIconPreview({ icon, fallbackLabel, size = 16 }: NavIconPrevie
 
   const boxSize = Math.max(26, size + 12);
 
-  if (
-    low === "github" ||
-    low.includes("github-icon") ||
-    low === "https://github.com/favicon.ico"
-  ) {
-    return (
-      <span class="volo-icon-preview-box" style={{ width: `${boxSize}px`, height: `${boxSize}px` }} title={raw}>
-        <svg width={size} height={size} viewBox="0 0 24 24" fill="currentColor">
-          <path d="M12 .5C5.65.5.5 5.65.5 12c0 5.09 3.29 9.4 7.86 10.92.58.11.79-.25.79-.56 0-.28-.01-1.02-.02-2-3.2.7-3.88-1.54-3.88-1.54-.52-1.33-1.28-1.69-1.28-1.69-1.05-.72.08-.71.08-.71 1.16.08 1.77 1.19 1.77 1.19 1.03 1.77 2.7 1.26 3.36.96.1-.75.4-1.26.73-1.55-2.55-.29-5.24-1.28-5.24-5.68 0-1.26.45-2.28 1.18-3.09-.12-.29-.51-1.46.11-3.05 0 0 .97-.31 3.17 1.18a11.02 11.02 0 0 1 5.78 0c2.2-1.49 3.16-1.18 3.16-1.18.63 1.59.24 2.76.12 3.05.74.81 1.18 1.83 1.18 3.09 0 4.41-2.69 5.38-5.26 5.67.41.36.78 1.06.78 2.14 0 1.55-.01 2.79-.01 3.17 0 .31.21.67.8.56A11.51 11.51 0 0 0 23.5 12C23.5 5.65 18.35.5 12 .5Z" />
-        </svg>
-      </span>
-    );
-  }
+  const box = (children: preact.ComponentChildren, fill = false) => (
+    <span class="volo-icon-preview-box" style={{ width: `${boxSize}px`, height: `${boxSize}px` }} title={raw}>
+      <svg
+        width={size}
+        height={size}
+        viewBox="0 0 24 24"
+        fill={fill ? "currentColor" : "none"}
+        stroke={fill ? undefined : "currentColor"}
+        stroke-width={fill ? undefined : "1.9"}
+        stroke-linecap={fill ? undefined : "round"}
+        stroke-linejoin={fill ? undefined : "round"}
+      >
+        {children}
+      </svg>
+    </span>
+  );
 
-  if (low === "admin" || low.includes("admin-panel")) {
-    return (
-      <span class="volo-icon-preview-box" style={{ width: `${boxSize}px`, height: `${boxSize}px` }} title={raw}>
-        <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+  const iconKey =
+    low === "github" || low.includes("github-icon") || low === "https://github.com/favicon.ico"
+      ? "github"
+      : low === "admin" || low.includes("admin-panel")
+      ? "admin"
+      : low === "logout" || low.includes("admin-logout")
+      ? "logout"
+      : low === "book" || low === "books"
+      ? "book"
+      : low === "rss" || low === "feed"
+      ? "rss"
+      : low === "mail" || low === "email"
+      ? "mail"
+      : low === "external" || low === "link"
+      ? low
+      : "";
+  if (iconKey) {
+    const iconContent: Record<string, [preact.ComponentChildren, boolean?]> = {
+      github: [
+        <path d="M12 .5C5.65.5.5 5.65.5 12c0 5.09 3.29 9.4 7.86 10.92.58.11.79-.25.79-.56 0-.28-.01-1.02-.02-2-3.2.7-3.88-1.54-3.88-1.54-.52-1.33-1.28-1.69-1.28-1.69-1.05-.72.08-.71.08-.71 1.16.08 1.77 1.19 1.77 1.19 1.03 1.77 2.7 1.26 3.36.96.1-.75.4-1.26.73-1.55-2.55-.29-5.24-1.28-5.24-5.68 0-1.26.45-2.28 1.18-3.09-.12-.29-.51-1.46.11-3.05 0 0 .97-.31 3.17 1.18a11.02 11.02 0 0 1 5.78 0c2.2-1.49 3.16-1.18 3.16-1.18.63 1.59.24 2.76.12 3.05.74.81 1.18 1.83 1.18 3.09 0 4.41-2.69 5.38-5.26 5.67.41.36.78 1.06.78 2.14 0 1.55-.01 2.79-.01 3.17 0 .31.21.67.8.56A11.51 11.51 0 0 0 23.5 12C23.5 5.65 18.35.5 12 .5Z" />,
+        true,
+      ],
+      admin: [
+        <>
           <rect x="3" y="3" width="7" height="9" rx="1.5" />
           <rect x="14" y="3" width="7" height="5" rx="1.5" />
           <rect x="14" y="12" width="7" height="9" rx="1.5" />
           <rect x="3" y="16" width="7" height="5" rx="1.5" />
-        </svg>
-      </span>
-    );
-  }
-
-  if (low === "logout" || low.includes("admin-logout")) {
-    return (
-      <span class="volo-icon-preview-box" style={{ width: `${boxSize}px`, height: `${boxSize}px` }} title={raw}>
-        <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+        </>,
+      ],
+      logout: [
+        <>
           <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4" />
           <polyline points="16 17 21 12 16 7" />
           <line x1="21" y1="12" x2="9" y2="12" />
-        </svg>
-      </span>
-    );
-  }
-
-  if (low === "book" || low === "books") {
-    return (
-      <span class="volo-icon-preview-box" style={{ width: `${boxSize}px`, height: `${boxSize}px` }} title={raw}>
-        <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+        </>,
+      ],
+      book: [
+        <>
           <path d="M2 4h7a3 3 0 0 1 3 3v13a2 2 0 0 0-2-2H2z" />
           <path d="M22 4h-7a3 3 0 0 0-3 3v13a2 2 0 0 1 2-2h8z" />
-        </svg>
-      </span>
-    );
-  }
-
-  if (low === "rss" || low === "feed") {
-    return (
-      <span class="volo-icon-preview-box" style={{ width: `${boxSize}px`, height: `${boxSize}px` }} title={raw}>
-        <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+        </>,
+      ],
+      rss: [
+        <>
           <path d="M4 11a9 9 0 0 1 9 9" />
           <path d="M4 4a16 16 0 0 1 16 16" />
           <circle cx="5" cy="19" r="1.5" fill="currentColor" />
-        </svg>
-      </span>
-    );
-  }
-
-  if (low === "mail" || low === "email") {
-    return (
-      <span class="volo-icon-preview-box" style={{ width: `${boxSize}px`, height: `${boxSize}px` }} title={raw}>
-        <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+        </>,
+      ],
+      mail: [
+        <>
           <rect x="3" y="5" width="18" height="14" rx="2" />
           <path d="m3 7 9 6 9-6" />
-        </svg>
-      </span>
-    );
-  }
-
-  if (low === "external") {
-    return (
-      <span class="volo-icon-preview-box" style={{ width: `${boxSize}px`, height: `${boxSize}px` }} title={raw}>
-        <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+        </>,
+      ],
+      external: [
+        <>
           <path d="M14 4h6v6" />
           <path d="M10 14 20 4" />
           <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" />
-        </svg>
-      </span>
-    );
-  }
-
-  if (low === "link") {
-    return (
-      <span class="volo-icon-preview-box" style={{ width: `${boxSize}px`, height: `${boxSize}px` }} title={raw}>
-        <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+        </>,
+      ],
+      link: [
+        <>
           <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71" />
           <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71" />
-        </svg>
-      </span>
-    );
+        </>,
+      ],
+    };
+    const [nodes, fill] = iconContent[iconKey];
+    return box(nodes, fill);
   }
 
-  const isSafePreviewSrc =
-    (raw.startsWith("/") && !raw.startsWith("//") && !raw.startsWith("/\\")) ||
-    /^https?:\/\//i.test(raw) ||
-    /^data:image\/(?:png|jpe?g|gif|webp|avif|bmp|x-icon);base64,/i.test(raw);
-  if (!imgErr && isSafePreviewSrc) {
+  const safePreviewSrc = safeMediaSrc(raw, { allowDataImage: true });
+  if (!imgErr && safePreviewSrc) {
     return (
       <span class="volo-icon-preview-box" style={{ width: `${boxSize}px`, height: `${boxSize}px` }} title={raw}>
         <img
-          src={raw}
+          src={safePreviewSrc}
           alt=""
           style={{ width: `${size + 2}px`, height: `${size + 2}px`, objectFit: "contain", borderRadius: "4px" }}
           onError={() => setImgErr(true)}
@@ -2419,6 +2412,10 @@ export function paginateItems<T>(
     safePage,
     totalPages,
   };
+}
+
+export function pagedSlice<T>(items: T[], page: number, pageSize = 15): T[] {
+  return items.length > pageSize ? paginateItems(items, page, pageSize).slice : items;
 }
 
 export interface PaginationProps {

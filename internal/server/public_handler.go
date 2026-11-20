@@ -100,9 +100,21 @@ type AppServer struct {
 	oidcBindTickets  map[string]oidcBindTicket
 
 	mediaRefCacheMu         sync.Mutex
+	mediaRefFetchOnce       sync.Once
+	mediaRefFetchSem        chan struct{}
+	mediaRefInvalidateGen   uint64
 	mediaRefCachedRev       uint64
 	mediaRefCountsByAssetID map[string]int
 	mediaRefOrphanCounts    map[string]int
+
+	aboutCache         aboutProjectCacheState
+	aboutRepoAPIURL    string
+	aboutReleaseAPIURL string
+	aboutNowFn         func() time.Time
+
+	bgCtx    context.Context
+	bgCancel context.CancelFunc
+	bgWG     sync.WaitGroup
 
 	auditActionsMu  sync.Mutex
 	auditActionsExp time.Time
@@ -116,6 +128,9 @@ type AppServer struct {
 
 // NewAppServer constructs and wires a complete AppServer instance.
 func NewAppServer(deps AppDeps) (*AppServer, error) {
+	if strings.TrimSpace(deps.Version) == "" {
+		deps.Version = defaultAppVersion
+	}
 	if deps.StartedAt.IsZero() {
 		deps.StartedAt = time.Now()
 	}
@@ -212,10 +227,13 @@ func NewAppServer(deps AppDeps) (*AppServer, error) {
 		_ = deps.Content.WarmCaches(context.Background())
 	}
 
+	bgCtx, bgCancel := context.WithCancel(context.Background())
 	s := &AppServer{
 		deps:           deps,
 		imageView:      media.NewImageViewEngine(8 << 20),
 		catalogFetcher: extpkg.NewMetadataFetcher(),
+		bgCtx:          bgCtx,
+		bgCancel:       bgCancel,
 	}
 	if deps.Passports != nil {
 		deps.Passports.SetSecureRequestFunc(s.isCookieSecureForRequest)
@@ -317,11 +335,23 @@ func NewAppServer(deps AppDeps) (*AppServer, error) {
 func (s *AppServer) Handler() http.Handler { return s.handler }
 func (s *AppServer) Deps() AppDeps         { return s.deps }
 
-// DrainApp flushes buffered view/analytics counters and waits for in-flight federation deliveries
+// DrainApp flushes buffered view/analytics counters and waits for in-flight federation and background deliveries
 // while leaving WAF/Geo handles open until extension/background workers have stopped.
 func (s *AppServer) DrainApp(ctx context.Context) error {
 	if s == nil {
 		return nil
+	}
+	if s.bgCancel != nil {
+		s.bgCancel()
+	}
+	doneBG := make(chan struct{})
+	go func() {
+		s.bgWG.Wait()
+		close(doneBG)
+	}()
+	select {
+	case <-doneBG:
+	case <-ctx.Done():
 	}
 	if s.deps.Plugins != nil {
 		s.deps.Plugins.WaitFederation()
@@ -336,6 +366,9 @@ func (s *AppServer) DrainApp(ctx context.Context) error {
 func (s *AppServer) Close(ctx context.Context) error {
 	if s == nil {
 		return nil
+	}
+	if s.bgCancel != nil {
+		s.bgCancel()
 	}
 	err := s.DrainApp(ctx)
 	if s.deps.WAF != nil {
@@ -568,7 +601,7 @@ func (s *AppServer) withRedirectGuardian(next http.Handler) http.Handler {
 
 func sanitizeResolvedRedirectTarget(target string, rawQuery string) (string, bool) {
 	dest := strings.TrimSpace(target)
-	if dest == "" || strings.ContainsAny(dest, "\r\n\x00") {
+	if dest == "" || strings.ContainsAny(dest, "\r\n\x00") || strings.ContainsAny(rawQuery, "\r\n\x00") {
 		return "", false
 	}
 	if strings.HasPrefix(dest, "/") {
@@ -994,12 +1027,22 @@ func (s *AppServer) permanentRedirectTo(target string) http.HandlerFunc {
 func (s *AppServer) handleLegacyCategoryRedirect(w http.ResponseWriter, r *http.Request) {
 	slug := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/category/"), ".html")
 	if slug == "" {
-		http.Redirect(w, r, "/categories", http.StatusMovedPermanently)
+		dest, valid := sanitizeResolvedRedirectTarget("/categories", r.URL.RawQuery)
+		if !valid {
+			http.NotFound(w, r)
+			return
+		}
+		http.Redirect(w, r, dest, http.StatusMovedPermanently)
 		return
 	}
-	dest := "/categories/" + slug
-	if r.URL.RawQuery != "" {
-		dest += "?" + r.URL.RawQuery
+	if strings.Contains(slug, "..") || strings.ContainsAny(slug, "/\\\r\n\x00") {
+		http.NotFound(w, r)
+		return
+	}
+	dest, valid := sanitizeResolvedRedirectTarget("/categories/"+url.PathEscape(slug), r.URL.RawQuery)
+	if !valid {
+		http.NotFound(w, r)
+		return
 	}
 	http.Redirect(w, r, dest, http.StatusMovedPermanently)
 }
@@ -1017,18 +1060,29 @@ func (s *AppServer) articleRedirectPathBySlug(ctx context.Context, slug string) 
 func (s *AppServer) handleLegacyArticleRedirect(w http.ResponseWriter, r *http.Request) {
 	trimmed := strings.Trim(strings.TrimPrefix(r.URL.Path, "/articles/"), "/")
 	if trimmed == "" {
-		http.Redirect(w, r, "/archives", http.StatusMovedPermanently)
+		dest, valid := sanitizeResolvedRedirectTarget("/archives", r.URL.RawQuery)
+		if !valid {
+			http.NotFound(w, r)
+			return
+		}
+		http.Redirect(w, r, dest, http.StatusMovedPermanently)
+		return
+	}
+	if strings.Contains(trimmed, "..") || strings.ContainsAny(trimmed, "\\\r\n\x00") {
+		http.NotFound(w, r)
 		return
 	}
 	parts := strings.Split(trimmed, "/")
 	slug := strings.TrimSuffix(parts[len(parts)-1], ".html")
-	if slug == "" || strings.Contains(slug, "..") {
+	if slug == "" || strings.Contains(slug, "..") || strings.ContainsAny(slug, "/\\\r\n\x00") {
 		http.NotFound(w, r)
 		return
 	}
-	dest := s.articleRedirectPathBySlug(r.Context(), slug)
-	if r.URL.RawQuery != "" {
-		dest += "?" + r.URL.RawQuery
+	rawDest := s.articleRedirectPathBySlug(r.Context(), slug)
+	dest, valid := sanitizeResolvedRedirectTarget(rawDest, r.URL.RawQuery)
+	if !valid {
+		http.NotFound(w, r)
+		return
 	}
 	http.Redirect(w, r, dest, http.StatusMovedPermanently)
 }
@@ -1336,8 +1390,20 @@ func writeOKJSON(w http.ResponseWriter) {
 	_, _ = w.Write([]byte("{\"ok\":true}\n"))
 }
 
+func decodeStrictJSON(w http.ResponseWriter, r *http.Request, maxBytes int64, dst any, allowEmpty bool) bool {
+	if r.Body == nil {
+		return allowEmpty
+	}
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxBytes))
+	if err := dec.Decode(dst); err != nil {
+		return allowEmpty && errors.Is(err, io.EOF)
+	}
+	var extra any
+	return dec.Decode(&extra) == io.EOF
+}
+
 func decodeJSONBody(w http.ResponseWriter, r *http.Request, maxBytes int64, dst any) bool {
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxBytes)).Decode(dst); err != nil {
+	if !decodeStrictJSON(w, r, maxBytes, dst, false) {
 		writeErrJSON(w, http.StatusBadRequest, "invalid json")
 		return false
 	}
@@ -1345,14 +1411,75 @@ func decodeJSONBody(w http.ResponseWriter, r *http.Request, maxBytes int64, dst 
 }
 
 func decodeOptJSONBody(w http.ResponseWriter, r *http.Request, maxBytes int64, dst any) bool {
-	if r.Body == nil {
-		return true
-	}
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxBytes)).Decode(dst); err != nil && !errors.Is(err, io.EOF) {
+	if !decodeStrictJSON(w, r, maxBytes, dst, true) {
 		writeErrJSON(w, http.StatusBadRequest, "invalid json")
 		return false
 	}
 	return true
+}
+
+func (s *AppServer) decodePublicJSONBody(w http.ResponseWriter, r *http.Request, maxBytes int64, dst any, locale string) bool {
+	if !decodeStrictJSON(w, r, maxBytes, dst, false) {
+		writeErrJSON(w, http.StatusBadRequest, s.deps.Catalog.T(locale, "error.bad_request"))
+		return false
+	}
+	return true
+}
+
+func writePagedJSON(w http.ResponseWriter, alias string, items any, total, page, perPage int) {
+	resp := map[string]any{
+		"items":     items,
+		"total":     total,
+		"page":      page,
+		"per_page":  perPage,
+		"page_size": perPage,
+	}
+	if alias != "" {
+		resp[alias] = items
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+func (s *AppServer) invalidateContentAndMediaCaches() {
+	if s == nil {
+		return
+	}
+	s.invalidateMediaRefCache()
+	if s.deps.Content != nil {
+		s.deps.Content.PurgeRuntimeCaches()
+	}
+}
+
+func queryIntClamped(r *http.Request, key string, def, minVal, maxVal int) int {
+	v, err := strconv.Atoi(strings.TrimSpace(r.URL.Query().Get(key)))
+	if err != nil {
+		v = def
+	}
+	if v < minVal {
+		return minVal
+	}
+	if maxVal > 0 && v > maxVal {
+		return maxVal
+	}
+	return v
+}
+
+func queryBool(r *http.Request, key string) bool {
+	v := strings.TrimSpace(r.URL.Query().Get(key))
+	return v == "1" || strings.EqualFold(v, "true")
+}
+
+func sqlInPlaceholders(ids []string) (string, []any) {
+	if len(ids) == 0 {
+		return "", nil
+	}
+	ph := make([]string, len(ids))
+	args := make([]any, len(ids))
+	for i, idVal := range ids {
+		ph[i] = "?"
+		args[i] = idVal
+	}
+	return strings.Join(ph, ","), args
 }
 
 func requireAdminJSON(w http.ResponseWriter, actor *domain.User) bool {
@@ -1384,7 +1511,8 @@ func (s *AppServer) requireSetupUnlocked(w http.ResponseWriter, r *http.Request)
 }
 
 func (s *AppServer) paginateQuery(baseSQL string, args []any, page, perPage int) (string, []any) {
-	qSQL, pageArgs := s.deps.Store.Dialect().PaginateSQL(baseSQL, perPage, (page-1)*perPage)
+	limit, offset := dialect.NormalizePage(page, perPage, perPage, perPage)
+	qSQL, pageArgs := s.deps.Store.Dialect().PaginateSQL(baseSQL, limit, offset)
 	out := make([]any, 0, len(args)+len(pageArgs))
 	out = append(out, args...)
 	out = append(out, pageArgs...)
@@ -1589,8 +1717,7 @@ func (s *AppServer) handleArticleActionAPI(w http.ResponseWriter, r *http.Reques
 	var req struct {
 		Password string `json:"password"`
 	}
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8192)).Decode(&req); err != nil {
-		writeErrJSON(w, http.StatusBadRequest, s.deps.Catalog.T(locale, "error.bad_request"))
+	if !s.decodePublicJSONBody(w, r, 8192, &req, locale) {
 		return
 	}
 
@@ -1828,8 +1955,7 @@ func (s *AppServer) handleCommentsRootAPI(w http.ResponseWriter, r *http.Request
 			}
 		}
 		var in content.CreateCommentInput
-		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 32768)).Decode(&in); err != nil {
-			writeErrJSON(w, http.StatusBadRequest, s.deps.Catalog.T(locale, "error.bad_request"))
+		if !s.decodePublicJSONBody(w, r, 32768, &in, locale) {
 			return
 		}
 		if strings.TrimSpace(in.EnvFPSignal) == "" {
@@ -1899,8 +2025,7 @@ func (s *AppServer) handleCommentItemAPI(w http.ResponseWriter, r *http.Request)
 			ContentMD string `json:"content_md"`
 			Content   string `json:"content"`
 		}
-		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 32768)).Decode(&body); err != nil {
-			writeErrJSON(w, http.StatusBadRequest, s.deps.Catalog.T(locale, "error.bad_request"))
+		if !s.decodePublicJSONBody(w, r, 32768, &body, locale) {
 			return
 		}
 		md := body.ContentMD
@@ -1928,8 +2053,7 @@ func (s *AppServer) handleCommentItemAPI(w http.ResponseWriter, r *http.Request)
 		var body struct {
 			ContentMD string `json:"content_md"`
 		}
-		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 32768)).Decode(&body); err != nil {
-			writeErrJSON(w, http.StatusBadRequest, s.deps.Catalog.T(locale, "error.bad_request"))
+		if !s.decodePublicJSONBody(w, r, 32768, &body, locale) {
 			return
 		}
 		updated, err := s.deps.Content.UpdateOwnComment(r.Context(), r, viewer, commentID, body.ContentMD)
@@ -2047,8 +2171,7 @@ func (s *AppServer) handleReactionsAPI(w http.ResponseWriter, r *http.Request) {
 		TargetID   string `json:"target_id"`
 		Kind       string `json:"kind"`
 	}
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&req); err != nil {
-		writeErrJSON(w, http.StatusBadRequest, s.deps.Catalog.T(locale, "error.bad_request"))
+	if !s.decodePublicJSONBody(w, r, 4096, &req, locale) {
 		return
 	}
 	validType, visible := s.isPubliclyReactableTarget(r.Context(), req.TargetType, req.TargetID)
@@ -2096,8 +2219,7 @@ func (s *AppServer) handleReaderSendCode(w http.ResponseWriter, r *http.Request)
 		Email    string `json:"email"`
 		Username string `json:"username"`
 	}
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&req); err != nil {
-		writeErrJSON(w, http.StatusBadRequest, s.deps.Catalog.T(locale, "error.bad_request"))
+	if !s.decodePublicJSONBody(w, r, 4096, &req, locale) {
 		return
 	}
 	if candUser := strings.TrimSpace(req.Username); candUser != "" && s.deps.Auth != nil {
@@ -2151,8 +2273,7 @@ func (s *AppServer) handleReaderRegister(w http.ResponseWriter, r *http.Request)
 		Code     string `json:"code"`
 		Next     string `json:"next"`
 	}
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8192)).Decode(&req); err != nil {
-		writeErrJSON(w, http.StatusBadRequest, s.deps.Catalog.T(locale, "error.bad_request"))
+	if !s.decodePublicJSONBody(w, r, 8192, &req, locale) {
 		return
 	}
 	u, err := s.deps.Auth.RegisterReader(r.Context(), req.Username, req.Email, req.Password, req.Code, locale)
@@ -2198,8 +2319,7 @@ func (s *AppServer) handleReaderLogin(w http.ResponseWriter, r *http.Request) {
 		Password string `json:"password"`
 		Next     string `json:"next"`
 	}
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8192)).Decode(&req); err != nil {
-		writeErrJSON(w, http.StatusBadRequest, s.deps.Catalog.T(locale, "error.bad_request"))
+	if !s.decodePublicJSONBody(w, r, 8192, &req, locale) {
 		return
 	}
 	var geo string
@@ -2282,8 +2402,7 @@ func (s *AppServer) handleReaderProfile(w http.ResponseWriter, r *http.Request) 
 	var req struct {
 		DisplayName string `json:"display_name"`
 	}
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&req); err != nil {
-		writeErrJSON(w, http.StatusBadRequest, s.deps.Catalog.T(locale, "error.bad_request"))
+	if !s.decodePublicJSONBody(w, r, 4096, &req, locale) {
 		return
 	}
 	disp := strings.TrimSpace(repo.StripASCIIControls(req.DisplayName))
@@ -2986,14 +3105,16 @@ func (s *AppServer) handleCategoriesOverview(w http.ResponseWriter, r *http.Requ
 	pctx.PageTitle = pctx.HeroTitle + " · " + pctx.Site.Title
 
 	const perPage = 36
+	q := strings.TrimSpace(r.URL.Query().Get("q"))
 	page := parsePageParam(r)
-	cats, total, _ := s.deps.Content.ListCategoriesWithCountsPage(r.Context(), page, perPage)
+	cats, total, _ := s.deps.Content.ListCategoriesWithCountsSearchPage(r.Context(), q, page, perPage)
 	totalPages := computeTotalPages(total, perPage)
 	if page > totalPages {
 		page = totalPages
-		cats, total, _ = s.deps.Content.ListCategoriesWithCountsPage(r.Context(), page, perPage)
+		cats, total, _ = s.deps.Content.ListCategoriesWithCountsSearchPage(r.Context(), q, page, perPage)
 	}
 	pctx.Categories = cats
+	pctx.TagQuery = q
 	pctx.Page = page
 	pctx.TotalPages = totalPages
 	pctx.Pagination = theme.BuildPagination(page, totalPages, perPage, total, 5)
@@ -3560,44 +3681,26 @@ func (s *AppServer) handleBookReader(w http.ResponseWriter, r *http.Request) {
 	slug, _ := url.PathUnescape(strings.TrimPrefix(r.URL.Path, "/books/"))
 	rawViewer, sess := s.resolveViewer(r)
 	viewer := s.publicPrivilegeViewer(r.Context(), rawViewer)
-	bk, err := s.deps.Content.GetBookBySlug(r.Context(), slug)
+	chID := strings.TrimSpace(r.URL.Query().Get("ch"))
+	cpage, _ := strconv.Atoi(strings.TrimSpace(r.URL.Query().Get("cpage")))
+	if cpage < 0 {
+		cpage = 0
+	}
+	rd, err := s.deps.Content.GetBookReaderPage(r.Context(), slug, chID, cpage, 100)
 	if err != nil {
 		s.renderErrorPage(w, r, http.StatusNotFound, "error.not_found")
 		return
 	}
+	bk := rd.Book
 	pctx := s.basePageContextWithSession(r, viewer, sess)
 	pctx.PageTitle = bk.Title + " · " + pctx.Site.Title
 	pctx.BookDetail = bk
-	activeIdx := -1
-	if chID := strings.TrimSpace(r.URL.Query().Get("ch")); chID != "" {
-		for i := range bk.FlatChapters {
-			if bk.FlatChapters[i].ID == chID {
-				pctx.ActiveChapter = &bk.FlatChapters[i]
-				activeIdx = i
-				break
-			}
-		}
-		if pctx.ActiveChapter == nil {
-			s.renderErrorPage(w, r, http.StatusNotFound, "error.not_found")
-			return
-		}
-	} else if bk.EmbedMode == "iframe" || bk.EmbedMode == "inline" {
-		for i := range bk.FlatChapters {
-			if strings.TrimSpace(bk.FlatChapters[i].URL) != "" {
-				pctx.ActiveChapter = &bk.FlatChapters[i]
-				activeIdx = i
-				break
-			}
-		}
-	}
-	if activeIdx > 0 {
-		prevCh := bk.FlatChapters[activeIdx-1]
-		pctx.PrevChapter = &prevCh
-	}
-	if activeIdx >= 0 && activeIdx+1 < len(bk.FlatChapters) {
-		nextCh := bk.FlatChapters[activeIdx+1]
-		pctx.NextChapter = &nextCh
-	}
+	pctx.ActiveChapter = rd.ActiveChapter
+	pctx.PrevChapter = rd.PrevChapter
+	pctx.NextChapter = rd.NextChapter
+	pctx.Page = rd.ChapterPage
+	pctx.TotalPages = rd.TotalPages
+	pctx.Pagination = theme.BuildPagination(rd.ChapterPage, rd.TotalPages, rd.PerPage, rd.TotalChapters, 5)
 	if pctx.ActiveChapter != nil {
 		if postSlug := s.extractLocalPostSlugFromChapterURL(r, pctx.ActiveChapter.URL); postSlug != "" {
 			if raw, gErr := s.deps.Content.GetPublishedRawArticleBySlug(r.Context(), postSlug); gErr == nil {
@@ -3704,39 +3807,29 @@ func (s *AppServer) handleLinksPage(w http.ResponseWriter, r *http.Request) {
 	pctx.PageTitle = s.deps.Catalog.T(pctx.Locale, "nav.links") + " · " + pctx.Site.Title
 
 	const perPage = 48
+	q := strings.TrimSpace(r.URL.Query().Get("q"))
 	catFilter := strings.TrimSpace(r.URL.Query().Get("category"))
 	page := parsePageParam(r)
-	links, _, total, _ := s.deps.Content.ListPublicLinksPage(r.Context(), catFilter, page, perPage)
-	totalPages := computeTotalPages(total, perPage)
-	if page > totalPages {
-		page = totalPages
-		links, _, total, _ = s.deps.Content.ListPublicLinksPage(r.Context(), catFilter, page, perPage)
-	}
+	uncatLabel := s.deps.Catalog.T(pctx.Locale, "nav.links")
+	groups, _, totalLinks, totalPages, clampedPage, _ := s.deps.Content.ListPublicLinkGroupsPage(
+		r.Context(), q, catFilter, uncatLabel, page, perPage,
+	)
 
-	grouped := make(map[string][]domain.Link)
-	var catOrder []string
-	for _, lk := range links {
-		cat := strings.TrimSpace(lk.CategoryName)
-		if cat == "" {
-			cat = s.deps.Catalog.T(pctx.Locale, "nav.links")
-		}
-		if len(grouped[cat]) == 0 {
-			catOrder = append(catOrder, cat)
-		}
-		grouped[cat] = append(grouped[cat], lk)
-	}
-	linkGroups := make([]theme.LinkCategoryGroup, 0, len(catOrder))
-	for _, cat := range catOrder {
+	grouped := make(map[string][]domain.Link, len(groups))
+	linkGroups := make([]theme.LinkCategoryGroup, 0, len(groups))
+	for _, g := range groups {
+		grouped[g.Category] = g.Items
 		linkGroups = append(linkGroups, theme.LinkCategoryGroup{
-			Category: cat,
-			Items:    grouped[cat],
+			Category: g.Category,
+			Items:    g.Items,
 		})
 	}
 	pctx.LinksByCategory = grouped
 	pctx.LinkGroups = linkGroups
-	pctx.Page = page
+	pctx.TagQuery = q
+	pctx.Page = clampedPage
 	pctx.TotalPages = totalPages
-	pctx.Pagination = theme.BuildPagination(page, totalPages, perPage, total, 5)
+	pctx.Pagination = theme.BuildPagination(clampedPage, totalPages, perPage, totalLinks, 5)
 	s.renderStudio(w, r, http.StatusOK, "links.html", pctx)
 }
 

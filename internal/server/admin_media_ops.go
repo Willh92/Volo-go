@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"io"
 	"io/fs"
+	"math"
 	"mime"
 	"net/http"
 	"os"
@@ -17,9 +18,12 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Willh92/Volo-go/internal/adminui"
 	"github.com/Willh92/Volo-go/internal/db/sqlx"
 	"github.com/Willh92/Volo-go/internal/domain"
+	"github.com/Willh92/Volo-go/internal/extpkg"
 	"github.com/Willh92/Volo-go/internal/media"
+	"github.com/Willh92/Volo-go/internal/security"
 	"github.com/Willh92/Volo-go/internal/theme"
 	"github.com/Willh92/Volo-go/pkg/id"
 )
@@ -238,10 +242,20 @@ func (s *AppServer) invalidateMediaRefCache() {
 		return
 	}
 	s.mediaRefCacheMu.Lock()
+	s.mediaRefInvalidateGen++
 	s.mediaRefCachedRev = 0
 	s.mediaRefCountsByAssetID = nil
 	s.mediaRefOrphanCounts = nil
 	s.mediaRefCacheMu.Unlock()
+}
+
+func (s *AppServer) ensureMediaRefFetchSem() chan struct{} {
+	s.mediaRefFetchOnce.Do(func() {
+		if s.mediaRefFetchSem == nil {
+			s.mediaRefFetchSem = make(chan struct{}, 1)
+		}
+	})
+	return s.mediaRefFetchSem
 }
 
 func mediaAssetRefLookupKey(a domain.MediaAsset) string {
@@ -257,36 +271,69 @@ func mediaAssetRefLookupKey(a domain.MediaAsset) string {
 
 // collectMediaRefCountsCached computes per-asset reference counts via `media.CountAssetReferences`,
 // caching only compact `map[assetID]int` keyed by `store.DataRevision()` so prose tokens are never retained on heap.
-func (s *AppServer) collectMediaRefCountsCached(ctx context.Context) map[string]int {
+// Concurrent misses at the same revision are deduplicated via a context-aware singleflight semaphore, and
+// monotonic revision + invalidation generation guards prevent stale scans from overwriting newer state.
+func (s *AppServer) collectMediaRefCountsCached(ctx context.Context) (map[string]int, uint64) {
 	if s == nil || s.deps.Store == nil {
-		return map[string]int{}
+		return map[string]int{}, 0
 	}
 	curRev := s.deps.Store.DataRevision()
 	s.mediaRefCacheMu.Lock()
 	if s.mediaRefCountsByAssetID != nil && curRev > 0 && s.mediaRefCachedRev == curRev {
 		cached := s.mediaRefCountsByAssetID
 		s.mediaRefCacheMu.Unlock()
-		return cached
+		return cached, curRev
 	}
+	s.mediaRefCacheMu.Unlock()
+
+	sem := s.ensureMediaRefFetchSem()
+	select {
+	case sem <- struct{}{}:
+		defer func() { <-sem }()
+	case <-ctx.Done():
+		return map[string]int{}, 0
+	}
+
+	curRev = s.deps.Store.DataRevision()
+	s.mediaRefCacheMu.Lock()
+	if s.mediaRefCountsByAssetID != nil && curRev > 0 && s.mediaRefCachedRev == curRev {
+		cached := s.mediaRefCountsByAssetID
+		s.mediaRefCacheMu.Unlock()
+		return cached, curRev
+	}
+	gen := s.mediaRefInvalidateGen
 	s.mediaRefCacheMu.Unlock()
 
 	var allAssets []domain.MediaAsset
-	_ = sqlx.SelectInto(ctx, s.deps.Store, &allAssets,
+	selErr := sqlx.SelectInto(ctx, s.deps.Store, &allAssets,
 		`SELECT id, storage_driver, object_key, public_url FROM media_assets`)
+	if selErr != nil {
+		return map[string]int{}, 0
+	}
 
 	refCounts, err := media.CountAssetReferences(ctx, s.deps.Store, allAssets)
-	if err != nil || refCounts == nil {
+	if err != nil {
+		return map[string]int{}, 0
+	}
+	if refCounts == nil {
 		refCounts = map[string]int{}
 	}
 
-	s.mediaRefCacheMu.Lock()
-	if s.mediaRefCachedRev != curRev {
-		s.mediaRefOrphanCounts = make(map[string]int)
+	latestRev := s.deps.Store.DataRevision()
+	var committedRev uint64
+	if curRev > 0 && latestRev == curRev {
+		s.mediaRefCacheMu.Lock()
+		if s.mediaRefInvalidateGen == gen && curRev >= s.mediaRefCachedRev {
+			if s.mediaRefCachedRev != curRev {
+				s.mediaRefOrphanCounts = make(map[string]int)
+			}
+			s.mediaRefCachedRev = curRev
+			s.mediaRefCountsByAssetID = refCounts
+			committedRev = curRev
+		}
+		s.mediaRefCacheMu.Unlock()
 	}
-	s.mediaRefCachedRev = curRev
-	s.mediaRefCountsByAssetID = refCounts
-	s.mediaRefCacheMu.Unlock()
-	return refCounts
+	return refCounts, committedRev
 }
 
 func (s *AppServer) countAssetsReferences(ctx context.Context, assets []domain.MediaAsset) []int {
@@ -294,7 +341,7 @@ func (s *AppServer) countAssetsReferences(ctx context.Context, assets []domain.M
 	if len(assets) == 0 || s == nil || s.deps.Store == nil {
 		return counts
 	}
-	cachedByKey := s.collectMediaRefCountsCached(ctx)
+	cachedByKey, _ := s.collectMediaRefCountsCached(ctx)
 	var missing []domain.MediaAsset
 	var missingIdx []int
 	for i, a := range assets {
@@ -323,11 +370,10 @@ func (s *AppServer) cachedOrComputeOrphanCount(
 	cacheScopeKey string,
 	canCache bool,
 ) int {
-	refCounts := s.collectMediaRefCountsCached(ctx)
-	curRev := s.deps.Store.DataRevision()
-	if canCache && curRev > 0 {
+	refCounts, refRev := s.collectMediaRefCountsCached(ctx)
+	if canCache && refRev > 0 {
 		s.mediaRefCacheMu.Lock()
-		if s.mediaRefCachedRev == curRev && s.mediaRefOrphanCounts != nil {
+		if s.mediaRefCachedRev == refRev && s.mediaRefOrphanCounts != nil {
 			if cnt, ok := s.mediaRefOrphanCounts[cacheScopeKey]; ok {
 				s.mediaRefCacheMu.Unlock()
 				return cnt
@@ -336,27 +382,35 @@ func (s *AppServer) cachedOrComputeOrphanCount(
 		s.mediaRefCacheMu.Unlock()
 	}
 
-	var keyRows []struct {
-		ID        string `db:"id"`
-		ObjectKey string `db:"object_key"`
-		PublicURL string `db:"public_url"`
-	}
-	_ = sqlx.SelectInto(ctx, s.deps.Store, &keyRows, `SELECT id, object_key, public_url FROM media_assets WHERE `+whereSQL, args...)
 	orphanCnt := 0
-	for _, kr := range keyRows {
-		mk := mediaAssetRefLookupKey(domain.MediaAsset{
-			ID:        kr.ID,
-			ObjectKey: kr.ObjectKey,
-			PublicURL: kr.PublicURL,
-		})
-		if refCounts[mk] == 0 {
-			orphanCnt++
+	if canCache && cacheScopeKey == "global" && refRev > 0 {
+		// Global unfiltered scope: refCounts already contains every media_assets row at refRev.
+		for _, rc := range refCounts {
+			if rc == 0 {
+				orphanCnt++
+			}
+		}
+	} else if rows, qErr := s.deps.Store.QueryContext(ctx, `SELECT id, object_key, public_url FROM media_assets WHERE `+whereSQL, args...); qErr == nil {
+		defer rows.Close()
+		for rows.Next() {
+			var rowID, objKey, pubURL string
+			if scanErr := rows.Scan(&rowID, &objKey, &pubURL); scanErr != nil {
+				continue
+			}
+			mk := mediaAssetRefLookupKey(domain.MediaAsset{
+				ID:        rowID,
+				ObjectKey: objKey,
+				PublicURL: pubURL,
+			})
+			if refCounts[mk] == 0 {
+				orphanCnt++
+			}
 		}
 	}
 
-	if canCache && curRev > 0 {
+	if canCache && refRev > 0 && s.deps.Store.DataRevision() == refRev {
 		s.mediaRefCacheMu.Lock()
-		if s.mediaRefCachedRev == curRev {
+		if s.mediaRefCachedRev == refRev {
 			if s.mediaRefOrphanCounts == nil {
 				s.mediaRefOrphanCounts = make(map[string]int)
 			}
@@ -465,59 +519,75 @@ func (s *AppServer) queryAdminMediaPage(
 	}
 
 	if usage == "unused" || usage == "orphan" || usage == "used" {
-		type mediaKeyRow struct {
-			ID            string `db:"id"`
-			StorageDriver string `db:"storage_driver"`
-			ObjectKey     string `db:"object_key"`
-			PublicURL     string `db:"public_url"`
-			SizeBytes     int64  `db:"size_bytes"`
-		}
-		var keyRows []mediaKeyRow
-		_ = sqlx.SelectInto(ctx, s.deps.Store, &keyRows,
+		refCounts, _ := s.collectMediaRefCountsCached(ctx)
+		rows, qErr := s.deps.Store.QueryContext(ctx,
 			`SELECT id, storage_driver, object_key, public_url, size_bytes FROM media_assets WHERE `+whereSQL+` ORDER BY `+orderClause, args...)
-		if len(keyRows) == 0 {
+		if qErr != nil {
 			return []MediaAssetView{}, 0, allTotal, 0, 0
 		}
-		probeAssets := make([]domain.MediaAsset, len(keyRows))
-		for i, kr := range keyRows {
-			probeAssets[i] = domain.MediaAsset{
-				ID:            kr.ID,
-				StorageDriver: kr.StorageDriver,
-				ObjectKey:     kr.ObjectKey,
-				PublicURL:     kr.PublicURL,
-			}
-		}
-		refCounts := s.countAssetsReferences(ctx, probeAssets)
+
 		type matchedKey struct {
 			id  string
 			rc  int
 			orp bool
 		}
-		matched := make([]matchedKey, 0, len(keyRows))
+		wantUsed := usage == "used"
+		start := math.MaxInt
+		end := math.MaxInt
+		if page >= 1 && perPage > 0 && (page-1) <= math.MaxInt/perPage {
+			start = (page - 1) * perPage
+			end = start + perPage
+			if end < start {
+				end = math.MaxInt
+			}
+		}
+		capHint := 50
+		if perPage > 0 && perPage <= 200 {
+			capHint = perPage
+		} else if perPage > 200 {
+			capHint = 200
+		}
+		pageMatched := make([]matchedKey, 0, capHint)
+		total := 0
 		orphanCnt := 0
 		var totalBytes int64
-		wantUsed := usage == "used"
-		for i, kr := range keyRows {
-			rc := refCounts[i]
+
+		for rows.Next() {
+			var rowID, drv, objKey, pubURL string
+			var sizeBytes int64
+			if scanErr := rows.Scan(&rowID, &drv, &objKey, &pubURL, &sizeBytes); scanErr != nil {
+				continue
+			}
+			asset := domain.MediaAsset{
+				ID:            rowID,
+				StorageDriver: drv,
+				ObjectKey:     objKey,
+				PublicURL:     pubURL,
+			}
+			mk := mediaAssetRefLookupKey(asset)
+			rc, ok := refCounts[mk]
+			if !ok {
+				if fb, fbErr := media.CountAssetReferences(ctx, s.deps.Store, []domain.MediaAsset{asset}); fbErr == nil {
+					rc = fb[mk]
+				}
+			}
 			isOrp := rc == 0
 			if isOrp {
 				orphanCnt++
 			}
 			if (wantUsed && rc > 0) || (!wantUsed && isOrp) {
-				totalBytes += kr.SizeBytes
-				matched = append(matched, matchedKey{id: kr.ID, rc: rc, orp: isOrp})
+				totalBytes += sizeBytes
+				if total >= start && total < end {
+					pageMatched = append(pageMatched, matchedKey{id: rowID, rc: rc, orp: isOrp})
+				}
+				total++
 			}
 		}
-		total := len(matched)
-		start := (page - 1) * perPage
-		if start >= total {
+		_ = rows.Close()
+
+		if len(pageMatched) == 0 {
 			return []MediaAssetView{}, total, allTotal, orphanCnt, totalBytes
 		}
-		end := start + perPage
-		if end > total {
-			end = total
-		}
-		pageMatched := matched[start:end]
 		placeholders := make([]string, len(pageMatched))
 		idArgs := make([]any, len(pageMatched))
 		for i, m := range pageMatched {
@@ -552,15 +622,12 @@ func (s *AppServer) queryAdminMediaPage(
 		return []MediaAssetView{}, 0, allTotal, 0, 0
 	}
 
-	offset := (page - 1) * perPage
-	baseSQL := `SELECT * FROM media_assets WHERE ` + whereSQL + ` ORDER BY ` + orderClause
-	paginatedSQL, pageArgs := s.deps.Store.Dialect().PaginateSQL(baseSQL, perPage, offset)
-	fullArgs := make([]any, 0, len(args)+len(pageArgs))
-	fullArgs = append(fullArgs, args...)
-	fullArgs = append(fullArgs, pageArgs...)
-
 	var rows []domain.MediaAsset
-	_ = sqlx.SelectInto(ctx, s.deps.Store, &rows, paginatedSQL, fullArgs...)
+	if (page-1) <= (total-1)/perPage {
+		baseSQL := `SELECT * FROM media_assets WHERE ` + whereSQL + ` ORDER BY ` + orderClause
+		paginatedSQL, fullArgs := s.paginateQuery(baseSQL, args, page, perPage)
+		_ = sqlx.SelectInto(ctx, s.deps.Store, &rows, paginatedSQL, fullArgs...)
+	}
 
 	orphanCnt := 0
 	var refCounts []int
@@ -724,15 +791,61 @@ func CompareSemVer(a, b string) int {
 }
 
 // Cached GitHub repository metadata for Admin About page (`/api/admin/about/project-info`)
-var aboutProjectCache struct {
-	mu        sync.Mutex
-	fetchMu   sync.Mutex
-	fetchedAt time.Time
-	stars     int
-	forks     int
-	latestTag string
-	htmlURL   string
-	liveOK    bool
+type aboutProjectCacheState struct {
+	mu            sync.Mutex
+	inflight      chan struct{}
+	fetchedAt     time.Time
+	repoFetchedAt time.Time
+	repoOK        bool
+	relFetchedAt  time.Time
+	relOK         bool
+	stars         int
+	forks         int
+	openIssues    int
+	repoFullName  string
+	repoDesc      string
+	repoLang      string
+	htmlURL       string
+	latestTag     string
+	latestName    string
+	latestHTMLURL string
+	latestPubAt   string
+	liveOK        bool
+}
+
+// SetAboutGitHubURLsForTest overrides the GitHub API endpoints used by /api/admin/about/project-info in tests.
+func (s *AppServer) SetAboutGitHubURLsForTest(repoURL, releaseURL string) {
+	if s == nil {
+		return
+	}
+	s.aboutCache.mu.Lock()
+	defer s.aboutCache.mu.Unlock()
+	s.aboutRepoAPIURL = strings.TrimSpace(repoURL)
+	s.aboutReleaseAPIURL = strings.TrimSpace(releaseURL)
+}
+
+// SetAboutClockForTest overrides the clock used by /api/admin/about/project-info cache TTL checks in tests.
+func (s *AppServer) SetAboutClockForTest(fn func() time.Time) {
+	if s == nil {
+		return
+	}
+	s.aboutCache.mu.Lock()
+	defer s.aboutCache.mu.Unlock()
+	s.aboutNowFn = fn
+}
+
+func isAboutPartStale(attemptedAt time.Time, ok, forceRefresh bool, now time.Time) bool {
+	if attemptedAt.IsZero() {
+		return true
+	}
+	ttl := 30 * time.Minute
+	if !ok {
+		ttl = 2 * time.Minute
+	}
+	if forceRefresh {
+		ttl = 10 * time.Second
+	}
+	return now.Sub(attemptedAt) > ttl
 }
 
 func (s *AppServer) handleAdminAboutProjectInfo(w http.ResponseWriter, r *http.Request) {
@@ -740,89 +853,256 @@ func (s *AppServer) handleAdminAboutProjectInfo(w http.ResponseWriter, r *http.R
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
-	ver := strings.TrimSpace(s.deps.Version)
-	if ver == "" {
-		ver = "v1.0.0"
-	}
+	ver := s.effectiveAppVersion()
 	repoURL := "https://github.com/Willh92/Volo-go"
 
 	forceRefresh := r.URL.Query().Get("refresh") == "1" || r.URL.Query().Get("refresh") == "true"
-	cacheTTL := 30 * time.Minute
-	if forceRefresh {
-		cacheTTL = 10 * time.Second
+	offline := r.URL.Query().Get("offline") == "1"
+
+	var (
+		fetchedAt     time.Time
+		stars         int
+		forks         int
+		openIssues    int
+		repoFullName  string
+		repoDesc      string
+		repoLang      string
+		htmlURL       string
+		latestTag     string
+		latestName    string
+		latestHTMLURL string
+		latestPubAt   string
+		liveOK        bool
+	)
+	snapshotLocked := func() {
+		fetchedAt = s.aboutCache.fetchedAt
+		stars = s.aboutCache.stars
+		forks = s.aboutCache.forks
+		openIssues = s.aboutCache.openIssues
+		repoFullName = s.aboutCache.repoFullName
+		repoDesc = s.aboutCache.repoDesc
+		repoLang = s.aboutCache.repoLang
+		htmlURL = s.aboutCache.htmlURL
+		latestTag = s.aboutCache.latestTag
+		latestName = s.aboutCache.latestName
+		latestHTMLURL = s.aboutCache.latestHTMLURL
+		latestPubAt = s.aboutCache.latestPubAt
+		liveOK = s.aboutCache.liveOK
 	}
 
-	aboutProjectCache.mu.Lock()
-	stale := time.Since(aboutProjectCache.fetchedAt) > cacheTTL
-	stars := aboutProjectCache.stars
-	forks := aboutProjectCache.forks
-	latestTag := aboutProjectCache.latestTag
-	liveOK := aboutProjectCache.liveOK
-	aboutProjectCache.mu.Unlock()
+	for attempts := 0; attempts < 2; attempts++ {
+		s.aboutCache.mu.Lock()
+		nowFn := s.aboutNowFn
+		now := time.Now()
+		if nowFn != nil {
+			now = nowFn()
+		}
+		needRepo := isAboutPartStale(s.aboutCache.repoFetchedAt, s.aboutCache.repoOK, forceRefresh, now)
+		needRel := isAboutPartStale(s.aboutCache.relFetchedAt, s.aboutCache.relOK, forceRefresh, now)
+		if (!needRepo && !needRel) || offline || s.deps.OutboundDialer == nil {
+			s.aboutCache.mu.Unlock()
+			break
+		}
+		if ch := s.aboutCache.inflight; ch != nil {
+			s.aboutCache.mu.Unlock()
+			select {
+			case <-ch:
+			case <-r.Context().Done():
+				return
+			}
+			continue
+		}
+		ch := make(chan struct{})
+		s.aboutCache.inflight = ch
+		repoEndpoint := s.aboutRepoAPIURL
+		if repoEndpoint == "" {
+			repoEndpoint = "https://api.github.com/repos/Willh92/Volo-go"
+		}
+		relEndpoint := s.aboutReleaseAPIURL
+		if relEndpoint == "" {
+			relEndpoint = "https://api.github.com/repos/Willh92/Volo-go/releases/latest"
+		}
+		dialer := s.deps.OutboundDialer
+		baseCtx := s.bgCtx
+		if baseCtx == nil {
+			baseCtx = context.Background()
+		}
+		s.aboutCache.mu.Unlock()
 
-	if stale && r.URL.Query().Get("offline") != "1" && s.deps.OutboundDialer != nil {
-		aboutProjectCache.fetchMu.Lock()
-		aboutProjectCache.mu.Lock()
-		stillStale := time.Since(aboutProjectCache.fetchedAt) > cacheTTL
-		stars = aboutProjectCache.stars
-		forks = aboutProjectCache.forks
-		latestTag = aboutProjectCache.latestTag
-		liveOK = aboutProjectCache.liveOK
-		aboutProjectCache.mu.Unlock()
+		s.bgWG.Add(1)
+		go func(needRepo, needRel bool, repoEndpoint, relEndpoint string, dialer *security.OutboundSafeDialer, baseCtx context.Context, nowFn func() time.Time, ch chan struct{}) {
+			defer s.bgWG.Done()
+			ctx, cancel := context.WithTimeout(baseCtx, 6*time.Second)
+			defer cancel()
 
-		if stillStale {
-			ctx, cancel := context.WithTimeout(r.Context(), 3500*time.Millisecond)
-			cli := s.deps.OutboundDialer.NewHTTPClient(3500 * time.Millisecond)
-			req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://api.github.com/repos/Willh92/Volo-go", nil)
-			if err == nil {
-				req.Header.Set("Accept", "application/vnd.github+json")
-				req.Header.Set("User-Agent", "Volo-go/"+ver)
-				if resp, rErr := cli.Do(req); rErr == nil {
+			cli := dialer.NewHTTPClient(6 * time.Second)
+			var (
+				wg         sync.WaitGroup
+				repoOK     bool
+				relOK      bool
+				nextStars  int
+				nextForks  int
+				nextIssues int
+				nextFull   string
+				nextDesc   string
+				nextLang   string
+				nextHTML   string
+				nextTag    string
+				nextName   string
+				nextRelURL string
+				nextPubAt  string
+			)
+
+			defer func() {
+				fetchNow := time.Now()
+				if nowFn != nil {
+					fetchNow = nowFn()
+				}
+				s.aboutCache.mu.Lock()
+				if needRepo {
+					s.aboutCache.repoFetchedAt = fetchNow
+					s.aboutCache.repoOK = repoOK
+					if repoOK {
+						s.aboutCache.stars = nextStars
+						s.aboutCache.forks = nextForks
+						s.aboutCache.openIssues = nextIssues
+						if nextFull != "" {
+							s.aboutCache.repoFullName = nextFull
+						}
+						if nextDesc != "" {
+							s.aboutCache.repoDesc = nextDesc
+						}
+						if nextLang != "" {
+							s.aboutCache.repoLang = nextLang
+						}
+						if nextHTML != "" {
+							s.aboutCache.htmlURL = nextHTML
+						}
+					}
+				}
+				if needRel {
+					s.aboutCache.relFetchedAt = fetchNow
+					s.aboutCache.relOK = relOK
+					if relOK {
+						s.aboutCache.latestTag = nextTag
+						s.aboutCache.latestName = nextName
+						if nextRelURL != "" {
+							s.aboutCache.latestHTMLURL = nextRelURL
+						}
+						s.aboutCache.latestPubAt = nextPubAt
+					}
+				}
+				s.aboutCache.fetchedAt = fetchNow
+				s.aboutCache.liveOK = s.aboutCache.repoOK && s.aboutCache.relOK
+				s.aboutCache.inflight = nil
+				close(ch)
+				s.aboutCache.mu.Unlock()
+			}()
+
+			if needRepo {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					req, err := http.NewRequestWithContext(ctx, http.MethodGet, repoEndpoint, nil)
+					if err != nil {
+						return
+					}
+					req.Header.Set("Accept", "application/vnd.github+json")
+					req.Header.Set("User-Agent", "Volo-go/"+ver)
+					resp, rErr := cli.Do(req)
+					if rErr != nil {
+						return
+					}
+					defer resp.Body.Close()
 					var meta struct {
+						FullName        string `json:"full_name"`
+						Description     string `json:"description"`
+						Language        string `json:"language"`
 						StargazersCount int    `json:"stargazers_count"`
 						ForksCount      int    `json:"forks_count"`
+						OpenIssuesCount int    `json:"open_issues_count"`
 						HTMLURL         string `json:"html_url"`
 					}
 					if resp.StatusCode == http.StatusOK && json.NewDecoder(io.LimitReader(resp.Body, 65536)).Decode(&meta) == nil {
-						stars = meta.StargazersCount
-						forks = meta.ForksCount
-						liveOK = true
+						nextStars = meta.StargazersCount
+						nextForks = meta.ForksCount
+						nextIssues = meta.OpenIssuesCount
+						nextFull = strings.TrimSpace(meta.FullName)
+						nextDesc = strings.TrimSpace(meta.Description)
+						nextLang = strings.TrimSpace(meta.Language)
+						nextHTML = extpkg.SanitizeHTTPURL(meta.HTMLURL)
+						repoOK = true
 					}
-					_ = resp.Body.Close()
-				}
+				}()
 			}
-			relReq, relErr := http.NewRequestWithContext(ctx, http.MethodGet, "https://api.github.com/repos/Willh92/Volo-go/releases/latest", nil)
-			if relErr == nil {
-				relReq.Header.Set("Accept", "application/vnd.github+json")
-				relReq.Header.Set("User-Agent", "Volo-go/"+ver)
-				if resp, rErr := cli.Do(relReq); rErr == nil {
+
+			if needRel {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					relReq, relErr := http.NewRequestWithContext(ctx, http.MethodGet, relEndpoint, nil)
+					if relErr != nil {
+						return
+					}
+					relReq.Header.Set("Accept", "application/vnd.github+json")
+					relReq.Header.Set("User-Agent", "Volo-go/"+ver)
+					resp, rErr := cli.Do(relReq)
+					if rErr != nil {
+						return
+					}
+					defer resp.Body.Close()
 					var rel struct {
-						TagName string `json:"tag_name"`
+						TagName     string `json:"tag_name"`
+						Name        string `json:"name"`
+						HTMLURL     string `json:"html_url"`
+						PublishedAt string `json:"published_at"`
 					}
 					if resp.StatusCode == http.StatusOK && json.NewDecoder(io.LimitReader(resp.Body, 65536)).Decode(&rel) == nil && strings.TrimSpace(rel.TagName) != "" {
-						latestTag = strings.TrimSpace(rel.TagName)
-						liveOK = true
+						nextTag = strings.TrimSpace(rel.TagName)
+						nextName = strings.TrimSpace(rel.Name)
+						nextRelURL = extpkg.SanitizeHTTPURL(rel.HTMLURL)
+						nextPubAt = strings.TrimSpace(rel.PublishedAt)
+						relOK = true
 					}
-					_ = resp.Body.Close()
-				}
+				}()
 			}
-			cancel()
 
-			aboutProjectCache.mu.Lock()
-			aboutProjectCache.fetchedAt = time.Now()
-			aboutProjectCache.stars = stars
-			aboutProjectCache.forks = forks
-			aboutProjectCache.latestTag = latestTag
-			aboutProjectCache.liveOK = liveOK
-			aboutProjectCache.mu.Unlock()
+			wg.Wait()
+		}(needRepo, needRel, repoEndpoint, relEndpoint, dialer, baseCtx, nowFn, ch)
+
+		select {
+		case <-ch:
+		case <-r.Context().Done():
+			return
 		}
-		aboutProjectCache.fetchMu.Unlock()
+		break
 	}
 
+	s.aboutCache.mu.Lock()
+	snapshotLocked()
+	s.aboutCache.mu.Unlock()
+
+	if repoFullName == "" {
+		repoFullName = "Willh92/Volo-go"
+	}
+	if htmlURL == "" {
+		htmlURL = repoURL
+	}
+	if repoLang == "" {
+		repoLang = "Go"
+	}
 	if latestTag == "" {
 		latestTag = ver
 	}
+	if latestHTMLURL == "" {
+		latestHTMLURL = repoURL + "/releases"
+	}
 	hasUpdate := latestTag != "" && CompareSemVer(latestTag, ver) > 0
+	adminGzipKB := math.Round(float64(adminui.Default().TotalGzipBytes())/1024.0*10) / 10
+	checkedAtMS := int64(0)
+	if !fetchedAt.IsZero() {
+		checkedAtMS = fetchedAt.UnixMilli()
+	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"project_name":   "Volo-go",
@@ -832,12 +1112,32 @@ func (s *AppServer) handleAdminAboutProjectInfo(w http.ResponseWriter, r *http.R
 		"go_version":     runtime.Version(),
 		"os_arch":        runtime.GOOS + "/" + runtime.GOARCH,
 		"db_dialect":     s.deps.Store.Dialect().Name(),
-		"repo_url":       repoURL,
-		"issues_url":     repoURL + "/issues",
-		"releases_url":   repoURL + "/releases",
-		"license":        "Apache-2.0",
-		"stars":          stars,
-		"forks":          forks,
-		"live_fetched":   liveOK,
+		"admin_gzip_kb":  adminGzipKB,
+		"online":         liveOK,
+		"checked_at":     checkedAtMS,
+		"repo": map[string]any{
+			"full_name":   repoFullName,
+			"html_url":    htmlURL,
+			"description": repoDesc,
+			"stars":       stars,
+			"forks":       forks,
+			"open_issues": openIssues,
+			"language":    repoLang,
+			"license":     "Apache-2.0",
+		},
+		"latest_release": map[string]any{
+			"tag_name":     latestTag,
+			"name":         latestName,
+			"html_url":     latestHTMLURL,
+			"published_at": latestPubAt,
+		},
+		"repo_url":     htmlURL,
+		"issues_url":   repoURL + "/issues",
+		"releases_url": latestHTMLURL,
+		"license":      "Apache-2.0",
+		"stars":        stars,
+		"forks":        forks,
+		"open_issues":  openIssues,
+		"live_fetched": liveOK,
 	})
 }

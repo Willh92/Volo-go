@@ -45,7 +45,6 @@ import {
   historyKeymap,
   insertBlankLine,
   insertNewlineKeepIndent,
-  insertTab,
   moveLineDown,
   moveLineUp,
   redo,
@@ -70,8 +69,30 @@ import {
   undo,
 } from "@codemirror/commands";
 import type { KeyBinding } from "@codemirror/view";
-import { apiFetch, readBootConfig, showToast } from "../api";
+import { apiFetch, readBootConfig, safeHref, safeMediaSrc, showToast, trimEndChars } from "../api";
+import { parseClipboardHtml } from "./clipboardHtmlParser";
 import { localeSig, t } from "../i18n";
+import {
+  cleanClipboardUrl,
+  CODE_BLOCK_LANGS,
+  collapseNewlines,
+  computeCssContext,
+  computeFenceDelim,
+  DASH_COMMENT_LANGS,
+  detectIRCodeLang,
+  escapeMarkdownProseText,
+  findCssStringRanges,
+  HASH_COMMENT_LANGS,
+  IR_CODE_RE,
+  IR_FN_REF_RE,
+  IR_INLINE_MATH_RE,
+  IR_ML_ANCHOR_RE,
+  NO_HASH_COMMENT_LANGS,
+  parseQuotePrefix,
+  resolveFenceLangFamily,
+  splitGfmTableRow,
+  stripQuotePrefix,
+} from "./markdownHelpers";
 import {
   AnimatedModal,
   computePortalMenuStyle,
@@ -87,40 +108,25 @@ import {
 } from "./UIControls";
 import { MediaLibraryModal } from "./MediaLibraryModal";
 import type { CM6CssEditorProps, CM6EditorProps } from "./CM6Editor";
+import {
+  buildCMImeHandlers,
+  createPropSyncTracker,
+  isPropSyncUpdate,
+  recordEditorEmit,
+  syncCMViewValue,
+} from "./cm6PropSync";
+
+const POP_DIMS: Record<string, { minW: number; maxW: number; maxH: number; estH: number }> = {
+  heading: { minW: 112, maxW: 180, maxH: 260, estH: 228 },
+  color: { minW: 224, maxW: 260, maxH: 310, estH: 236 },
+  callout: { minW: 196, maxW: 240, maxH: 250, estH: 200 },
+  codeblock: { minW: 168, maxW: 220, maxH: 300, estH: 280 },
+  book: { minW: 236, maxW: 290, maxH: 180, estH: 112 },
+  math: { minW: 224, maxW: 280, maxH: 240, estH: 172 },
+  export: { minW: 236, maxW: 300, maxH: 220, estH: 142 },
+};
 
 type EditorMode = "ir" | "wysiwyg" | "sv";
-
-const CODE_BLOCK_LANGS: ReadonlyArray<{ value: string; label: string }> = [
-  { value: "go", label: "Go" },
-  { value: "bash", label: "Bash / Shell" },
-  { value: "javascript", label: "JavaScript" },
-  { value: "typescript", label: "TypeScript" },
-  { value: "python", label: "Python" },
-  { value: "rust", label: "Rust" },
-  { value: "csharp", label: "C#" },
-  { value: "cpp", label: "C / C++" },
-  { value: "java", label: "Java" },
-  { value: "php", label: "PHP" },
-  { value: "ruby", label: "Ruby" },
-  { value: "lua", label: "Lua" },
-  { value: "dart", label: "Dart" },
-  { value: "scala", label: "Scala" },
-  { value: "zig", label: "Zig" },
-  { value: "elixir", label: "Elixir" },
-  { value: "sql", label: "SQL" },
-  { value: "graphql", label: "GraphQL" },
-  { value: "proto", label: "Protobuf" },
-  { value: "hcl", label: "HCL / Terraform" },
-  { value: "json", label: "JSON" },
-  { value: "yaml", label: "YAML" },
-  { value: "toml", label: "TOML / INI" },
-  { value: "nginx", label: "Nginx" },
-  { value: "html", label: "HTML / XML" },
-  { value: "css", label: "CSS" },
-  { value: "scss", label: "SCSS / Less" },
-  { value: "diff", label: "Diff" },
-  { value: "", label: "" },
-];
 
 async function copyTextToClipboard(text: string): Promise<void> {
   if (typeof navigator !== "undefined" && navigator.clipboard?.writeText) {
@@ -218,7 +224,11 @@ function getActiveSearchLineRange(
   };
 }
 
-function indentTwoSpaces(view: EditorView): boolean {
+function mapSelectedLines(
+  view: EditorView,
+  userEvent: string,
+  fn: (line: { from: number; text: string }) => { from: number; to: number; insert: string } | null
+): boolean {
   const { state } = view;
   if (state.readOnly) return false;
   const changes: Array<{ from: number; to: number; insert: string }> = [];
@@ -232,45 +242,24 @@ function indentTwoSpaces(view: EditorView): boolean {
     for (let ln = startLine; ln <= endLine; ln++) {
       if (seen.has(ln)) continue;
       seen.add(ln);
-      const line = state.doc.line(ln);
-      changes.push({ from: line.from, to: line.from, insert: "  " });
+      const ch = fn(state.doc.line(ln));
+      if (ch) changes.push(ch);
     }
   }
   if (changes.length > 0) {
-    view.dispatch({ changes, userEvent: "input.indent" });
+    view.dispatch({ changes, userEvent });
   }
   return true;
 }
 
-function dedentTwoSpaces(view: EditorView): boolean {
-  const { state } = view;
-  if (state.readOnly) return false;
-  const changes: Array<{ from: number; to: number; insert: string }> = [];
-  const seen = new Set<number>();
-  for (const r of state.selection.ranges) {
-    const startLine = state.doc.lineAt(r.from).number;
-    const endLine =
-      r.to > r.from && state.doc.lineAt(r.to).from === r.to
-        ? Math.max(startLine, state.doc.lineAt(r.to).number - 1)
-        : state.doc.lineAt(r.to).number;
-    for (let ln = startLine; ln <= endLine; ln++) {
-      if (seen.has(ln)) continue;
-      seen.add(ln);
-      const line = state.doc.line(ln);
-      if (line.text.startsWith("\t")) {
-        changes.push({ from: line.from, to: line.from + 1, insert: "" });
-      } else if (line.text.startsWith("  ")) {
-        changes.push({ from: line.from, to: line.from + 2, insert: "" });
-      } else if (line.text.startsWith(" ")) {
-        changes.push({ from: line.from, to: line.from + 1, insert: "" });
-      }
-    }
-  }
-  if (changes.length > 0) {
-    view.dispatch({ changes, userEvent: "input.dedent" });
-  }
-  return true;
-}
+const indentTwoSpaces = (view: EditorView): boolean =>
+  mapSelectedLines(view, "input.indent", (line) => ({ from: line.from, to: line.from, insert: "  " }));
+
+const dedentTwoSpaces = (view: EditorView): boolean =>
+  mapSelectedLines(view, "input.dedent", (line) => {
+    const n = line.text.startsWith("\t") ? 1 : line.text.startsWith("  ") ? 2 : line.text.startsWith(" ") ? 1 : 0;
+    return n > 0 ? { from: line.from, to: line.from + n, insert: "" } : null;
+  });
 
 const voloIndentWithTab: KeyBinding = {
   key: "Tab",
@@ -340,53 +329,60 @@ interface FenceOpenMatch {
 }
 
 function countQuotePrefix(text: string): { depth: number; len: number } {
-  const m = /^((?: {0,3}>\s?)+)/.exec(text);
-  if (!m) return { depth: 0, len: 0 };
-  return { depth: Math.min(3, (m[1].match(/>/g) || []).length), len: m[1].length };
-}
-
-function stripQuotePrefix(text: string, maxMarkers: number): { stripped: string; len: number } {
-  if (maxMarkers <= 0) return { stripped: text, len: 0 };
-  let idx = 0;
-  let count = 0;
-  while (count < maxMarkers && idx < text.length) {
-    let sp = 0;
-    while (sp < 3 && idx + sp < text.length && text[idx + sp] === " ") sp++;
-    if (text[idx + sp] !== ">") break;
-    idx += sp + 1;
-    if (text[idx] === " ") idx++;
-    count++;
-  }
-  return { stripped: text.slice(idx), len: idx };
+  const { prefixLen, markerCount } = parseQuotePrefix(text);
+  return { depth: Math.min(3, markerCount), len: prefixLen };
 }
 
 function matchFenceOpen(text: string): FenceOpenMatch | null {
-  const m = /^((?: {0,3}>\s?)*)( {0,3})(`{3,}|~{3,})(.*)$/.exec(text);
-  if (!m) return null;
-  const qPrefix = m[1];
-  const qDepth = qPrefix ? Math.min(3, (qPrefix.match(/>/g) || []).length) : 0;
-  const fenceChar = m[3][0] as "`" | "~";
-  const rest = m[4];
+  const { prefixLen, markerCount } = parseQuotePrefix(text);
+  const tail = text.slice(prefixLen);
+  const m = /^( {0,3})(`{3,}|~{3,})([^\n\r\u2028\u2029]*)/.exec(tail);
+  if (!m || m[0].length !== tail.length) return null;
+  const qDepth = Math.min(3, markerCount);
+  const fenceChar = m[2][0] as "`" | "~";
+  const rest = m[3];
   if (fenceChar === "`" && rest.includes("`")) return null;
   const leadTrim = /^\s*/.exec(rest)?.[0].length ?? 0;
   const langTok = /^[^\s`~]*/.exec(rest.slice(leadTrim))?.[0] ?? "";
   return {
-    quotePrefixLen: qPrefix.length,
+    quotePrefixLen: prefixLen,
     quoteDepth: qDepth,
-    leadSpaces: qPrefix.length + m[2].length,
+    leadSpaces: prefixLen + m[1].length,
     fenceChar,
-    fenceLen: m[3].length,
+    fenceLen: m[2].length,
     lang: langTok,
-    langOffset: qPrefix.length + m[2].length + m[3].length + leadTrim,
+    langOffset: prefixLen + m[1].length + m[2].length + leadTrim,
     langRawLen: langTok.length,
   };
 }
 
 function matchFenceClose(text: string, fenceChar: string, fenceLen: number, fenceQuoteDepth = 0): boolean {
-  const m = /^((?: {0,3}>\s?)*)( {0,3})(`{3,}|~{3,})\s*$/.exec(text);
-  if (!m) return false;
-  const qDepth = m[1] ? Math.min(3, (m[1].match(/>/g) || []).length) : 0;
-  return qDepth === fenceQuoteDepth && m[3][0] === fenceChar && m[3].length >= fenceLen;
+  const { prefixLen, markerCount } = parseQuotePrefix(text);
+  if (Math.min(3, markerCount) !== fenceQuoteDepth) return false;
+  const rest = text.slice(prefixLen);
+  let sp = 0;
+  while (sp < 3 && sp < rest.length && rest[sp] === " ") sp++;
+  let fl = 0;
+  while (sp + fl < rest.length && rest[sp + fl] === fenceChar) fl++;
+  if (fl < 3 || fl < fenceLen) return false;
+  for (let i = sp + fl; i < rest.length; i++) {
+    if (!/\s/.test(rest[i])) return false;
+  }
+  return true;
+}
+
+function trailingHorizWsLen(s: string): number {
+  let i = s.length;
+  while (i > 0 && (s[i - 1] === " " || s[i - 1] === "\t")) i--;
+  return s.length - i;
+}
+
+function stripHorizWsBeforeNewline(s: string): string {
+  if (!s.includes("\n")) return s;
+  return s
+    .split("\n")
+    .map((line, i, arr) => (i < arr.length - 1 ? line.slice(0, line.length - trailingHorizWsLen(line)) : line))
+    .join("\n");
 }
 
 function isInsideFencedCode(state: EditorState, lineNumber: number): boolean {
@@ -413,13 +409,6 @@ function isInsideMathBlock(state: EditorState, lineNumber: number): boolean {
 
 const mdLinePrefixRe =
   /^(\s*(?:>\s*)*)(?:([-*+])\s+(\[[ xX]\]\s+)?|(\d+)([.)])\s+|)?(.*)$/;
-
-function hasUnescapedTrailingPipe(s: string): boolean {
-  if (!s.endsWith("|")) return false;
-  let bs = 0;
-  for (let i = s.length - 2; i >= 0 && s[i] === "\\"; i--) bs++;
-  return bs % 2 === 0;
-}
 
 function getGfmTableCellRanges(lineFrom: number, lineText: string): Array<{ from: number; to: number }> {
   const trimmed = lineText.trim();
@@ -452,7 +441,7 @@ function getGfmTableCellRanges(lineFrom: number, lineText: string): Array<{ from
   return ranges.map((r) => {
     const raw = lineText.slice(r.from - lineFrom, r.to - lineFrom);
     const lead = raw.match(/^\s*/)?.[0].length ?? 0;
-    const trail = raw.match(/\s*$/)?.[0].length ?? 0;
+    const trail = raw.length - raw.trimEnd().length;
     const contentFrom = r.from + lead;
     const contentTo = Math.max(contentFrom, r.to - trail);
     if (contentFrom === contentTo && r.to > r.from) {
@@ -526,32 +515,6 @@ function navigateGfmTableCell(view: EditorView, dir: 1 | -1): boolean {
   }
   return false;
 }
-
-const HASH_COMMENT_LANGS = new Set([
-  "py",
-  "python",
-  "sh",
-  "bash",
-  "zsh",
-  "shell",
-  "console",
-  "yaml",
-  "yml",
-  "toml",
-  "ini",
-  "conf",
-  "nginx",
-  "rb",
-  "ruby",
-  "pl",
-  "perl",
-  "r",
-  "dockerfile",
-  "makefile",
-  "env",
-]);
-
-const DASH_COMMENT_LANGS = new Set(["sql", "mysql", "postgres", "postgresql", "sqlite", "pgsql", "lua"]);
 
 function resolveEnclosingFenceLang(state: EditorState, lineNumber: number): string {
   const scan = getIRDocScan(state.doc);
@@ -659,9 +622,8 @@ function toggleEditorComment(view: EditorView, cssOnly = false): boolean {
     const trimmed = l.text.trim();
     if (!trimmed && startLn !== endLn) continue;
     const lead = /^[ \t]*/.exec(l.text)?.[0] || "";
-    const trail = /[ \t]*$/.exec(l.text)?.[0] || "";
     const bodyFrom = l.from + lead.length;
-    const bodyTo = l.to - trail.length;
+    const bodyTo = l.to - trailingHorizWsLen(l.text);
     if (trimmed.startsWith(openTrim) && trimmed.endsWith(closeTrim) && trimmed.length >= openTrim.length + closeTrim.length) {
       const inner = trimmed.slice(openTrim.length, trimmed.length - closeTrim.length).replace(/^ | $/g, "");
       changes.push({ from: bodyFrom, to: bodyTo, insert: inner });
@@ -746,6 +708,20 @@ function buildSmartTypingExt(cssOnly = false): Extension {
     }
     return false;
   });
+}
+
+function deleteAutoPair(view: EditorView, pos: number, lineTo: number): boolean {
+  if (pos >= lineTo) return false;
+  const { state } = view;
+  if (CODE_AUTO_PAIRS[state.sliceDoc(pos - 1, pos)] === state.sliceDoc(pos, pos + 1)) {
+    view.dispatch({
+      changes: { from: pos - 1, to: pos + 1, insert: "" },
+      selection: { anchor: pos - 1 },
+      userEvent: "delete.backward",
+    });
+    return true;
+  }
+  return false;
 }
 
 function expandIndentedBracesOnEnter(view: EditorView): boolean {
@@ -874,19 +850,7 @@ const markdownEditingKeymap: KeyBinding[] = [
       const line = state.doc.lineAt(pos);
       if (pos === line.from) return false;
       if (isInsideFencedCode(state, line.number)) {
-        if (pos < line.to) {
-          const prevCh = state.sliceDoc(pos - 1, pos);
-          const nextCh = state.sliceDoc(pos, pos + 1);
-          if (CODE_AUTO_PAIRS[prevCh] === nextCh) {
-            view.dispatch({
-              changes: { from: pos - 1, to: pos + 1, insert: "" },
-              selection: { anchor: pos - 1 },
-              userEvent: "delete.backward",
-            });
-            return true;
-          }
-        }
-        return false;
+        return deleteAutoPair(view, pos, line.to);
       }
       const before = line.text.slice(0, pos - line.from);
       if (/^\s*(?:>\s*)+(?:[-*+]\s+(?:\[[ xX]\]\s+)?|\d+[.)]\s+)?$/.test(before) ||
@@ -908,8 +872,13 @@ const pasteURLAsLinkExt = EditorView.domEventHandlers({
   paste(event, view) {
     const { state } = view;
     if (state.readOnly) return false;
-    const text = event.clipboardData?.getData("text/plain")?.trim() || "";
-    if (!/^https?:\/\/\S+$/i.test(text)) return false;
+    const rawText = event.clipboardData?.getData("text/plain")?.trim() || "";
+    const text = safeHref(cleanClipboardUrl(rawText, "href"), {
+      allowRelative: false,
+      allowHash: false,
+      allowMailto: false,
+    });
+    if (!text || !/^https?:\/\//i.test(text)) return false;
     const sel = state.selection.main;
     if (sel.empty) return false;
     const line = state.doc.lineAt(sel.from);
@@ -936,7 +905,7 @@ const DEFAULT_VENDOR_CDN_BASES = [
   "https://unpkg.com",
 ];
 function normalizeVendorCDNBase(raw: string): string | null {
-  const trimmed = raw.trim().replace(/[<>"'`\s]+/g, "").replace(/\/+$/, "");
+  const trimmed = trimEndChars(raw.trim().replace(/[<>"'`\s]+/g, ""), "/");
   if (!trimmed) return null;
   if (trimmed.startsWith("/") && !trimmed.startsWith("//") && !trimmed.startsWith("/\\")) {
     return encodeURI(trimmed);
@@ -945,7 +914,7 @@ function normalizeVendorCDNBase(raw: string): string | null {
     try {
       const u = new URL(trimmed);
       if (u.protocol === "https:" || u.protocol === "http:") {
-        return encodeURI((u.origin + u.pathname).replace(/\/+$/, ""));
+        return encodeURI(trimEndChars(u.origin + u.pathname, "/"));
       }
     } catch {
       return null;
@@ -1134,6 +1103,18 @@ function renderMermaidSvg(code: string, target: HTMLElement, onReady?: () => voi
         const svgEl = doc.querySelector("svg");
         if (svgEl) {
           svgEl.querySelectorAll("script").forEach((s) => s.remove());
+          svgEl.querySelectorAll("*").forEach((el) => {
+            for (const attr of Array.from(el.attributes)) {
+              const name = attr.name.toLowerCase();
+              if (name.startsWith("on")) {
+                el.removeAttribute(attr.name);
+              } else if (name === "href" || name === "xlink:href") {
+                if (!safeHref(attr.value, { allowMailto: false })) {
+                  el.removeAttribute(attr.name);
+                }
+              }
+            }
+          });
           target.replaceChildren(document.importNode(svgEl, true));
           onReady?.();
         }
@@ -1145,6 +1126,85 @@ function renderMermaidSvg(code: string, target: HTMLElement, onReady?: () => voi
       }
     });
 }
+
+function mkEl<K extends keyof HTMLElementTagNameMap>(
+  tag: K,
+  cls?: string,
+  text?: string
+): HTMLElementTagNameMap[K] {
+  const el = document.createElement(tag);
+  if (cls) el.className = cls;
+  if (text !== undefined) el.textContent = text;
+  return el;
+}
+
+function triggerCopyBtnFeedback(
+  btn: HTMLButtonElement,
+  text: string,
+  copyTxt: string,
+  copiedTxt: string,
+  onError?: () => void
+): void {
+  void copyTextToClipboard(text)
+    .then(() => {
+      const prevTimer = (btn as any)._copyTimer;
+      if (prevTimer) window.clearTimeout(prevTimer);
+      btn.setAttribute("data-copied", "true");
+      btn.textContent = `✓ ${copiedTxt}`;
+      (btn as any)._copyTimer = window.setTimeout(() => {
+        (btn as any)._copyTimer = 0;
+        if (btn.isConnected) {
+          btn.removeAttribute("data-copied");
+          btn.textContent = copyTxt;
+        }
+      }, 1400);
+    })
+    .catch(() => {
+      onError?.();
+    });
+}
+
+function populateCodeLangSelect(
+  select: HTMLSelectElement,
+  explicitLang: string,
+  autoLang: string,
+  plainTxt: string,
+  markSelectedAttr = false
+): void {
+  const seen = new Set<string>();
+  for (const item of CODE_BLOCK_LANGS) {
+    seen.add(item.value);
+    const label =
+      item.value === ""
+        ? autoLang
+          ? `${autoLang.toUpperCase()} · auto`
+          : plainTxt
+        : item.label;
+    const opt = mkEl("option", undefined, label);
+    opt.value = item.value;
+    if (markSelectedAttr && item.value === explicitLang) {
+      opt.selected = true;
+      opt.setAttribute("selected", "");
+    }
+    select.appendChild(opt);
+  }
+  if (explicitLang && !seen.has(explicitLang)) {
+    const custom = mkEl("option", undefined, explicitLang.toUpperCase());
+    custom.value = explicitLang;
+    if (markSelectedAttr) {
+      custom.selected = true;
+      custom.setAttribute("selected", "");
+    }
+    select.insertBefore(custom, select.firstChild);
+  }
+  select.value = explicitLang;
+}
+
+const codeHeadBoundRoots = new WeakSet<HTMLElement>();
+const codeHeadHostOpts = new WeakMap<
+  HTMLElement,
+  { copyLabel: string; copiedLabel: string; onLangChange?: () => void }
+>();
 
 export function enhanceRenderedPreviewDOM(
   root: HTMLElement,
@@ -1159,11 +1219,15 @@ export function enhanceRenderedPreviewDOM(
   // 0. Ensure external images bypass strict hotlink Referer checks and fix &amp;-escaped URLs
   root.querySelectorAll<HTMLImageElement>("img").forEach((img) => {
     const rawSrc = img.getAttribute("src") || "";
-    const cleaned = cleanClipboardUrl(rawSrc) || rawSrc.trim();
-    if (cleaned && cleaned !== rawSrc) {
+    const cleaned = cleanClipboardUrl(rawSrc, "src");
+    if (!cleaned) {
+      img.removeAttribute("src");
+      return;
+    }
+    if (cleaned !== rawSrc) {
       img.setAttribute("src", cleaned);
     }
-    if (cleaned && !/^(?:\/(?!\/)|data:|blob:)/i.test(cleaned)) {
+    if (!/^(?:\/(?!\/)|data:|blob:)/i.test(cleaned)) {
       img.referrerPolicy = "no-referrer";
     }
   });
@@ -1175,9 +1239,14 @@ export function enhanceRenderedPreviewDOM(
       if (!el.hasAttribute("data-math-src")) {
         const raw = (el.textContent || "").trim();
         const isBlock = el.classList.contains("volo-math-block");
-        const stripped = isBlock
-          ? raw.replace(/^(?:\$\$|\\\[)\s*|\s*(?:\$\$|\\\])$/g, "")
-          : raw.replace(/^\$|\$$/g, "");
+        let stripped = raw;
+        if (isBlock) {
+          if (stripped.startsWith("$$") || stripped.startsWith("\\[")) stripped = stripped.slice(2);
+          if (stripped.endsWith("$$") || stripped.endsWith("\\]")) stripped = stripped.slice(0, -2);
+          stripped = stripped.trim();
+        } else {
+          stripped = raw.replace(/^\$|\$$/g, "");
+        }
         el.setAttribute("data-math-src", stripped);
         el.setAttribute("data-math-display", isBlock ? "1" : "0");
       }
@@ -1216,34 +1285,30 @@ export function enhanceRenderedPreviewDOM(
     }
   }
 
-  // 2b. Protected directive cards ([data-volo-md-b64]: :::lock, :::book, :::bookshelf, custom :::plugin, [toc])
+  // 2b. Protected directive cards & callout titles in WYSIWYG
   if (opts.isWysiwyg) {
-    for (const el of Array.from(root.querySelectorAll<HTMLElement>("[data-volo-md-b64], [data-md-toc], [data-md-media-href]"))) {
+    for (const el of Array.from(
+      root.querySelectorAll<HTMLElement>("[data-volo-md-b64], [data-md-toc], [data-md-media-href], .volo-callout__title")
+    )) {
       el.contentEditable = "false";
     }
   }
 
   // 3. Split Preview visual boundary markers (<!--more-->, :::lock)
   if (!opts.isWysiwyg) {
+    const mkMarker = (txt: string) => {
+      const m = mkEl("div", "volo-pv-marker");
+      m.appendChild(mkEl("span", undefined, txt));
+      return m;
+    };
     for (const p of Array.from(root.querySelectorAll<HTMLElement>("p"))) {
       if ((p.textContent || "").trim() === "§VOLO_MORE_MARKER§") {
-        const marker = document.createElement("div");
-        marker.className = "volo-pv-marker";
-        const span = document.createElement("span");
-        span.textContent = "<!--more-->";
-        marker.appendChild(span);
-        p.replaceWith(marker);
+        p.replaceWith(mkMarker("<!--more-->"));
       }
     }
     for (const lk of Array.from(root.querySelectorAll<HTMLElement>(".volo-lock-block--unlocked"))) {
       if (lk.querySelector(":scope > .volo-pv-marker")) continue;
-      const lType = lk.getAttribute("data-lock-type") || "password";
-      const marker = document.createElement("div");
-      marker.className = "volo-pv-marker";
-      const span = document.createElement("span");
-      span.textContent = `:::lock (${lType})`;
-      marker.appendChild(span);
-      lk.prepend(marker);
+      lk.prepend(mkMarker(`:::lock (${lk.getAttribute("data-lock-type") || "password"})`));
     }
   }
 
@@ -1251,6 +1316,47 @@ export function enhanceRenderedPreviewDOM(
   const copyTxt = opts.copyLabel || "Copy";
   const copiedTxt = opts.copiedLabel || "Copied";
   const plainTxt = opts.plainLabel || "CODE";
+  codeHeadHostOpts.set(root, { copyLabel: copyTxt, copiedLabel: copiedTxt, onLangChange: opts.onLangChange });
+  if (!codeHeadBoundRoots.has(root)) {
+    codeHeadBoundRoots.add(root);
+    root.addEventListener("click", (ev) => {
+      const btn = (ev.target as HTMLElement | null)?.closest(".volo-copy-btn") as HTMLButtonElement | null;
+      if (!btn || !root.contains(btn)) return;
+      ev.preventDefault();
+      ev.stopPropagation();
+      const host = btn.closest("figure.volo-codeblock, .volo-code-block") as HTMLElement | null;
+      const pre = host?.querySelector("pre") as HTMLElement | null;
+      if (!pre) return;
+      const cfg = codeHeadHostOpts.get(root);
+      triggerCopyBtnFeedback(
+        btn,
+        extractPreCodeLines(pre),
+        cfg?.copyLabel || "Copy",
+        cfg?.copiedLabel || "Copied",
+        () => showToast(t("api.err_network"), "err")
+      );
+    });
+    root.addEventListener("change", (ev) => {
+      const target = ev.target;
+      if (!(target instanceof HTMLSelectElement) || !target.classList.contains("volo-code-lang-select") || !root.contains(target)) {
+        return;
+      }
+      ev.stopPropagation();
+      const host = target.closest("figure.volo-codeblock, .volo-code-block") as HTMLElement | null;
+      const nextLang = target.value.trim().toLowerCase();
+      if (host) {
+        if (nextLang) host.setAttribute("data-lang", nextLang);
+        else host.removeAttribute("data-lang");
+      }
+      for (const opt of Array.from(target.options)) {
+        const match = opt.value === nextLang;
+        opt.selected = match;
+        if (match) opt.setAttribute("selected", "");
+        else opt.removeAttribute("selected");
+      }
+      codeHeadHostOpts.get(root)?.onLangChange?.();
+    });
+  }
   for (const pre of Array.from(root.querySelectorAll<HTMLElement>("pre:not(.mermaid)"))) {
     const fig = pre.closest("figure.volo-codeblock") as HTMLElement | null;
     const container = fig || pre.parentElement;
@@ -1281,8 +1387,7 @@ export function enhanceRenderedPreviewDOM(
       fig.classList.add("volo-code-block");
       host = fig;
     } else {
-      const wrap = document.createElement("figure");
-      wrap.className = "volo-codeblock volo-code-block";
+      const wrap = mkEl("figure", "volo-codeblock volo-code-block");
       if (explicitLang) wrap.setAttribute("data-lang", explicitLang);
       if (detectedLang) wrap.setAttribute("data-detected-lang", detectedLang);
       pre.replaceWith(wrap);
@@ -1290,90 +1395,32 @@ export function enhanceRenderedPreviewDOM(
       host = wrap;
     }
 
-    const head = document.createElement("div");
-    head.className = "volo-code-head";
+    const head = mkEl("div", "volo-code-head");
     head.contentEditable = "false";
 
     if (opts.isWysiwyg) {
-      const select = document.createElement("select");
-      select.className = "volo-code-lang-select";
+      const select = mkEl("select", "volo-code-lang-select");
       select.setAttribute("aria-label", t("ed.code_lang_ph"));
-      const seenVals = new Set<string>();
-      for (const item of CODE_BLOCK_LANGS) {
-        seenVals.add(item.value);
-        const opt = document.createElement("option");
-        opt.value = item.value;
-        opt.textContent =
-          item.value === ""
-            ? detectedLang
-              ? `${detectedLang.toUpperCase()} · auto`
-              : plainTxt
-            : item.label;
-        select.appendChild(opt);
-      }
-      if (explicitLang && !seenVals.has(explicitLang)) {
-        const customOpt = document.createElement("option");
-        customOpt.value = explicitLang;
-        customOpt.textContent = explicitLang.toUpperCase();
-        select.insertBefore(customOpt, select.firstChild);
-      }
-      select.value = explicitLang;
-      select.onchange = (ev) => {
-        ev.stopPropagation();
-        const nextLang = select.value.trim().toLowerCase();
-        if (nextLang) host.setAttribute("data-lang", nextLang);
-        else host.removeAttribute("data-lang");
-        opts.onLangChange?.();
-      };
+      populateCodeLangSelect(select, explicitLang, detectedLang, plainTxt, true);
       head.appendChild(select);
     } else {
-      const langSpan = document.createElement("span");
-      langSpan.className = "volo-code-lang";
+      const langSpan = mkEl("span", "volo-code-lang", (explicitLang || detectedLang || "code").toUpperCase());
       if (!explicitLang) langSpan.setAttribute("data-auto-lang", "1");
-      langSpan.textContent = (explicitLang || detectedLang || "code").toUpperCase();
       head.appendChild(langSpan);
     }
 
-    const btn = document.createElement("button");
+    const btn = mkEl("button", "volo-copy-btn", copyTxt);
     btn.type = "button";
-    btn.className = "volo-copy-btn";
-    btn.textContent = copyTxt;
-    btn.onclick = (ev) => {
-      ev.preventDefault();
-      ev.stopPropagation();
-      const clone = (pre.querySelector("code") || pre).cloneNode(true) as HTMLElement;
-      clone.querySelectorAll(".ln, .lnt, .volo-code-head, button, select").forEach((n) => n.remove());
-      void copyTextToClipboard((clone.textContent || "").replace(/\u00a0/g, " ")).then(() => {
-        const prevTimer = (btn as any)._copyTimer;
-        if (prevTimer) window.clearTimeout(prevTimer);
-        btn.setAttribute("data-copied", "true");
-        btn.textContent = `✓ ${copiedTxt}`;
-        (btn as any)._copyTimer = window.setTimeout(() => {
-          (btn as any)._copyTimer = 0;
-          if (btn.isConnected) {
-            btn.removeAttribute("data-copied");
-            btn.textContent = copyTxt;
-          }
-        }, 1400);
-      });
-    };
     head.appendChild(btn);
     host.insertBefore(head, host.firstChild);
   }
 }
 
-function cleanClipboardUrl(raw: string): string {
-  let s = raw.replace(/[\u200b-\u200d\ufeff]/g, "").trim();
-  if (!s || /^(?:javascript|vbscript):/i.test(s)) return "";
-  if (/^data:/i.test(s) && !/^data:image\/(?:png|jpe?g|gif|webp|avif|bmp|x-icon);base64,/i.test(s)) {
-    return "";
-  }
-  if (/^(?:https?:\/\/|\/\/|\/)/i.test(s)) {
-    for (let pass = 0; pass < 2 && s.includes("&amp;"); pass++) {
-      s = s.replace(/&amp;/gi, "&");
-    }
-  }
-  return s;
+function formatDirectiveAttr(k: string, raw: unknown): string {
+  const v = String(raw ?? "").replace(/[\r\n]+/g, " ").trim();
+  if (!v.includes('"')) return `${k}="${v}"`;
+  if (!v.includes("'")) return `${k}='${v}'`;
+  return `${k}="${v.replace(/"/g, "'")}"`;
 }
 
 function escapeMdLinkLabel(label: string): string {
@@ -1393,17 +1440,10 @@ function parseMarkdownImageTarget(rawTarget: string): string {
 
 function resolveIRImageSrc(rawSrc: string): string {
   let s = rawSrc.trim();
-  if (!s || s.startsWith("//") || s.startsWith("/\\")) return "";
-  if (/^data:image\/(?:png|jpe?g|gif|webp|avif|bmp|x-icon);base64,/i.test(s)) return s;
-  if (/^(?:javascript|vbscript|data|file):/i.test(s)) return "";
-  if (/^https?:\/\//i.test(s)) {
-    s = cleanClipboardUrl(s);
-    return s;
-  }
-  if (/^(?:blob:|\/)/i.test(s)) return s;
-  if (s.startsWith("./")) return "/" + s.slice(2).replace(/^\/+/, "");
-  if (/^(?:image|images|uploads)\//i.test(s)) return "/" + s;
-  return s;
+  if (!s) return "";
+  if (s.startsWith("./")) s = "/" + s.slice(2).replace(/^\/+/, "");
+  else if (/^(?:image|images|uploads)\//i.test(s)) s = "/" + s;
+  return cleanClipboardUrl(s, "src");
 }
 
 function isVideoMedia(mime?: string, url?: string): boolean {
@@ -1506,262 +1546,16 @@ interface IRDocScan {
   lockState: Uint8Array;
 }
 
-const NO_HASH_COMMENT_LANGS = new Set([
-  "c",
-  "cpp",
-  "c++",
-  "cc",
-  "cxx",
-  "h",
-  "hpp",
-  "cs",
-  "c#",
-  "csharp",
-  "fs",
-  "f#",
-  "fsharp",
-  "vb",
-  "vb.net",
-  "vbnet",
-  "go",
-  "golang",
-  "js",
-  "jsx",
-  "javascript",
-  "mjs",
-  "cjs",
-  "ts",
-  "tsx",
-  "typescript",
-  "java",
-  "kotlin",
-  "kt",
-  "swift",
-  "dart",
-  "rust",
-  "rs",
-  "zig",
-  "lua",
-  "proto",
-  "protobuf",
-  "css",
-  "scss",
-  "less",
-  "html",
-  "htm",
-  "xml",
-  "svg",
-  "vue",
-  "svelte",
-  "json",
-  "jsonc",
-  "json5",
-  "sql",
-  "mysql",
-  "postgres",
-  "postgresql",
-  "sqlite",
-  "pgsql",
-  "diff",
-  "patch",
-  "glsl",
-  "hlsl",
-  "wgsl",
-  "scala",
-  "groovy",
-  "objc",
-]);
-
-function resolveFenceLangFamily(lang: string): number {
-  switch (lang) {
-    case "json":
-    case "jsonc":
-    case "json5":
-      return 3;
-    case "html":
-    case "htm":
-    case "xml":
-    case "svg":
-    case "vue":
-    case "svelte":
-      return 4;
-    case "css":
-    case "scss":
-    case "less":
-      return 5;
-    case "diff":
-    case "patch":
-      return 6;
-    case "sql":
-    case "mysql":
-    case "postgres":
-    case "postgresql":
-    case "sqlite":
-    case "pgsql":
-      return 7;
-    case "lua":
-      return 8;
-    case "graphql":
-    case "gql":
-      return 9;
-    case "proto":
-    case "protobuf":
-      return 10;
-    case "sh":
-    case "bash":
-    case "zsh":
-    case "shell":
-    case "console":
-    case "py":
-    case "python":
-    case "rb":
-    case "ruby":
-    case "elixir":
-    case "ex":
-    case "exs":
-    case "hcl":
-    case "terraform":
-    case "tf":
-    case "yaml":
-    case "yml":
-    case "toml":
-    case "ini":
-    case "conf":
-    case "nginx":
-    case "env":
-    case "dockerfile":
-    case "makefile":
-    case "perl":
-    case "pl":
-    case "r":
-      return 2;
-    case "c":
-    case "cpp":
-    case "c++":
-    case "cc":
-    case "cxx":
-    case "h":
-    case "hpp":
-    case "cs":
-    case "c#":
-    case "csharp":
-    case "fs":
-    case "f#":
-    case "fsharp":
-    case "vb":
-    case "vb.net":
-    case "vbnet":
-    case "go":
-    case "golang":
-    case "js":
-    case "jsx":
-    case "javascript":
-    case "mjs":
-    case "cjs":
-    case "ts":
-    case "tsx":
-    case "typescript":
-    case "java":
-    case "kotlin":
-    case "kt":
-    case "swift":
-    case "dart":
-    case "rust":
-    case "rs":
-    case "zig":
-    case "scala":
-    case "php":
-      return 1;
-    default:
-      return 0;
-  }
-}
-
-function detectIRCodeLang(
-  linesText: string[],
-  startLn: number,
-  endLn: number
-): { lang: string; fam: number; noHash: number } {
-  if (startLn > endLn) return { lang: "", fam: 0, noHash: 0 };
-  const sampleLines: string[] = [];
-  let charBudget = 0;
-  for (let k = startLn; k <= endLn && sampleLines.length < 32 && charBudget < 2400; k++) {
-    const t = linesText[k];
-    if (t.trim()) {
-      sampleLines.push(t);
-      charBudget += t.length + 1;
+function scanQuotedEnd(s: string, start: number, q: string): number {
+  let i = start + 1;
+  while (i < s.length) {
+    if (s[i] === "\\") {
+      i += 2;
+      continue;
     }
+    if (s[i++] === q) break;
   }
-  if (sampleLines.length === 0) return { lang: "", fam: 0, noHash: 0 };
-  const sample = sampleLines.join("\n");
-  const first = sampleLines[0].trim();
-
-  if (/^(?:diff --git\b|---\s+\S|\+\+\+\s+\S|@@\s+-\d+)/m.test(sample)) {
-    return { lang: "diff", fam: 6, noHash: 1 };
-  }
-  if (/^(?:<!DOCTYPE\s+html\b|<\?xml\b|<(?:html|head|body|div|section|template|svg|script|style|table|form|main|article)\b)/i.test(first)) {
-    return { lang: first.startsWith("<?xml") ? "xml" : "html", fam: 4, noHash: 1 };
-  }
-  if ((first.startsWith("{") || first.startsWith("[")) && /"[^"\n]+"\s*:/.test(sample)) {
-    return { lang: "json", fam: 3, noHash: 1 };
-  }
-  if (/^\s*(?:SELECT\b[\s\S]*\bFROM\b|INSERT\s+INTO\b|UPDATE\s+\w+\s+SET\b|DELETE\s+FROM\b|CREATE\s+(?:TABLE|INDEX|VIEW|DATABASE)\b|ALTER\s+TABLE\b)/im.test(sample)) {
-    return { lang: "sql", fam: 7, noHash: 1 };
-  }
-  if (
-    /\b(?:server\s*\{|location\s+[~^=*\s/]|proxy_pass\s+|fastcgi_pass\s+|upstream\s+\w+|listen\s+\d+|server_name\s+|absolute_redirect\s+(?:on|off)|proxy_set_header\s+)/.test(
-      sample
-    )
-  ) {
-    return { lang: "nginx", fam: 2, noHash: 0 };
-  }
-  if (
-    /(?:^\s*(?:@media|@keyframes|:root|\.[a-zA-Z_-][\w-]*\s*[,{]|#[a-zA-Z_-][\w-]*\s*[,{]))/m.test(sample) &&
-    /[a-z-]+\s*:\s*[^;\n]+;/.test(sample)
-  ) {
-    return { lang: "css", fam: 5, noHash: 1 };
-  }
-  if (/\b(?:package\s+[a-z_]\w*|func\s+(?:\([^)]+\)\s*)?[A-Za-z_]\w*\s*\(|fmt\.Print|if\s+err\s*!=\s*nil\b)/.test(sample)) {
-    return { lang: "go", fam: 1, noHash: 1 };
-  }
-  if (/\b(?:fn\s+[a-z_]\w*\s*[<(]|let\s+mut\s+|impl\b|pub\s+(?:fn|struct|enum|use)\b|println!\s*\()/.test(sample)) {
-    return { lang: "rust", fam: 1, noHash: 1 };
-  }
-  if (/^\s*syntax\s*=\s*["']proto[23]["']/m.test(sample) || /\b(?:message|service)\s+[A-Z]\w*\s*\{/.test(sample)) {
-    return { lang: "proto", fam: 10, noHash: 1 };
-  }
-  if (/^<\?php\b/m.test(sample) || (/\$[A-Za-z_]\w*\s*=/.test(sample) && /->|::|\bfunction\b/.test(sample))) {
-    return { lang: "php", fam: 1, noHash: 0 };
-  }
-  if (/^\s*(?:query|mutation|subscription|fragment\s+\w+\s+on|type\s+\w+\s*(?:implements\s+\w+\s*)?\{)/m.test(sample)) {
-    return { lang: "graphql", fam: 9, noHash: 0 };
-  }
-  if (/^\s*#\s*(?:include|define|ifdef|ifndef|pragma)\b/m.test(sample) || /\b(?:std::|int\s+main\s*\()/.test(sample)) {
-    return { lang: "cpp", fam: 1, noHash: 1 };
-  }
-  if (/\b(?:local\s+[A-Za-z_]\w*\s*=|elseif\b.*\bthen\b|function\s+[A-Za-z_][\w.:]*\s*\([\s\S]*?\bend\b)/.test(sample)) {
-    return { lang: "lua", fam: 8, noHash: 1 };
-  }
-  if (/^\s*(?:def\s+[A-Za-z_]\w*\s*\(|from\s+[A-Za-z_][\w.]*\s+import\s+|elif\s+.+:|if\s+__name__\s*==)/m.test(sample)) {
-    return { lang: "python", fam: 2, noHash: 0 };
-  }
-  if (/\b(?:def\s+[a-z_]\w*[?!]?|attr_accessor\b|require\s+['"]|puts\s+|elsif\b)/.test(sample) && /\bend\b/.test(sample)) {
-    return { lang: "ruby", fam: 2, noHash: 0 };
-  }
-  if (/\b(?:const\s+\w+\s*=|let\s+\w+\s*=|export\s+(?:default|function|const|interface|type|class)\b|import\s+.+\s+from\s+['"]|console\.\w+\()/.test(sample)) {
-    return { lang: /\b(?:interface\s+\w+|:\s*(?:string|number|boolean|Record|ReadonlyArray)\b)/.test(sample) ? "typescript" : "javascript", fam: 1, noHash: 1 };
-  }
-  if (/^(?:#!\/(?:usr\/bin\/env\s+)?(?:ba|z)?sh\b|\s*(?:sudo|apt|apt-get|yum|dnf|docker|kubectl|systemctl|git|npm|pnpm|curl|wget|chmod|chown|mkdir|export)\s+)/m.test(sample)) {
-    return { lang: "bash", fam: 2, noHash: 0 };
-  }
-  if (
-    !sample.includes("{") &&
-    !sample.includes(";") &&
-    sampleLines.filter((l) => /^\s*(?:-\s+)?[A-Za-z0-9_.-]+:\s*(?:\S|$)/.test(l)).length >= 2
-  ) {
-    return { lang: "yaml", fam: 2, noHash: 0 };
-  }
-  return { lang: "", fam: 0, noHash: 0 };
+  return i;
 }
 
 function populateFenceBlockMeta(
@@ -1777,7 +1571,7 @@ function populateFenceBlockMeta(
 ): void {
   const supportsHtmlCmt = fam === 4;
   const supportsLuaCmt = fam === 8;
-  const supportsSlashCmt = fam === 0 || fam === 1 || fam === 3 || fam === 5 || fam === 7 || fam === 10;
+  const supportsSlashCmt = fam === 0 || fam === 1 || fam === 3 || fam === 5 || fam === 7 || fam === 10 || fam === 12;
   let inBlock = false;
 
   for (let k = startLn; k <= endLn; k++) {
@@ -1823,14 +1617,7 @@ function populateFenceBlockMeta(
           break;
         }
         if (s[i] === '"' || s[i] === "'") {
-          const q = s[i++];
-          while (i < s.length) {
-            if (s[i] === "\\") {
-              i += 2;
-              continue;
-            }
-            if (s[i++] === q) break;
-          }
+          i = scanQuotedEnd(s, i, s[i]);
           continue;
         }
         i++;
@@ -1847,10 +1634,10 @@ function populateFenceBlockMeta(
         }
         const ch = s[i];
         const nx = s[i + 1];
-        if (ch === "/" && nx === "/") break;
-        if (fam === 7 && ch === "-" && nx === "-") break;
+        if (fam !== 12 && ch === "/" && nx === "/") break;
+        if ((fam === 7 || fam === 12) && ch === "-" && nx === "-") break;
         if (!noHash && ch === "#" && nx !== "[" && (i === 0 || /\s/.test(s[i - 1]))) break;
-        if (ch === "/" && nx === "*") {
+        if (fam !== 12 && ch === "/" && nx === "*") {
           inBlock = true;
           i += 2;
           continue;
@@ -1860,18 +1647,7 @@ function populateFenceBlockMeta(
             i += 2;
             continue;
           }
-          i++;
-          while (i < s.length) {
-            if (s[i] === "\\") {
-              i += 2;
-              continue;
-            }
-            if (s[i] === ch) {
-              i++;
-              break;
-            }
-            i++;
-          }
+          i = scanQuotedEnd(s, i, ch);
           continue;
         }
         i++;
@@ -1892,11 +1668,18 @@ const CALLOUT_NAMES = ["", "note", "tip", "important", "warning", "caution"] as 
 const irDocScanCache = new WeakMap<EditorState["doc"], IRDocScan>();
 
 function isGfmTableDelimiterLine(text: string): boolean {
-  if (!text.includes("|")) return false;
-  return (
-    /^\s*\|?\s*:?-{1,}:?(?:\s*\|\s*:?-{1,}:?)+\s*\|?\s*$/.test(text) ||
-    /^\s*\|\s*:?-{1,}:?\s*\|\s*$/.test(text)
-  );
+  const trimmed = text.trim();
+  if (!trimmed.includes("|")) return false;
+  const hasOuterPipes = trimmed.startsWith("|") && trimmed.endsWith("|");
+  let s = trimmed;
+  if (s.startsWith("|")) s = s.slice(1);
+  if (s.endsWith("|")) s = s.slice(0, -1);
+  const parts = s.split("|");
+  if (parts.length < 2 && !hasOuterPipes) return false;
+  for (const p of parts) {
+    if (!/^:?-+:?$/.test(p.trim())) return false;
+  }
+  return true;
 }
 
 function readHtmlAttr(openTag: string, attrName: string): string {
@@ -1960,11 +1743,7 @@ function getIRDocScan(doc: EditorState["doc"]): IRDocScan {
     let fam = curFenceFam;
     let noHash = curFenceNoHash;
     if (!rawLang) {
-      const strippedLines =
-        qDepth > 0
-          ? linesText.map((lt, idx) => (idx > openLn && idx <= bodyEndLn ? stripQuotePrefix(lt, qDepth).stripped : lt))
-          : linesText;
-      const det = detectIRCodeLang(strippedLines, openLn + 1, bodyEndLn);
+      const det = detectIRCodeLang(linesText, openLn + 1, bodyEndLn, qDepth);
       if (det.lang) {
         fenceAutoLang.set(openLn, det.lang);
         fam = det.fam;
@@ -2203,19 +1982,27 @@ function getIRDocScan(doc: EditorState["doc"]): IRDocScan {
       }
     }
 
-    // 1. HTML <table>...</table> block (single-line or multi-line)
+    // 1. HTML <table>...</table> block (single-line or multi-line, tracking nested <table> depth)
     if (/^\s*<table\b/i.test(text) && ln >= noCloseTableUntil) {
       let endLn = -1;
       let hitFence = false;
+      let tableDepth = 0;
       const limit = Math.min(total, ln + 500);
       for (let k = ln; k <= limit; k++) {
         if (k > ln && fenceState[k] !== 0) {
           hitFence = true;
           break;
         }
-        if (/<\/table>/i.test(linesText[k])) {
-          endLn = k;
-          break;
+        const lt = linesText[k];
+        if (lt.includes("<")) {
+          const opens = lt.match(/<table\b/gi);
+          const closes = lt.match(/<\/table>/gi);
+          if (opens) tableDepth += opens.length;
+          if (closes) tableDepth -= closes.length;
+          if (tableDepth <= 0 && closes) {
+            endLn = k;
+            break;
+          }
         }
       }
       if (endLn >= ln) {
@@ -2284,10 +2071,10 @@ function getIRDocScan(doc: EditorState["doc"]): IRDocScan {
         if (endLn > ln) {
           const endTo = lineFroms[endLn] + linesText[endLn].length;
           const chunk = doc.sliceString(lineFrom, endTo);
-          const mlRe = /(<a\b(?:"[^"]*"|'[^']*'|[^"'>])*?>)([\s\S]*?)(<\/a>)/gi;
+          IR_ML_ANCHOR_RE.lastIndex = 0;
           let mm: RegExpExecArray | null;
           let matchedEndLn = -1;
-          while ((mm = mlRe.exec(chunk)) !== null) {
+          while ((mm = IR_ML_ANCHOR_RE.exec(chunk)) !== null) {
             if (!mm[0].includes("\n")) continue;
             if (/<(?:table|div|p|ul|ol|h[1-6]|blockquote|pre)\b/i.test(mm[2])) continue;
             const absStart = lineFrom + mm.index;
@@ -2338,16 +2125,42 @@ function getIRDocScan(doc: EditorState["doc"]): IRDocScan {
     }
 
     let im: RegExpExecArray | null;
-    const inlineCodeRe = /(`+)([^`\n]+?)\1/g;
-    while ((im = inlineCodeRe.exec(text)) !== null) {
+    IR_CODE_RE.lastIndex = 0;
+    while ((im = IR_CODE_RE.exec(text)) !== null) {
       claim(im.index, im.index + im[0].length);
     }
-    const htmlCodeRe = /<code\b[^>]*>[^<\n]*<\/code>/gi;
+    const htmlCodeRe = /<code\b[^<>]*>[^<\n]*<\/code>/gi;
     while ((im = htmlCodeRe.exec(text)) !== null) {
       claim(im.index, im.index + im[0].length);
     }
 
     const foundOnLine: IRImageSpan[] = [];
+    const pushIRImgSpan = (
+      s: number,
+      e: number,
+      imgFrom: number,
+      imgTo: number,
+      rawTarget: string,
+      resolvedSrc: string,
+      alt: string,
+      href = "",
+      htmlTag?: string
+    ) => {
+      if (!claim(s, e)) return;
+      seedIRImageHintDims(resolvedSrc, htmlTag);
+      warmIRImageDim(resolvedSrc);
+      foundOnLine.push({
+        lineNumber: ln,
+        spanFrom: lineFrom + s,
+        spanTo: lineFrom + e,
+        imgFrom: lineFrom + imgFrom,
+        imgTo: lineFrom + imgTo,
+        resolvedSrc,
+        rawTarget,
+        alt,
+        href,
+      });
+    };
     const linkedImgRe =
       /\[!\[([^[\]\n]*)\]\((?!\))([^()\n]*(?:\([^()\n]*\)[^()\n]*)*)\)\]\((?!\))([^()\n]*(?:\([^()\n]*\)[^()\n]*)*)\)/g;
     while ((im = linkedImgRe.exec(text)) !== null) {
@@ -2355,26 +2168,10 @@ function getIRDocScan(doc: EditorState["doc"]): IRDocScan {
       const rawTarget = parseMarkdownImageTarget(im[2] || "");
       const resolvedSrc = resolveIRImageSrc(rawTarget);
       if (!resolvedSrc) continue;
-      const href = cleanClipboardUrl(parseMarkdownImageTarget(im[3] || "")) || parseMarkdownImageTarget(im[3] || "");
+      const href = cleanClipboardUrl(parseMarkdownImageTarget(im[3] || ""), "href");
       const s = im.index;
-      const e = s + im[0].length;
       const imgFrom = s + 1;
-      const imgTo = imgFrom + 2 + im[1].length + 2 + im[2].length + 1;
-      if (claim(s, e)) {
-        seedIRImageHintDims(resolvedSrc);
-        warmIRImageDim(resolvedSrc);
-        foundOnLine.push({
-          lineNumber: ln,
-          spanFrom: lineFrom + s,
-          spanTo: lineFrom + e,
-          imgFrom: lineFrom + imgFrom,
-          imgTo: lineFrom + imgTo,
-          resolvedSrc,
-          rawTarget,
-          alt,
-          href,
-        });
-      }
+      pushIRImgSpan(s, s + im[0].length, imgFrom, imgFrom + 2 + im[1].length + 2 + im[2].length + 1, rawTarget, resolvedSrc, alt, href);
     }
 
     const mdImgRe = /!\[([^[\]\n]*)\]\((?!\))([^()\n]*(?:\([^()\n]*\)[^()\n]*)*)\)/g;
@@ -2385,24 +2182,10 @@ function getIRDocScan(doc: EditorState["doc"]): IRDocScan {
       if (!resolvedSrc) continue;
       const s = im.index;
       const e = s + im[0].length;
-      if (claim(s, e)) {
-        seedIRImageHintDims(resolvedSrc);
-        warmIRImageDim(resolvedSrc);
-        foundOnLine.push({
-          lineNumber: ln,
-          spanFrom: lineFrom + s,
-          spanTo: lineFrom + e,
-          imgFrom: lineFrom + s,
-          imgTo: lineFrom + e,
-          resolvedSrc,
-          rawTarget,
-          alt,
-          href: "",
-        });
-      }
+      pushIRImgSpan(s, e, s, e, rawTarget, resolvedSrc, alt);
     }
 
-    const htmlImgRe = /<img\b[^>]*>/gi;
+    const htmlImgRe = /<img\b(?:"[^"<>]*"|'[^'<>]*'|[^"'<>])*>/gi;
     while ((im = htmlImgRe.exec(text)) !== null) {
       const rawTarget = readHtmlAttr(im[0], "src");
       const resolvedSrc = resolveIRImageSrc(rawTarget);
@@ -2410,21 +2193,7 @@ function getIRDocScan(doc: EditorState["doc"]): IRDocScan {
       const alt = readHtmlAttr(im[0], "alt");
       const s = im.index;
       const e = s + im[0].length;
-      if (claim(s, e)) {
-        seedIRImageHintDims(resolvedSrc, im[0]);
-        warmIRImageDim(resolvedSrc);
-        foundOnLine.push({
-          lineNumber: ln,
-          spanFrom: lineFrom + s,
-          spanTo: lineFrom + e,
-          imgFrom: lineFrom + s,
-          imgTo: lineFrom + e,
-          resolvedSrc,
-          rawTarget,
-          alt,
-          href: "",
-        });
-      }
+      pushIRImgSpan(s, e, s, e, rawTarget, resolvedSrc, alt, "", im[0]);
     }
 
     if (foundOnLine.length > 1) {
@@ -2457,6 +2226,13 @@ function getIRDocScan(doc: EditorState["doc"]): IRDocScan {
   return res;
 }
 
+const CSS_AT_RE = /@[A-Za-z-]+/g;
+const CSS_IMP_RE = /!\s*important\b/gi;
+const CSS_VAR_RE = /--[A-Za-z0-9_-]+|\$[A-Za-z_-][\w-]*/g;
+const CSS_FN_RE = /(?<![A-Za-z0-9_-])([A-Za-z_-][\w-]*)(?=\()/g;
+const CSS_VAL_KW_RE =
+  /\b(?:none|auto|inherit|initial|unset|solid|dashed|dotted|flex|grid|block|inline|inline-flex|inline-block|relative|absolute|fixed|sticky|hidden|clip|visible|pointer|center|left|right|top|bottom|space-between|transparent|currentColor|border-box|ease|linear|infinite|both|row|column|wrap|nowrap|bold|normal|italic)\b/g;
+
 function highlightIRCodeLine(
   text: string,
   fam: number,
@@ -2465,6 +2241,29 @@ function highlightIRCodeLine(
   claim: (s: number, e: number, cls: string) => void
 ): void {
   let cm: RegExpExecArray | null;
+  const hl = (re: RegExp, cls: string, grp = 0) => {
+    while ((cm = re.exec(text)) !== null) {
+      const s = grp ? cm.index + (cm[0].length - cm[grp].length) : cm.index;
+      claim(s, s + cm[grp].length, cls);
+    }
+  };
+
+  // Family 11: Markdown
+  if (fam === 11) {
+    if (/^\s*#{1,6}\s+/.test(text)) {
+      claim(0, text.length, "gh");
+      return;
+    }
+    if (/^\s*(?:`{3,}|~{3,})/.test(text)) {
+      claim(0, text.length, "cp");
+      return;
+    }
+    const bqM = /^\s*>\s?/.exec(text);
+    if (bqM) claim(0, bqM[0].length, "gu");
+    hl(/`[^`\n]+`/g, "s2");
+    hl(/!?\[[^[\]\n]*\]\([^()\n]+\)/g, "na");
+    return;
+  }
 
   // Family 6: Unified Diff / Patch
   if (fam === 6) {
@@ -2506,23 +2305,16 @@ function highlightIRCodeLine(
       claim(openIdx, closeIdx + 3, "cm");
       startIdx = closeIdx + 3;
     }
-    const dtRe = /<!DOCTYPE[^>]*>|<\?xml[^?]*\?>/gi;
-    while ((cm = dtRe.exec(text)) !== null) claim(cm.index, cm.index + cm[0].length, "cp");
-    const strRe = /"[^"]*"|'[^']*'/g;
-    while ((cm = strRe.exec(text)) !== null) claim(cm.index, cm.index + cm[0].length, "s2");
+    hl(/<!DOCTYPE[^<>]*>|<\?xml[^<>?]*\?>/gi, "cp");
+    hl(/"[^"]*"|'[^']*'/g, "s2");
     const tagRe = /(<\/?)([A-Za-z][A-Za-z0-9:._-]*)/g;
     while ((cm = tagRe.exec(text)) !== null) {
       claim(cm.index, cm.index + cm[1].length, "p");
       claim(cm.index + cm[1].length, cm.index + cm[0].length, "nt");
     }
-    const closeBrkRe = /\/?>/g;
-    while ((cm = closeBrkRe.exec(text)) !== null) claim(cm.index, cm.index + cm[0].length, "p");
-    const attrRe = /(\s)([A-Za-z_:][A-Za-z0-9_.:-]*)(?=\s*=)/g;
-    while ((cm = attrRe.exec(text)) !== null) {
-      claim(cm.index + cm[1].length, cm.index + cm[0].length, "na");
-    }
-    const entRe = /&[A-Za-z0-9#]+;/g;
-    while ((cm = entRe.exec(text)) !== null) claim(cm.index, cm.index + cm[0].length, "kc");
+    hl(/\/?>/g, "p");
+    hl(/(\s)([A-Za-z_:][A-Za-z0-9_.:-]*)(?=\s*=)/g, "na", 2);
+    hl(/&[A-Za-z0-9#]+;/g, "kc");
     return;
   }
 
@@ -2555,28 +2347,17 @@ function highlightIRCodeLine(
       }
       if (text[idx8] === '"' || text[idx8] === "'") {
         const q = text[idx8];
-        let j = idx8 + 1;
-        while (j < text.length) {
-          if (text[j] === "\\") {
-            j += 2;
-            continue;
-          }
-          if (text[j++] === q) break;
-        }
-        claim(idx8, Math.min(j, text.length), q === "'" ? "s1" : "s2");
-        idx8 = j;
+        const endPos = Math.min(scanQuotedEnd(text, idx8, q), text.length);
+        claim(idx8, endPos, q === "'" ? "s1" : "s2");
+        idx8 = endPos;
         continue;
       }
       idx8++;
     }
-    const lcRe = /\b(?:true|false|nil|self)\b/g;
-    while ((cm = lcRe.exec(text)) !== null) claim(cm.index, cm.index + cm[0].length, "kc");
-    const lkRe = /\b(?:local|function|end|if|then|else|elseif|for|in|while|do|repeat|until|return|break|goto|and|or|not)\b/g;
-    while ((cm = lkRe.exec(text)) !== null) claim(cm.index, cm.index + cm[0].length, "k");
-    const lfRe = /\b([A-Za-z_]\w*)(?=\s*[({'"\[])/g;
-    while ((cm = lfRe.exec(text)) !== null) claim(cm.index, cm.index + cm[1].length, "nf");
-    const lnRe = /\b(?:0[xX][0-9a-fA-F]+|\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)\b/g;
-    while ((cm = lnRe.exec(text)) !== null) claim(cm.index, cm.index + cm[0].length, "mi");
+    hl(/\b(?:true|false|nil|self)\b/g, "kc");
+    hl(/\b(?:local|function|end|if|then|else|elseif|for|in|while|do|repeat|until|return|break|goto|and|or|not)\b/g, "k");
+    hl(/\b([A-Za-z_]\w*)(?=\s*[({'"\[])/g, "nf");
+    hl(/\b(?:0[xX][0-9a-fA-F]+|\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)\b/g, "mi");
     return;
   }
 
@@ -2619,11 +2400,11 @@ function highlightIRCodeLine(
       idx = end + 2;
       continue;
     }
-    if (ch === "/" && nx === "/" && (idx === 0 || text[idx - 1] !== ":")) {
+    if (fam !== 12 && ch === "/" && nx === "/" && (idx === 0 || text[idx - 1] !== ":")) {
       claim(idx, text.length, "c1");
       break;
     }
-    if (fam === 7 && ch === "-" && nx === "-") {
+    if ((fam === 7 || fam === 12) && ch === "-" && nx === "-") {
       claim(idx, text.length, "c1");
       break;
     }
@@ -2640,19 +2421,7 @@ function highlightIRCodeLine(
           continue;
         }
       }
-      let j = idx + 1;
-      while (j < text.length) {
-        if (text[j] === "\\") {
-          j += 2;
-          continue;
-        }
-        if (text[j] === ch) {
-          j++;
-          break;
-        }
-        j++;
-      }
-      const endPos = Math.min(j, text.length);
+      const endPos = Math.min(scanQuotedEnd(text, idx, ch), text.length);
       const isJsonKey = fam === 3 && ch === '"' && /^\s*:/.test(text.slice(endPos));
       claim(idx, endPos, isJsonKey ? "nt" : ch === "'" ? "s1" : "s2");
       idx = endPos;
@@ -2663,160 +2432,110 @@ function highlightIRCodeLine(
 
   // Family 3: JSON / JSONC / JSON5
   if (fam === 3) {
-    const jkRe = /(?:^|[{,\s])([A-Za-z_$][\w$]*)(?=\s*:)/g;
-    while ((cm = jkRe.exec(text)) !== null) {
-      const s = cm.index + cm[0].length - cm[1].length;
-      claim(s, s + cm[1].length, "nt");
-    }
-    const jcRe = /\b(?:true|false|null|Infinity|NaN)\b/g;
-    while ((cm = jcRe.exec(text)) !== null) claim(cm.index, cm.index + cm[0].length, "kc");
-    const jnRe = /[+-]?\b(?:0[xX][0-9a-fA-F]+|\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)\b/g;
-    while ((cm = jnRe.exec(text)) !== null) claim(cm.index, cm.index + cm[0].length, "mi");
-    const jpRe = /[{}\[\]:,]/g;
-    while ((cm = jpRe.exec(text)) !== null) claim(cm.index, cm.index + 1, "p");
+    hl(/(?:^|[{,\s])([A-Za-z_$][\w$]*)(?=\s*:)/g, "nt", 1);
+    hl(/\b(?:true|false|null|Infinity|NaN)\b/g, "kc");
+    hl(/[+-]?\b(?:0[xX][0-9a-fA-F]+|\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)\b/g, "mi");
+    hl(/[{}\[\]:,]/g, "p");
     return;
   }
 
   // Family 5: CSS / SCSS / Less
   if (fam === 5) {
-    const atRe = /@[A-Za-z-]+/g;
-    while ((cm = atRe.exec(text)) !== null) claim(cm.index, cm.index + cm[0].length, "k");
-    const impRe = /!\s*important\b/gi;
-    while ((cm = impRe.exec(text)) !== null) claim(cm.index, cm.index + cm[0].length, "kc");
-    const cvRe = /--[A-Za-z0-9_-]+|\$[A-Za-z_-][\w-]*/g;
-    while ((cm = cvRe.exec(text)) !== null) claim(cm.index, cm.index + cm[0].length, "nv");
-    const psRe = /(::?[A-Za-z-]+)(?=[^{};]*(?:\{|$))/g;
-    while ((cm = psRe.exec(text)) !== null) claim(cm.index, cm.index + cm[1].length, "nd");
-    const clsIdRe = /[.#][A-Za-z_-][A-Za-z0-9_-]*(?=[^{};]*\{)/g;
-    while ((cm = clsIdRe.exec(text)) !== null) claim(cm.index, cm.index + cm[0].length, "nc");
-    const prRe = /(?:^|[;{\s(])([A-Za-z-]+)(?=\s*:(?!:)[^;{}]*(?:;|\}|\)|$))/g;
-    while ((cm = prRe.exec(text)) !== null) {
-      const s = cm.index + cm[0].length - cm[1].length;
-      claim(s, s + cm[1].length, "na");
+    hl(CSS_AT_RE, "k");
+    hl(CSS_IMP_RE, "kc");
+    hl(CSS_VAR_RE, "nv");
+    const cssCtx = computeCssContext(text);
+    const pseudoRe = /(::?[A-Za-z-]+)/g;
+    while ((cm = pseudoRe.exec(text)) !== null) {
+      if (cssCtx[cm.index] === 1 || cssCtx[cm.index] === 3) claim(cm.index, cm.index + cm[0].length, "nd");
     }
-    const fnRe = /\b([A-Za-z_-][\w-]*)(?=\()/g;
-    while ((cm = fnRe.exec(text)) !== null) claim(cm.index, cm.index + cm[1].length, "nf");
-    const hexNumRe = /#[0-9a-fA-F]{3,8}\b|-?\b\d+(?:\.\d+)?(?:px|rem|em|vh|vw|dvh|svh|dvw|svw|%|s|ms|deg|fr|ch)?\b/g;
-    while ((cm = hexNumRe.exec(text)) !== null) claim(cm.index, cm.index + cm[0].length, "mi");
-    const valKwRe =
-      /\b(?:none|auto|inherit|initial|unset|solid|dashed|dotted|flex|grid|block|inline|inline-flex|inline-block|relative|absolute|fixed|sticky|hidden|clip|visible|pointer|center|left|right|top|bottom|space-between|transparent|currentColor|border-box|ease|linear|infinite|both|row|column|wrap|nowrap|bold|normal|italic)\b/g;
-    while ((cm = valKwRe.exec(text)) !== null) claim(cm.index, cm.index + cm[0].length, "kc");
+    const selRe = /[.#][A-Za-z_-][A-Za-z0-9_-]*/g;
+    while ((cm = selRe.exec(text)) !== null) {
+      if (cssCtx[cm.index] === 1) claim(cm.index, cm.index + cm[0].length, "nc");
+    }
+    const propRe = /(?:^|[;{\s(])([A-Za-z-]+)\s*:(?!:)/g;
+    while ((cm = propRe.exec(text)) !== null) {
+      const lead = /^[;{\s(]/.test(cm[0]) ? 1 : 0;
+      const s = cm.index + lead;
+      if (cssCtx[s] === 2 || cssCtx[s] === 3) claim(s, s + cm[1].length, "na");
+    }
+    hl(CSS_FN_RE, "nf");
+    hl(/#[0-9a-fA-F]{3,8}\b|-?\b\d+(?:\.\d+)?(?:px|rem|em|vh|vw|dvh|svh|dvw|svw|%|s|ms|deg|fr|ch)?\b/g, "mi");
+    hl(CSS_VAL_KW_RE, "kc");
     return;
   }
 
   // Family 7: SQL
   if (fam === 7) {
-    const scRe = /\b(?:NULL|TRUE|FALSE)\b/gi;
-    while ((cm = scRe.exec(text)) !== null) claim(cm.index, cm.index + cm[0].length, "kc");
-    const stRe =
-      /\b(?:INT|INTEGER|BIGINT|SMALLINT|SERIAL|BIGSERIAL|TEXT|VARCHAR|CHAR|BOOLEAN|BOOL|DATE|TIME|TIMESTAMP|TIMESTAMPTZ|NUMERIC|DECIMAL|FLOAT|DOUBLE|REAL|JSON|JSONB|UUID|BLOB|BYTEA)\b/gi;
-    while ((cm = stRe.exec(text)) !== null) claim(cm.index, cm.index + cm[0].length, "kt");
-    const skRe =
-      /\b(?:SELECT|FROM|WHERE|INSERT|INTO|VALUES|UPDATE|SET|DELETE|JOIN|LEFT|RIGHT|INNER|OUTER|FULL|CROSS|ON|AS|AND|OR|NOT|IN|IS|LIKE|ILIKE|BETWEEN|EXISTS|GROUP|BY|ORDER|HAVING|LIMIT|OFFSET|UNION|ALL|DISTINCT|CREATE|ALTER|DROP|TRUNCATE|TABLE|INDEX|VIEW|DATABASE|SCHEMA|PRIMARY|KEY|FOREIGN|REFERENCES|UNIQUE|DEFAULT|CHECK|CONSTRAINT|CASCADE|BEGIN|COMMIT|ROLLBACK|TRANSACTION|WITH|CASE|WHEN|THEN|ELSE|END|RETURNING|ASC|DESC)\b/gi;
-    while ((cm = skRe.exec(text)) !== null) claim(cm.index, cm.index + cm[0].length, "k");
-    const sfRe = /\b([A-Za-z_]\w*)(?=\s*\()/g;
-    while ((cm = sfRe.exec(text)) !== null) claim(cm.index, cm.index + cm[1].length, "nf");
-    const snRe = /-?\b\d+(?:\.\d+)?\b/g;
-    while ((cm = snRe.exec(text)) !== null) claim(cm.index, cm.index + cm[0].length, "mi");
+    hl(/\b(?:NULL|TRUE|FALSE)\b/gi, "kc");
+    hl(
+      /\b(?:INT|INTEGER|BIGINT|SMALLINT|SERIAL|BIGSERIAL|TEXT|VARCHAR|CHAR|BOOLEAN|BOOL|DATE|TIME|TIMESTAMP|TIMESTAMPTZ|NUMERIC|DECIMAL|FLOAT|DOUBLE|REAL|JSON|JSONB|UUID|BLOB|BYTEA)\b/gi,
+      "kt"
+    );
+    hl(
+      /\b(?:SELECT|FROM|WHERE|INSERT|INTO|VALUES|UPDATE|SET|DELETE|JOIN|LEFT|RIGHT|INNER|OUTER|FULL|CROSS|ON|AS|AND|OR|NOT|IN|IS|LIKE|ILIKE|BETWEEN|EXISTS|GROUP|BY|ORDER|HAVING|LIMIT|OFFSET|UNION|ALL|DISTINCT|CREATE|ALTER|DROP|TRUNCATE|TABLE|INDEX|VIEW|DATABASE|SCHEMA|PRIMARY|KEY|FOREIGN|REFERENCES|UNIQUE|DEFAULT|CHECK|CONSTRAINT|CASCADE|BEGIN|COMMIT|ROLLBACK|TRANSACTION|WITH|CASE|WHEN|THEN|ELSE|END|RETURNING|ASC|DESC)\b/gi,
+      "k"
+    );
+    hl(/\b([A-Za-z_]\w*)(?=\s*\()/g, "nf");
+    hl(/-?\b\d+(?:\.\d+)?\b/g, "mi");
     return;
   }
 
   // Family 9: GraphQL
   if (fam === 9) {
-    const gdRe = /@[A-Za-z_]\w*/g;
-    while ((cm = gdRe.exec(text)) !== null) claim(cm.index, cm.index + cm[0].length, "nd");
-    const gvRe = /\$[A-Za-z_]\w*/g;
-    while ((cm = gvRe.exec(text)) !== null) claim(cm.index, cm.index + cm[0].length, "nv");
-    const gcRe = /\b(?:true|false|null)\b/g;
-    while ((cm = gcRe.exec(text)) !== null) claim(cm.index, cm.index + cm[0].length, "kc");
-    const gtRe = /\b(?:Int|Float|String|Boolean|ID)\b/g;
-    while ((cm = gtRe.exec(text)) !== null) claim(cm.index, cm.index + cm[0].length, "kt");
-    const gkRe =
-      /\b(?:query|mutation|subscription|fragment|on|type|interface|union|enum|input|scalar|schema|directive|extend|implements|repeatable)\b/g;
-    while ((cm = gkRe.exec(text)) !== null) claim(cm.index, cm.index + cm[0].length, "k");
-    const gfRe = /\b([A-Za-z_]\w*)(?=\s*:)/g;
-    while ((cm = gfRe.exec(text)) !== null) claim(cm.index, cm.index + cm[1].length, "na");
-    const gtyRe = /\b[A-Z][A-Za-z0-9_]*\b/g;
-    while ((cm = gtyRe.exec(text)) !== null) claim(cm.index, cm.index + cm[0].length, "nc");
-    const gnRe = /-?\b\d+(?:\.\d+)?\b/g;
-    while ((cm = gnRe.exec(text)) !== null) claim(cm.index, cm.index + cm[0].length, "mi");
+    hl(/@[A-Za-z_]\w*/g, "nd");
+    hl(/\$[A-Za-z_]\w*/g, "nv");
+    hl(/\b(?:true|false|null)\b/g, "kc");
+    hl(/\b(?:Int|Float|String|Boolean|ID)\b/g, "kt");
+    hl(
+      /\b(?:query|mutation|subscription|fragment|on|type|interface|union|enum|input|scalar|schema|directive|extend|implements|repeatable)\b/g,
+      "k"
+    );
+    hl(/\b([A-Za-z_]\w*)(?=\s*:)/g, "na");
+    hl(/\b[A-Z][A-Za-z0-9_]*\b/g, "nc");
+    hl(/-?\b\d+(?:\.\d+)?\b/g, "mi");
     return;
   }
 
   // Family 10: Protobuf
   if (fam === 10) {
-    const pcRe = /\b(?:true|false|max)\b/g;
-    while ((cm = pcRe.exec(text)) !== null) claim(cm.index, cm.index + cm[0].length, "kc");
-    const ptRe =
-      /\b(?:double|float|int32|int64|uint32|uint64|sint32|sint64|fixed32|fixed64|sfixed32|sfixed64|bool|string|bytes)\b/g;
-    while ((cm = ptRe.exec(text)) !== null) claim(cm.index, cm.index + cm[0].length, "kt");
-    const pkRe =
-      /\b(?:syntax|edition|package|import|public|weak|option|message|enum|service|rpc|returns|stream|repeated|optional|required|oneof|map|reserved|extensions|to)\b/g;
-    while ((cm = pkRe.exec(text)) !== null) claim(cm.index, cm.index + cm[0].length, "k");
-    const ptyRe = /\b[A-Z][A-Za-z0-9_]*\b/g;
-    while ((cm = ptyRe.exec(text)) !== null) claim(cm.index, cm.index + cm[0].length, "nc");
-    const pnRe = /\b(?:0[xX][0-9a-fA-F]+|\d+)\b/g;
-    while ((cm = pnRe.exec(text)) !== null) claim(cm.index, cm.index + cm[0].length, "mi");
+    hl(/\b(?:true|false|max)\b/g, "kc");
+    hl(
+      /\b(?:double|float|int32|int64|uint32|uint64|sint32|sint64|fixed32|fixed64|sfixed32|sfixed64|bool|string|bytes)\b/g,
+      "kt"
+    );
+    hl(
+      /\b(?:syntax|edition|package|import|public|weak|option|message|enum|service|rpc|returns|stream|repeated|optional|required|oneof|map|reserved|extensions|to)\b/g,
+      "k"
+    );
+    hl(/\b[A-Z][A-Za-z0-9_]*\b/g, "nc");
+    hl(/\b(?:0[xX][0-9a-fA-F]+|\d+)\b/g, "mi");
     return;
   }
 
   // Families 0, 1, 2: Programming, PHP, Ruby, Elixir, HCL/Terraform, Zig, Scala, Dart, C#, F#, VB, Shell, Nginx, YAML, TOML
-  const phpTagRe = /<\?(?:php|=)?|\?>/gi;
-  while ((cm = phpTagRe.exec(text)) !== null) claim(cm.index, cm.index + cm[0].length, "cp");
-  const rsAttrRe = /^\s*(#!?\[[^\]]*\])/g;
-  while ((cm = rsAttrRe.exec(text)) !== null) {
-    const idx = cm.index + cm[0].length - cm[1].length;
-    claim(idx, idx + cm[1].length, "nd");
-  }
-  const decRe = /(?:^|[\s(])(@[A-Za-z_][\w.]*)/g;
-  while ((cm = decRe.exec(text)) !== null) {
-    const idx = cm.index + cm[0].length - cm[1].length;
-    claim(idx, idx + cm[1].length, "nd");
-  }
-  const symRe = /(?:^|[\s([,=])(:[A-Za-z_]\w*[?!]?)\b/g;
-  while ((cm = symRe.exec(text)) !== null) {
-    const idx = cm.index + cm[0].length - cm[1].length;
-    claim(idx, idx + cm[1].length, "kc");
-  }
-  const uriRe = /\b(?:https?|wss?|grpcs?|fastcgi|uwsgi|scgi):\/\/[^\s;'"]+/g;
-  while ((cm = uriRe.exec(text)) !== null) claim(cm.index, cm.index + cm[0].length, "s2");
-  const varRe = /\$\{?[A-Za-z_][A-Za-z0-9_]*\}?|\$[@*#?$!0-9-]/g;
-  while ((cm = varRe.exec(text)) !== null) claim(cm.index, cm.index + cm[0].length, "nv");
-  const flagRe = /(?:^|\s)(--?[A-Za-z][\w-]*)/g;
-  while ((cm = flagRe.exec(text)) !== null) {
-    const idx = cm.index + (cm[0].length - cm[1].length);
-    claim(idx, idx + cm[1].length, "na");
-  }
-  if (fam !== 1) {
-    const keyRe = /^\s*(?:-\s+)?([A-Za-z_][A-Za-z0-9_.-]*)(?=\s*(?::(?:\s|$)|=))/g;
-    while ((cm = keyRe.exec(text)) !== null) {
-      const idx = cm.index + cm[0].lastIndexOf(cm[1]);
-      claim(idx, idx + cm[1].length, "nt");
-    }
-  }
-  const constRe = /\b(?:true|false|null|nil|undefined|None|True|False|Nothing|on|off|yes|no|NaN|Infinity|iota|self|Self|this|super|base)\b/g;
-  while ((cm = constRe.exec(text)) !== null) claim(cm.index, cm.index + cm[0].length, "kc");
-  const primTypeRe =
-    /\b(?:string|int|int8|int16|int32|int64|uint|uint8|uint16|uint32|uint64|uintptr|float32|float64|bool|byte|sbyte|decimal|object|dynamic|rune|error|any|void|char|short|ushort|long|ulong|double|float|size_t|usize|isize|i8|i16|i32|i64|i128|u8|u16|u32|u64|u128|f16|f32|f64|f128|anyerror|comptime_int|comptime_float|str|number|boolean|unknown|never|symbol|bigint|Unit|Any|AnyRef|AnyVal|Option|Result|Vec|Box|Rc|Arc|String|Map|Set|List|Future|Stream|Iterable|Promise|Array|Record)\b/g;
-  while ((cm = primTypeRe.exec(text)) !== null) claim(cm.index, cm.index + cm[0].length, "kt");
-  const kwRe =
-    /\b(?:sudo|apt|apt-get|yum|dnf|apk|cd|mkdir|tar|wget|curl|make|docker|kubectl|systemctl|git|npm|pnpm|terraform|export|return|func|go|defer|chan|select|fallthrough|range|map|function|fn|mut|ref|move|unsafe|where|trait|dyn|crate|use|extern|def|defp|defmodule|defmacro|defprotocol|defimpl|defstruct|alias|require|quote|unquote|cond|receive|after|lambda|yield|pass|raise|except|global|nonlocal|assert|del|elif|elsif|unless|until|begin|rescue|ensure|module|end|when|then|attr_accessor|attr_reader|attr_writer|resource|variable|output|provider|locals|data|echo|foreach|endforeach|endif|callable|clone|global|class|interface|implements|extends|with|mixin|extension|factory|late|covariant|required|sealed|internal|record|init|delegate|event|operator|out|params|checked|unchecked|fixed|lock|stackalloc|using|get|set|let|member|open|rec|mutable|comptime|errdefer|orelse|unreachable|nosuspend|suspend|resume|object|implicit|lazy|abstract|readonly|keyof|typeof|instanceof|infer|declare|namespace|enum|impl|pub|mod|match|async|await|try|catch|finally|throw|new|delete|const|var|val|if|else|for|while|do|loop|switch|case|default|break|continue|import|from|package|type|struct|union|static|final|private|protected|public|override|virtual|inline|constexpr|template|typename|in|of|as|is|not|and|or|Sub|Function|Dim|As|If|Then|Else|ElseIf|End|For|To|Next|While|Return|Imports|Module|Class|Public|Private|server|location|upstream|events|stream|http|listen|proxy_pass|fastcgi_pass|proxy_set_header|rewrite|root|index|error_page|access_log|error_log|include|ssl_certificate|ssl_certificate_key|client_max_body_size|keepalive_timeout|gzip|absolute_redirect|server_name|try_files|add_header)\b/g;
-  while ((cm = kwRe.exec(text)) !== null) claim(cm.index, cm.index + cm[0].length, "k");
-  const macroRe = /\b([a-z_][a-z0-9_]*)!(?=\s*[(\[{])/g;
-  while ((cm = macroRe.exec(text)) !== null) claim(cm.index, cm.index + cm[0].length, "nd");
-  const fnRe = /\b([A-Za-z_]\w*[?!]?)(?=\s*\()/g;
-  while ((cm = fnRe.exec(text)) !== null) claim(cm.index, cm.index + cm[1].length, "nf");
-  const typeRe = /\b[A-Z][a-zA-Z0-9_]*\b/g;
-  while ((cm = typeRe.exec(text)) !== null) claim(cm.index, cm.index + cm[0].length, "nc");
-  if (fam !== 1) {
-    const directiveRe = /^(\s*)([a-z][a-z0-9_]{2,})(?=\s+[^\s=:{])/g;
-    while ((cm = directiveRe.exec(text)) !== null) {
-      const idx = cm.index + cm[1].length;
-      claim(idx, idx + cm[2].length, "na");
-    }
-  }
-  const numRe = /\b(?:0[xX][0-9a-fA-F_]+|0[bB][01_]+|0[oO][0-7_]+|\d[\d_]*(?:\.[\d_]+)?(?:[eE][+-]?\d+)?(?:ms|s|m|h|d|k|K|M|G)?)\b/g;
-  while ((cm = numRe.exec(text)) !== null) claim(cm.index, cm.index + cm[0].length, "mi");
+  hl(/<\?(?:php|=)?|\?>/gi, "cp");
+  hl(/^\s*(#!?\[[^\]]*\])/g, "nd", 1);
+  hl(/(?:^|[\s(])(@[A-Za-z_][\w.]*)/g, "nd", 1);
+  hl(/(?:^|[\s([,=])(:[A-Za-z_]\w*[?!]?)\b/g, "kc", 1);
+  hl(/\b(?:https?|wss?|grpcs?|fastcgi|uwsgi|scgi):\/\/[^\s;'"]+/g, "s2");
+  hl(/\$\{?[A-Za-z_][A-Za-z0-9_]*\}?|\$[@*#?$!0-9-]/g, "nv");
+  hl(/(?:^|\s)(--?[A-Za-z][\w-]*)/g, "na", 1);
+  if (fam !== 1) hl(/^\s*(?:-\s+)?([A-Za-z_][A-Za-z0-9_.-]*)(?=\s*(?::(?:\s|$)|=))/g, "nt", 1);
+  hl(/\b(?:true|false|null|nil|undefined|None|True|False|Nothing|on|off|yes|no|NaN|Infinity|iota|self|Self|this|super|base)\b/g, "kc");
+  hl(
+    /\b(?:string|int|int8|int16|int32|int64|uint|uint8|uint16|uint32|uint64|uintptr|float32|float64|bool|byte|sbyte|decimal|object|dynamic|rune|error|any|void|char|short|ushort|long|ulong|double|float|size_t|usize|isize|i8|i16|i32|i64|i128|u8|u16|u32|u64|u128|f16|f32|f64|f128|anyerror|comptime_int|comptime_float|str|number|boolean|unknown|never|symbol|bigint|Unit|Any|AnyRef|AnyVal|Option|Result|Vec|Box|Rc|Arc|String|Map|Set|List|Future|Stream|Iterable|Promise|Array|Record)\b/g,
+    "kt"
+  );
+  hl(
+    /\b(?:sudo|apt|apt-get|yum|dnf|apk|cd|mkdir|tar|wget|curl|make|docker|kubectl|systemctl|git|npm|pnpm|terraform|export|return|func|go|defer|chan|select|fallthrough|range|map|function|fn|mut|ref|move|unsafe|where|trait|dyn|crate|use|extern|def|defp|defmodule|defmacro|defprotocol|defimpl|defstruct|alias|require|quote|unquote|cond|receive|after|lambda|yield|pass|raise|except|global|nonlocal|assert|del|elif|elsif|unless|until|begin|rescue|ensure|module|end|when|then|attr_accessor|attr_reader|attr_writer|resource|variable|output|provider|locals|data|echo|foreach|endforeach|endif|callable|clone|class|interface|implements|extends|with|mixin|extension|factory|late|covariant|required|sealed|internal|record|init|delegate|event|operator|out|params|checked|unchecked|fixed|lock|stackalloc|using|get|set|let|member|open|rec|mutable|comptime|errdefer|orelse|unreachable|nosuspend|suspend|resume|object|implicit|lazy|abstract|readonly|keyof|typeof|instanceof|infer|declare|namespace|enum|impl|pub|mod|match|async|await|try|catch|finally|throw|new|delete|const|var|val|if|else|for|while|do|loop|switch|case|default|break|continue|import|from|package|type|struct|union|static|final|private|protected|public|override|virtual|inline|constexpr|template|typename|in|of|as|is|not|and|or|Sub|Function|Dim|As|If|Then|Else|ElseIf|End|For|To|Next|While|Return|Imports|Module|Class|Public|Private|server|location|upstream|events|stream|http|listen|proxy_pass|fastcgi_pass|proxy_set_header|rewrite|root|index|error_page|access_log|error_log|include|ssl_certificate|ssl_certificate_key|client_max_body_size|keepalive_timeout|gzip|absolute_redirect|server_name|try_files|add_header)\b/g,
+    "k"
+  );
+  hl(/\b([a-z_][a-z0-9_]*)!(?=\s*[(\[{])/g, "nd");
+  hl(/\b([A-Za-z_]\w*[?!]?)(?=\s*\()/g, "nf");
+  hl(/\b[A-Z][a-zA-Z0-9_]*\b/g, "nc");
+  if (fam !== 1) hl(/^(\s*)([a-z][a-z0-9_]{2,})(?=\s+[^\s=:{])/g, "na", 2);
+  hl(/\b(?:0[xX][0-9a-fA-F_]+|0[bB][01_]+|0[oO][0-7_]+|\d[\d_]*(?:\.[\d_]+)?(?:[eE][+-]?\d+)?(?:ms|s|m|h|d|k|K|M|G)?)\b/g, "mi");
 }
 
 interface IRBlockDecoState {
@@ -3002,6 +2721,26 @@ function buildIRQuoteLineCls(depth: number, edge: number, alertKind: string): st
   if (alertKind) quoteCls += ` cm-ir-callout cm-ir-callout-${alertKind}`;
   return quoteCls;
 }
+
+const IR_HTML_TECH_RE = /(<(code|kbd|sup|sub)\b[^<>]*>)([^<\n]+)(<\/\2>)/gi;
+const IR_BR_RE = /<br\s*\/?>/gi;
+const IR_FONT_RE = /(<font\b[^<>]*>)([^<\n]+)(<\/font>)/gi;
+const IR_SPAN_RE = /(<span\b[^<>]*>)([^<\n]+)(<\/span>)/gi;
+const IR_MARK_RE = /(<mark>)([^<\n]+)(<\/mark>)/gi;
+const IR_U_RE = /(<u>)([^<\n]+)(<\/u>)/gi;
+const IR_HTML_LINK_RE = /(<a\b(?:"[^"<>]*"|'[^'<>]*'|[^"'<>])*?>)([^<\n]+)(<\/a>)/gi;
+const IR_HTML_FMT_RE = /(<(strong|b|em|i|s|del|strike)>)([^<\n]+)(<\/\2>)/gi;
+const IR_AUDIO_RE = /(<audio\b[^<>]*>)\s*(?:<\/audio>)?/gi;
+const IR_VIDEO_RE = /(<video\b[^<>]*>)\s*(?:<\/video>)?/gi;
+const IR_WIKI_RE = /\[\[([^[\]\n|\x01\x02]+?)(?:\|([^[\]\n]+))?\]\]/g;
+const IR_LINK_RE = /(?<!!)\[([^[\]\n]+)\]\((?!\))([^()\n\x01\x02]*(?:\([^()\n\x01\x02]*\)[^()\n\x01\x02]*)*)\)/g;
+const IR_BARE_URL_RE = /\bhttps?:\/\/[^\s<>()[\]"'\x01\x02]+/gi;
+const IR_EQ_MARK_RE = /(?:^|[^=])==(?!=|\s)([^=\n]*?[^\s=])==(?!=)/g;
+const IR_BOLD_RE = /\*\*(?!\s)([^\n*]+(?:\*(?!\*)[^\n*]+)*)\*\*/g;
+const IR_STRIKE_RE = /~~([^~\n]+)~~/g;
+const IR_ITALIC_RE = /(?:^|[^*])\*([^*\s][^*\n]*?)\*(?!\*)/g;
+const IR_SUP_RE = /(?:^|[^^\\[])\^([^\s^\n[\]]+)\^(?!\^)/g;
+const IR_SUB_RE = /(?:^|[^~\\/])~([^\s~\n/]+)~(?!~)/g;
 
 function buildInstantRenderPlugin(): Extension {
   const hideDeco = Decoration.replace({});
@@ -3192,12 +2931,14 @@ function buildInstantRenderPlugin(): Extension {
 
         const capLen = Math.min(text.length, 2400);
         const mChars = text.slice(0, capLen).split("");
+        let maskDirty = false;
         const claimLiteral = (s: number, e: number): boolean => {
           if (s < 0 || e > capLen || s >= e) return false;
           for (let i = s; i < e; i++) {
             if (mChars[i] === "\x01" || mChars[i] === "\x02") return false;
           }
           for (let i = s; i < e; i++) mChars[i] = "\x02";
+          maskDirty = true;
           return true;
         };
         const claimDelims = (openFrom: number, openTo: number, closeFrom: number, closeTo: number): boolean => {
@@ -3213,7 +2954,21 @@ function buildInstantRenderPlugin(): Extension {
           }
           for (let i = openFrom; i < openTo; i++) mChars[i] = "\x01";
           for (let i = closeFrom; i < closeTo; i++) mChars[i] = "\x01";
+          maskDirty = true;
           return true;
+        };
+        const applyDelimMark = (s: number, openEnd: number, closeStart: number, e: number, cls: string) => {
+          if (!claimDelims(s, openEnd, closeStart, e)) return;
+          addRange(line.from + s, line.from + openEnd, hideDeco);
+          addRange(line.from + openEnd, line.from + closeStart, Decoration.mark({ class: cls }));
+          addRange(line.from + closeStart, line.from + e, hideDeco);
+        };
+        const hideLineEdges = (openLen: number, closeTailLen: number) => {
+          const closeStart = text.length - closeTailLen;
+          if (!isCursorLine && claimDelims(0, openLen, closeStart, text.length)) {
+            addRange(line.from, line.from + openLen, hideDeco);
+            addRange(line.from + closeStart, line.to, hideDeco);
+          }
         };
 
         // Reserve segments already handled by multi-line <a> and pre-scanned image decorations in irBlockDecoField
@@ -3234,17 +2989,17 @@ function buildInstantRenderPlugin(): Extension {
         }
 
         const hm = /^(#{1,6})\s+/.exec(text);
-        const htmlHm = !hm ? /^(\s*<h([1-6])\b[^>]*>)(.*)(<\/h\2>\s*)$/i.exec(text) : null;
-        const qm = /^(\s*(?:>\s?)+)(?:\[!(NOTE|TIP|IMPORTANT|WARNING|CAUTION)\]\s*)?/i.exec(text);
-        const htmlQm = !qm ? /^(\s*<blockquote\b[^>]*>)(.*)(<\/blockquote>\s*)$/i.exec(text) : null;
+        const htmlHm = !hm ? /^(\s*<h([1-6])\b[^<>]*>)(.*)(<\/h\2>\s*)$/i.exec(text) : null;
+        const qm = /^([ \t]*(?:>[ \t]?)+)(?:\[!(NOTE|TIP|IMPORTANT|WARNING|CAUTION)\][ \t]*)?/i.exec(text);
+        const htmlQm = !qm ? /^(\s*<blockquote\b[^<>]*>)(.*)(<\/blockquote>\s*)$/i.exec(text) : null;
         const soloToc = /^\s*\[toc\]\s*$/i.exec(text);
         const dm = !soloToc ? /^\s*:::(?:bookshelf|book|lock)?.*$/i.exec(text) : null;
-        const hrm = /^\s*(?:---|\*\*\*|___|<hr\b[^>]*\/?>)\s*$/i.exec(text);
+        const hrm = /^\s*(?:---|\*\*\*|___|<hr\b[^<>]*\/?>)\s*$/i.exec(text);
         const soloBr = /^\s*<br\s*\/?>\s*$/i.exec(text);
         const centerLine = /^(\s*<center>)(.*)(<\/center>\s*)$/i.exec(text);
-        const pLine = /^(\s*<p\b[^>]*>)(.*)(<\/p>\s*)$/i.exec(text);
-        const liLine = /^(\s*<li\b[^>]*>)(.*)(<\/li>\s*)$/i.exec(text);
-        const listWrapLine = /^\s*<\/?(?:ul|ol)\b[^>]*>\s*$/i.exec(text);
+        const pLine = /^(\s*<p\b[^<>]*>)(.*)(<\/p>\s*)$/i.exec(text);
+        const liLine = /^(\s*<li\b[^<>]*>)(.*)(<\/li>\s*)$/i.exec(text);
+        const listWrapLine = /^\s*<\/?(?:ul|ol)\b[^<>]*>\s*$/i.exec(text);
         const alignTagLine = scan.alignTagLine[line.number] === 1;
         const alignKind = scan.alignKind[line.number] || 0;
         if (alignKind) {
@@ -3264,16 +3019,8 @@ function buildInstantRenderPlugin(): Extension {
             addRange(line.from, line.from + hm[0].length, hideDeco);
           }
         } else if (htmlHm) {
-          const lvl = Number(htmlHm[2]);
-          addLine(line.from, `cm-ir-h cm-ir-h${lvl}`);
-          if (!isCursorLine) {
-            const openLen = htmlHm[1].length;
-            const closeStart = text.length - htmlHm[4].length;
-            if (claimDelims(0, openLen, closeStart, text.length)) {
-              addRange(line.from, line.from + openLen, hideDeco);
-              addRange(line.from + closeStart, line.to, hideDeco);
-            }
-          }
+          addLine(line.from, `cm-ir-h cm-ir-h${Number(htmlHm[2])}`);
+          hideLineEdges(htmlHm[1].length, htmlHm[4].length);
         } else if (qm) {
           const scanCallout = CALLOUT_NAMES[scan.calloutKind[line.number] || 0] || "";
           const alertKind = qm[2] ? qm[2].toLowerCase() : scanCallout;
@@ -3292,14 +3039,7 @@ function buildInstantRenderPlugin(): Extension {
           }
         } else if (htmlQm) {
           addLine(line.from, "cm-ir-quote cm-ir-quote-first cm-ir-quote-last");
-          if (!isCursorLine) {
-            const openLen = htmlQm[1].length;
-            const closeStart = text.length - htmlQm[3].length;
-            if (claimDelims(0, openLen, closeStart, text.length)) {
-              addRange(line.from, line.from + openLen, hideDeco);
-              addRange(line.from + closeStart, line.to, hideDeco);
-            }
-          }
+          hideLineEdges(htmlQm[1].length, htmlQm[3].length);
         } else if (soloToc) {
           if (!isCursorLine && claimLiteral(0, text.length)) {
             addRange(
@@ -3323,21 +3063,9 @@ function buildInstantRenderPlugin(): Extension {
           }
         } else if (centerLine) {
           addLine(line.from, "cm-ir-center");
-          if (!isCursorLine) {
-            const openLen = centerLine[1].length;
-            const closeStart = text.length - centerLine[3].length;
-            if (claimDelims(0, openLen, closeStart, text.length)) {
-              addRange(line.from, line.from + openLen, hideDeco);
-              addRange(line.from + closeStart, line.to, hideDeco);
-            }
-          }
+          hideLineEdges(centerLine[1].length, centerLine[3].length);
         } else if (pLine && !isCursorLine) {
-          const openLen = pLine[1].length;
-          const closeStart = text.length - pLine[3].length;
-          if (claimDelims(0, openLen, closeStart, text.length)) {
-            addRange(line.from, line.from + openLen, hideDeco);
-            addRange(line.from + closeStart, line.to, hideDeco);
-          }
+          hideLineEdges(pLine[1].length, pLine[3].length);
         } else if (liLine && !isCursorLine) {
           const openLen = liLine[1].length;
           const closeStart = text.length - liLine[3].length;
@@ -3354,9 +3082,10 @@ function buildInstantRenderPlugin(): Extension {
         // Inline decorations on non-cursor / non-active-search lines (never applied when IME is composing on cursor line)
         if (!isCursorLine && text.length > 0 && text.length <= 2400) {
           // Interactive task checkbox (- [ ] / - [x] and blockquote > - [ ] / > - [x])
-          const tm = /^((?: {0,3}>\s?)*\s*)([-*+]\s+)(\[[ xX]\])(\s+)/.exec(text);
+          const qp = parseQuotePrefix(text);
+          const tm = /^(\s*)([-*+]\s+)(\[[ xX]\])(\s+)/.exec(text.slice(qp.prefixLen));
           if (tm) {
-            const bulletStart = tm[1].length;
+            const bulletStart = qp.prefixLen + tm[1].length;
             const boxStart = bulletStart + tm[2].length;
             const boxEnd = boxStart + tm[3].length;
             if (claimLiteral(bulletStart, boxEnd)) {
@@ -3373,10 +3102,27 @@ function buildInstantRenderPlugin(): Extension {
           }
 
           // Inline code `...` / ``a ` b`` (atomic literal: claim entire span as \x02)
-          const codeRe = /(`+)(?!`)([^\n]+?)(?<!`)\1(?!`)/g;
           let m: RegExpExecArray | null;
           let curMask = mChars.join("");
-          while ((m = codeRe.exec(curMask)) !== null) {
+          maskDirty = false;
+          const refreshMask = () => {
+            if (maskDirty) {
+              curMask = mChars.join("");
+              maskDirty = false;
+            }
+          };
+          const runPairPass = (re: RegExp, openLen: number, closeLen: number, cls: string, leadChar?: string) => {
+            refreshMask();
+            re.lastIndex = 0;
+            while ((m = re.exec(curMask)) !== null) {
+              const lead = leadChar && !m[0].startsWith(leadChar) ? 1 : 0;
+              const s = m.index + lead;
+              const e = m.index + m[0].length;
+              applyDelimMark(s, s + openLen, e - closeLen, e, cls);
+            }
+          };
+          IR_CODE_RE.lastIndex = 0;
+          while ((m = IR_CODE_RE.exec(curMask)) !== null) {
             const s = m.index;
             const e = s + m[0].length;
             const tLen = m[1].length;
@@ -3400,28 +3146,23 @@ function buildInstantRenderPlugin(): Extension {
           // Standalone Markdown video/audio link ([title](/uploads/demo.mp4))
           const soloMediaLink = !soloEmbed ? /^\s*\[([^\]\n]+)\]\(([^)\n]+)\)\s*$/.exec(text) : null;
           if (soloMediaLink) {
-            const target = parseMarkdownImageTarget(soloMediaLink[2] || "");
-            if (/^(?:\/|https?:\/\/)/i.test(target)) {
-              if (isVideoMedia("", target) && claimLiteral(0, text.length)) {
+            const target = safeMediaSrc(parseMarkdownImageTarget(soloMediaLink[2] || ""), { allowRelative: true });
+            if (target) {
+              const mKind = isVideoMedia("", target) ? "video" : isAudioMedia("", target) ? "audio" : null;
+              if (mKind && claimLiteral(0, text.length)) {
                 addRange(
                   line.from,
                   line.to,
-                  Decoration.replace({ widget: new VideoIRWidget(target, line.from, line.to) })
-                );
-              } else if (isAudioMedia("", target) && claimLiteral(0, text.length)) {
-                addRange(
-                  line.from,
-                  line.to,
-                  Decoration.replace({ widget: new AudioIRWidget(target, line.from, line.to) })
+                  Decoration.replace({ widget: new MediaIRWidget(mKind, target, line.from, line.to) })
                 );
               }
             }
           }
 
           // Footnote references [^id] (claim before ^sup^ and [label](url))
-          curMask = mChars.join("");
-          const fnRefRe = /\[\^([^\s\]\n\x01\x02]+)\]/g;
-          while ((m = fnRefRe.exec(curMask)) !== null) {
+          refreshMask();
+          IR_FN_REF_RE.lastIndex = 0;
+          while ((m = IR_FN_REF_RE.exec(curMask)) !== null) {
             const s = m.index;
             const e = s + m[0].length;
             if (claimLiteral(s, e)) {
@@ -3430,9 +3171,9 @@ function buildInstantRenderPlugin(): Extension {
           }
 
           // HTML inline <code>...</code>, <kbd>...</kbd>, <sup>...</sup>, <sub>...</sub>
-          curMask = mChars.join("");
-          const htmlTechRe = /(<(code|kbd|sup|sub)\b[^>]*>)([^<\n]+)(<\/\2>)/gi;
-          while ((m = htmlTechRe.exec(curMask)) !== null) {
+          refreshMask();
+          IR_HTML_TECH_RE.lastIndex = 0;
+          while ((m = IR_HTML_TECH_RE.exec(curMask)) !== null) {
             const s = m.index;
             const e = s + m[0].length;
             const tName = m[2].toLowerCase();
@@ -3455,9 +3196,9 @@ function buildInstantRenderPlugin(): Extension {
           }
 
           // Inline <br> / <br/> / <br /> inside prose lines
-          curMask = mChars.join("");
-          const brRe = /<br\s*\/?>/gi;
-          while ((m = brRe.exec(curMask)) !== null) {
+          refreshMask();
+          IR_BR_RE.lastIndex = 0;
+          while ((m = IR_BR_RE.exec(curMask)) !== null) {
             const s = m.index;
             const e = s + m[0].length;
             if (claimLiteral(s, e)) {
@@ -3470,154 +3211,82 @@ function buildInstantRenderPlugin(): Extension {
             }
           }
 
-          // Linear-time <font color="...">...</font> (delimiter-only claim + data-volo-color for dark mode)
-          curMask = mChars.join("");
-          const fontRe = /(<font\b[^>]*>)([^<\n]+)(<\/font>)/gi;
-          while ((m = fontRe.exec(curMask)) !== null) {
-            const s = m.index;
-            const e = s + m[0].length;
-            const rawColor = readHtmlAttr(text.slice(s, s + m[1].length), "color");
-            const openEnd = s + m[1].length;
-            const closeStart = e - m[3].length;
-            if (rawColor && SAFE_IR_COLOR_RE.test(rawColor) && claimDelims(s, openEnd, closeStart, e)) {
-              const normColor = rawColor.trim().toLowerCase();
-              addRange(line.from + s, line.from + openEnd, hideDeco);
-              addRange(
-                line.from + openEnd,
-                line.from + closeStart,
-                Decoration.mark({
-                  attributes: { style: `color: ${rawColor};`, "data-volo-color": normColor },
-                })
-              );
-              addRange(line.from + closeStart, line.from + e, hideDeco);
+          // Linear-time <font color="...">...</font> and <span style="color: ...">...</span>
+          const runColorTagPass = (re: RegExp, fromStyle: boolean) => {
+            refreshMask();
+            re.lastIndex = 0;
+            while ((m = re.exec(curMask)) !== null) {
+              const s = m.index;
+              const e = s + m[0].length;
+              const rawAttr = readHtmlAttr(text.slice(s, s + m[1].length), fromStyle ? "style" : "color");
+              const col = fromStyle ? (/^\s*color\s*:\s*([^;]+)\s*;?\s*$/i.exec(rawAttr)?.[1].trim() || "") : rawAttr;
+              const openEnd = s + m[1].length;
+              const closeStart = e - m[3].length;
+              if (col && SAFE_IR_COLOR_RE.test(col) && claimDelims(s, openEnd, closeStart, e)) {
+                addRange(line.from + s, line.from + openEnd, hideDeco);
+                addRange(
+                  line.from + openEnd,
+                  line.from + closeStart,
+                  Decoration.mark({
+                    attributes: { style: `color: ${col};`, "data-volo-color": col.trim().toLowerCase() },
+                  })
+                );
+                addRange(line.from + closeStart, line.from + e, hideDeco);
+              }
             }
-          }
+          };
+          runColorTagPass(IR_FONT_RE, false);
+          runColorTagPass(IR_SPAN_RE, true);
 
-          // Linear-time <span style="color: ...">...</span>
-          curMask = mChars.join("");
-          const spanRe = /(<span\b[^>]*>)([^<\n]+)(<\/span>)/gi;
-          while ((m = spanRe.exec(curMask)) !== null) {
-            const s = m.index;
-            const e = s + m[0].length;
-            const rawStyle = readHtmlAttr(text.slice(s, s + m[1].length), "style");
-            const colorMatch = /^\s*color\s*:\s*([^;]+)\s*;?\s*$/i.exec(rawStyle);
-            const safeColor = colorMatch ? colorMatch[1].trim() : "";
-            const openEnd = s + m[1].length;
-            const closeStart = e - m[3].length;
-            if (safeColor && SAFE_IR_COLOR_RE.test(safeColor) && claimDelims(s, openEnd, closeStart, e)) {
-              addRange(line.from + s, line.from + openEnd, hideDeco);
-              addRange(
-                line.from + openEnd,
-                line.from + closeStart,
-                Decoration.mark({
-                  attributes: { style: `color: ${safeColor};`, "data-volo-color": safeColor.toLowerCase() },
-                })
-              );
-              addRange(line.from + closeStart, line.from + e, hideDeco);
-            }
-          }
-
-          // Highlight <mark>...</mark>
-          curMask = mChars.join("");
-          const markRe = /(<mark>)([^<\n]+)(<\/mark>)/gi;
-          while ((m = markRe.exec(curMask)) !== null) {
-            const s = m.index;
-            const e = s + m[0].length;
-            if (claimDelims(s, s + 6, e - 7, e)) {
-              addRange(line.from + s, line.from + s + 6, hideDeco);
-              addRange(line.from + s + 6, line.from + e - 7, Decoration.mark({ class: "cm-ir-mark" }));
-              addRange(line.from + e - 7, line.from + e, hideDeco);
-            }
-          }
-
-          // Underline <u>...</u>
-          curMask = mChars.join("");
-          const uRe = /(<u>)([^<\n]+)(<\/u>)/gi;
-          while ((m = uRe.exec(curMask)) !== null) {
-            const s = m.index;
-            const e = s + m[0].length;
-            if (claimDelims(s, s + 3, e - 4, e)) {
-              addRange(line.from + s, line.from + s + 3, hideDeco);
-              addRange(line.from + s + 3, line.from + e - 4, Decoration.mark({ class: "cm-ir-underline" }));
-              addRange(line.from + e - 4, line.from + e, hideDeco);
-            }
-          }
+          // Highlight <mark>...</mark> & Underline <u>...</u>
+          runPairPass(IR_MARK_RE, 6, 7, "cm-ir-mark");
+          runPairPass(IR_U_RE, 3, 4, "cm-ir-underline");
 
           // Single-line HTML <a ...>...</a> links
-          curMask = mChars.join("");
-          const htmlLinkRe = /(<a\b(?:"[^"]*"|'[^']*'|[^"'>])*?>)([^<\n]+)(<\/a>)/gi;
-          while ((m = htmlLinkRe.exec(curMask)) !== null) {
+          refreshMask();
+          IR_HTML_LINK_RE.lastIndex = 0;
+          while ((m = IR_HTML_LINK_RE.exec(curMask)) !== null) {
             const s = m.index;
             const e = s + m[0].length;
-            const openEnd = s + m[1].length;
-            const closeStart = e - m[3].length;
-            if (claimDelims(s, openEnd, closeStart, e)) {
-              addRange(line.from + s, line.from + openEnd, hideDeco);
-              addRange(line.from + openEnd, line.from + closeStart, Decoration.mark({ class: "cm-ir-link" }));
-              addRange(line.from + closeStart, line.from + e, hideDeco);
-            }
+            applyDelimMark(s, s + m[1].length, e - m[3].length, e, "cm-ir-link");
           }
 
           // HTML inline formatting tags (<strong>/<b>, <em>/<i>, <s>/<del>/<strike>)
-          curMask = mChars.join("");
-          const htmlFmtRe = /(<(strong|b|em|i|s|del|strike)>)([^<\n]+)(<\/\2>)/gi;
-          while ((m = htmlFmtRe.exec(curMask)) !== null) {
+          refreshMask();
+          IR_HTML_FMT_RE.lastIndex = 0;
+          while ((m = IR_HTML_FMT_RE.exec(curMask)) !== null) {
             const s = m.index;
             const e = s + m[0].length;
-            const openEnd = s + m[1].length;
-            const closeStart = e - m[4].length;
-            if (claimDelims(s, openEnd, closeStart, e)) {
-              const tagLow = m[2].toLowerCase();
-              const cls =
-                tagLow === "strong" || tagLow === "b"
-                  ? "cm-ir-bold"
-                  : tagLow === "em" || tagLow === "i"
-                  ? "cm-ir-italic"
-                  : "cm-ir-strike";
-              addRange(line.from + s, line.from + openEnd, hideDeco);
-              addRange(line.from + openEnd, line.from + closeStart, Decoration.mark({ class: cls }));
-              addRange(line.from + closeStart, line.from + e, hideDeco);
-            }
+            const tagLow = m[2].toLowerCase();
+            const cls =
+              tagLow === "strong" || tagLow === "b"
+                ? "cm-ir-bold"
+                : tagLow === "em" || tagLow === "i"
+                ? "cm-ir-italic"
+                : "cm-ir-strike";
+            applyDelimMark(s, s + m[1].length, e - m[4].length, e, cls);
           }
 
-          // Linear-time <audio ...></audio> player on non-cursor lines
-          curMask = mChars.join("");
-          const audioRe = /(<audio\b[^>]*>)\s*(?:<\/audio>)?/gi;
-          while ((m = audioRe.exec(curMask)) !== null) {
-            const s = m.index;
-            const e = m.index + m[0].length;
-            const rawSrc = readHtmlAttr(text.slice(s, s + m[1].length), "src");
-            if (!rawSrc || !/^(?:\/|https?:\/\/)/i.test(rawSrc)) continue;
-            if (claimLiteral(s, e)) {
-              addRange(
-                line.from + s,
-                line.from + e,
-                Decoration.replace({ widget: new AudioIRWidget(rawSrc, line.from + s, line.from + e) })
-              );
+          // Linear-time <audio ...></audio> and <video ...></video> players on non-cursor lines
+          const runMediaTagPass = (re: RegExp, kind: "audio" | "video") => {
+            refreshMask();
+            re.lastIndex = 0;
+            while ((m = re.exec(curMask)) !== null) {
+              const s = m.index;
+              const e = s + m[0].length;
+              const rawSrc = safeMediaSrc(readHtmlAttr(text.slice(s, s + m[1].length), "src"), { allowRelative: true });
+              if (rawSrc && claimLiteral(s, e)) {
+                addRange(line.from + s, line.from + e, Decoration.replace({ widget: new MediaIRWidget(kind, rawSrc, line.from + s, line.from + e) }));
+              }
             }
-          }
-
-          // Linear-time <video ...></video> player on non-cursor lines
-          curMask = mChars.join("");
-          const videoRe = /(<video\b[^>]*>)\s*(?:<\/video>)?/gi;
-          while ((m = videoRe.exec(curMask)) !== null) {
-            const s = m.index;
-            const e = m.index + m[0].length;
-            const rawSrc = readHtmlAttr(text.slice(s, s + m[1].length), "src");
-            if (!rawSrc || !/^(?:\/|https?:\/\/)/i.test(rawSrc)) continue;
-            if (claimLiteral(s, e)) {
-              addRange(
-                line.from + s,
-                line.from + e,
-                Decoration.replace({ widget: new VideoIRWidget(rawSrc, line.from + s, line.from + e) })
-              );
-            }
-          }
+          };
+          runMediaTagPass(IR_AUDIO_RE, "audio");
+          runMediaTagPass(IR_VIDEO_RE, "video");
 
           // Volo Wiki Links [[slug]] / [[slug|label]]
-          curMask = mChars.join("");
-          const wikiRe = /\[\[([^[\]\n|\x01\x02]+?)(?:\|([^[\]\n]+))?\]\]/g;
-          while ((m = wikiRe.exec(curMask)) !== null) {
+          refreshMask();
+          IR_WIKI_RE.lastIndex = 0;
+          while ((m = IR_WIKI_RE.exec(curMask)) !== null) {
             const s = m.index;
             const e = s + m[0].length;
             const slug = text.slice(s + 2, s + 2 + m[1].length).trim();
@@ -3640,9 +3309,9 @@ function buildInstantRenderPlugin(): Extension {
           }
 
           // Markdown Links [label](url) — delimiter-only occupied so [`code` link](url) and [Click **here**](url) compose!
-          curMask = mChars.join("");
-          const linkRe = /(?<!!)\[([^[\]\n]+)\]\((?!\))([^()\n\x01\x02]*(?:\([^()\n\x01\x02]*\)[^()\n\x01\x02]*)*)\)/g;
-          while ((m = linkRe.exec(curMask)) !== null) {
+          refreshMask();
+          IR_LINK_RE.lastIndex = 0;
+          while ((m = IR_LINK_RE.exec(curMask)) !== null) {
             const s = m.index;
             const e = s + m[0].length;
             const labelLen = m[1].length;
@@ -3650,6 +3319,7 @@ function buildInstantRenderPlugin(): Extension {
             const closeStart = s + 1 + labelLen;
             if (claimDelims(s, openEnd, closeStart, e)) {
               for (let i = closeStart; i < e; i++) mChars[i] = "\x02";
+              maskDirty = true;
               addRange(line.from + s, line.from + openEnd, hideDeco);
               addRange(line.from + openEnd, line.from + closeStart, Decoration.mark({ class: "cm-ir-link" }));
               addRange(line.from + closeStart, line.from + e, hideDeco);
@@ -3657,9 +3327,9 @@ function buildInstantRenderPlugin(): Extension {
           }
 
           // Bare URL autolinks in prose (claim literal BEFORE math/strike/italic/sup/sub)
-          curMask = mChars.join("");
-          const bareUrlRe = /\bhttps?:\/\/[^\s<>()[\]"'\x01\x02]+/gi;
-          while ((m = bareUrlRe.exec(curMask)) !== null) {
+          refreshMask();
+          IR_BARE_URL_RE.lastIndex = 0;
+          while ((m = IR_BARE_URL_RE.exec(curMask)) !== null) {
             const s = m.index;
             let e = s + m[0].length;
             while (e > s && /[.,;:!?]$/.test(text[e - 1])) e--;
@@ -3669,10 +3339,9 @@ function buildInstantRenderPlugin(): Extension {
           }
 
           // Inline LaTeX math $...$ & \(...\) (atomic literal span)
-          curMask = mChars.join("");
-          const inlineMathRe =
-            /(?:^|[^\\$])\$(?!\s|\$)([^\n$\x01\x02]*?[^\s\\$\x01\x02])\$(?![0-9a-zA-Z\\$])|\\\(([^\n\x01\x02]+?)\\\)/g;
-          while ((m = inlineMathRe.exec(curMask)) !== null) {
+          refreshMask();
+          IR_INLINE_MATH_RE.lastIndex = 0;
+          while ((m = IR_INLINE_MATH_RE.exec(curMask)) !== null) {
             const isParen = m[2] !== undefined;
             const lead = isParen || m[0].startsWith("$") ? 0 : 1;
             const s = m.index + lead;
@@ -3690,87 +3359,13 @@ function buildInstantRenderPlugin(): Extension {
             }
           }
 
-          // Extended Highlight ==...== (delimiter-only so ==mark **bold**== composes)
-          curMask = mChars.join("");
-          const eqMarkRe = /(?:^|[^=])==(?!=|\s)([^=\n]*?[^\s=])==(?!=)/g;
-          while ((m = eqMarkRe.exec(curMask)) !== null) {
-            const lead = m[0].startsWith("=") ? 0 : 1;
-            const s = m.index + lead;
-            const e = m.index + m[0].length;
-            if (claimDelims(s, s + 2, e - 2, e)) {
-              addRange(line.from + s, line.from + s + 2, hideDeco);
-              addRange(line.from + s + 2, line.from + e - 2, Decoration.mark({ class: "cm-ir-mark" }));
-              addRange(line.from + e - 2, line.from + e, hideDeco);
-            }
-          }
-
-          // Bold **...** (supports nested *italic* inside **bold *italic*** and *italic **bold***)
-          curMask = mChars.join("");
-          const boldRe = /\*\*(?!\s)((?:[^*\n]|\*(?!\s|\*)(?:[^*\n]*?[^\s*\n])?\*)+?)\*\*/g;
-          while ((m = boldRe.exec(curMask)) !== null) {
-            const s = m.index;
-            const e = s + m[0].length;
-            if (claimDelims(s, s + 2, e - 2, e)) {
-              addRange(line.from + s, line.from + s + 2, hideDeco);
-              addRange(line.from + s + 2, line.from + e - 2, Decoration.mark({ class: "cm-ir-bold" }));
-              addRange(line.from + e - 2, line.from + e, hideDeco);
-            }
-          }
-
-          // Strikethrough ~~...~~ (must run BEFORE single-tilde ~sub~)
-          curMask = mChars.join("");
-          const strikeRe = /~~([^~\n]+)~~/g;
-          while ((m = strikeRe.exec(curMask)) !== null) {
-            const s = m.index;
-            const e = s + m[0].length;
-            if (claimDelims(s, s + 2, e - 2, e)) {
-              addRange(line.from + s, line.from + s + 2, hideDeco);
-              addRange(line.from + s + 2, line.from + e - 2, Decoration.mark({ class: "cm-ir-strike" }));
-              addRange(line.from + e - 2, line.from + e, hideDeco);
-            }
-          }
-
-          // Italic *...*
-          curMask = mChars.join("");
-          const italicRe = /(?:^|[^*])\*([^*\s][^*\n]*?)\*(?!\*)/g;
-          while ((m = italicRe.exec(curMask)) !== null) {
-            const fullOffset = m[0].startsWith("*") ? 0 : 1;
-            const s = m.index + fullOffset;
-            const e = m.index + m[0].length;
-            if (claimDelims(s, s + 1, e - 1, e)) {
-              addRange(line.from + s, line.from + s + 1, hideDeco);
-              addRange(line.from + s + 1, line.from + e - 1, Decoration.mark({ class: "cm-ir-italic" }));
-              addRange(line.from + e - 1, line.from + e, hideDeco);
-            }
-          }
-
-          // Extended Superscript ^sup^
-          curMask = mChars.join("");
-          const supRe = /(?:^|[^^\\[])\^([^\s^\n[\]]+)\^(?!\^)/g;
-          while ((m = supRe.exec(curMask)) !== null) {
-            const lead = m[0].startsWith("^") ? 0 : 1;
-            const s = m.index + lead;
-            const e = m.index + m[0].length;
-            if (claimDelims(s, s + 1, e - 1, e)) {
-              addRange(line.from + s, line.from + s + 1, hideDeco);
-              addRange(line.from + s + 1, line.from + e - 1, Decoration.mark({ class: "cm-ir-sup" }));
-              addRange(line.from + e - 1, line.from + e, hideDeco);
-            }
-          }
-
-          // Extended Subscript ~sub~
-          curMask = mChars.join("");
-          const subRe = /(?:^|[^~\\/])~([^\s~\n/]+)~(?!~)/g;
-          while ((m = subRe.exec(curMask)) !== null) {
-            const lead = m[0].startsWith("~") ? 0 : 1;
-            const s = m.index + lead;
-            const e = m.index + m[0].length;
-            if (claimDelims(s, s + 1, e - 1, e)) {
-              addRange(line.from + s, line.from + s + 1, hideDeco);
-              addRange(line.from + s + 1, line.from + e - 1, Decoration.mark({ class: "cm-ir-sub" }));
-              addRange(line.from + e - 1, line.from + e, hideDeco);
-            }
-          }
+          // Extended Highlight ==...==, Bold **...**, Strike ~~...~~, Italic *...*, Sup ^...^, Sub ~...~
+          runPairPass(IR_EQ_MARK_RE, 2, 2, "cm-ir-mark", "=");
+          runPairPass(IR_BOLD_RE, 2, 2, "cm-ir-bold");
+          runPairPass(IR_STRIKE_RE, 2, 2, "cm-ir-strike");
+          runPairPass(IR_ITALIC_RE, 1, 1, "cm-ir-italic", "*");
+          runPairPass(IR_SUP_RE, 1, 1, "cm-ir-sup", "^");
+          runPairPass(IR_SUB_RE, 1, 1, "cm-ir-sub", "~");
         }
 
         pos = line.to + 1;
@@ -3784,6 +3379,8 @@ function buildInstantRenderPlugin(): Extension {
       decorations: DecorationSet;
       activeLine: number;
       activeLineHasImg: boolean;
+      selFromLine: number;
+      selToLine: number;
       wasComposing: boolean;
       headOffsetY: number | null = null;
       measuredScrollTop = 0;
@@ -3802,6 +3399,9 @@ function buildInstantRenderPlugin(): Extension {
         this.wasComposing = view.composing;
         this.decorations = buildDecos(view);
         const ln = view.state.doc.lineAt(view.state.selection.main.head);
+        const trackInit = view.hasFocus || view.composing;
+        this.selFromLine = trackInit ? view.state.doc.lineAt(view.state.selection.main.from).number : -1;
+        this.selToLine = trackInit ? view.state.doc.lineAt(view.state.selection.main.to).number : -1;
         this.activeLine = view.hasFocus ? ln.number : -1;
         this.activeLineHasImg = view.hasFocus ? lineHasIRTallWidget(view.state, ln.number, ln.text) : false;
         this.currentScrollTop = view.scrollDOM.scrollTop;
@@ -3875,6 +3475,10 @@ function buildInstantRenderPlugin(): Extension {
 
         const head = state.selection.main.head;
         const nextLine = state.doc.lineAt(head);
+        const trackSel = focused || update.view.composing;
+        const nextSelFromLine = trackSel ? state.doc.lineAt(state.selection.main.from).number : -1;
+        const nextSelToLine = trackSel ? state.doc.lineAt(state.selection.main.to).number : -1;
+        const selLinesChanged = nextSelFromLine !== this.selFromLine || nextSelToLine !== this.selToLine;
         const nextLineNo = focused ? nextLine.number : -1;
         const prevLineNo = this.activeLine;
         const prevHadImg = this.activeLineHasImg;
@@ -3885,7 +3489,7 @@ function buildInstantRenderPlugin(): Extension {
         if (
           update.docChanged ||
           update.viewportChanged ||
-          update.selectionSet ||
+          (update.selectionSet && selLinesChanged) ||
           update.focusChanged ||
           composingChanged ||
           searchChanged
@@ -3893,6 +3497,8 @@ function buildInstantRenderPlugin(): Extension {
           this.decorations = buildDecos(update.view);
         }
 
+        this.selFromLine = nextSelFromLine;
+        this.selToLine = nextSelToLine;
         this.activeLine = nextLineNo;
         this.activeLineHasImg = nextHasImg;
 
@@ -4112,7 +3718,7 @@ function computeIRImgBox(src: string): { w: number; h: number } | null {
 function lineHasIRTallWidget(state: EditorState, lineNumber: number, text: string): boolean {
   if (getIRDocScan(state.doc).tableLines.has(lineNumber)) return true;
   if (text.length === 0 || text.length > 2400) return false;
-  if (/!\[[^[\]\n]*\]\((?!\))[^()\n]*(?:\([^()\n]*\)[^()\n]*)*\)/.test(text) || /<(?:img|video|audio)\b[^>]*?\bsrc\s*=/i.test(text)) {
+  if (/!\[[^[\]\n]*\]\((?!\))[^()\n]*(?:\([^()\n]*\)[^()\n]*)*\)/.test(text) || /<(?:img|video|audio)\b[^<>]*?\bsrc\s*=/i.test(text)) {
     return true;
   }
   if (/^\s*\[toc\]\s*$/i.test(text) || matchStandaloneEmbedVideo(text) !== null) {
@@ -4131,7 +3737,7 @@ class BrIRWidget extends WidgetType {
     return true;
   }
   toDOM(): HTMLElement {
-    return document.createElement("br");
+    return mkEl("br");
   }
 }
 
@@ -4140,64 +3746,19 @@ class BulletIRWidget extends WidgetType {
     return true;
   }
   toDOM(): HTMLElement {
-    const span = document.createElement("span");
-    span.textContent = "• ";
+    const span = mkEl("span", undefined, "• ");
     span.style.color = "var(--volo-accent)";
     span.style.fontWeight = "700";
     return span;
   }
 }
 
-function splitGfmTableRow(line: string): string[] {
-  let s = line.trim();
-  if (s.startsWith("|")) s = s.slice(1);
-  if (hasUnescapedTrailingPipe(s)) s = s.slice(0, -1);
-  const cells: string[] = [];
-  let cur = "";
-  let codeTicks = 0;
-  for (let i = 0; i < s.length; i++) {
-    const ch = s[i];
-    if (ch === "\\" && i + 1 < s.length) {
-      const next = s[i + 1];
-      if (next === "|") {
-        // GFM §4.10: `\|` unescapes to literal `|` before inline code spans are parsed
-        cur += "|";
-        i++;
-        continue;
-      }
-      if (next === "\\") {
-        cur += codeTicks > 0 ? "\\\\" : "\\";
-        i++;
-        continue;
-      }
-    }
-    if (ch === "`") {
-      let run = 1;
-      while (i + run < s.length && s[i + run] === "`") run++;
-      if (codeTicks === 0) {
-        codeTicks = run;
-      } else if (run === codeTicks) {
-        codeTicks = 0;
-      }
-      cur += s.slice(i, i + run);
-      i += run - 1;
-    } else if (ch === "|") {
-      cells.push(cur.trim());
-      cur = "";
-    } else {
-      cur += ch;
-    }
-  }
-  cells.push(cur.trim());
-  return cells;
-}
-
 function appendSafeCellMarkdown(host: HTMLElement, raw: string): void {
   const parts = raw.split(/<br\s*\/?>/gi);
   parts.forEach((seg, idx) => {
-    if (idx > 0) host.appendChild(document.createElement("br"));
+    if (idx > 0) host.appendChild(mkEl("br"));
     const tokenRe =
-      /!\[([^[\]\n]*)\]\((?!\))([^()\n]*(?:\([^()\n]*\)[^()\n]*)*)\)|\[([^[\]\n]+)\]\((?!\))([^()\n]*(?:\([^()\n]*\)[^()\n]*)*)\)|(`+)(?!`)([^\n]+?)(?<!`)\5(?!`)|(\bhttps?:\/\/[^\s<>()[\]"']+)|\$(?!\s|\$)([^\n$]*?[^\s\\$])\$(?![0-9a-zA-Z\\$])|\*\*([^*\n]+)\*\*|==([^=\n]+)==|~~([^~\n]+)~~|\*([^*\s][^*\n]*?)\*|\^([^\s^\n[\]]+)\^|~([^\s~\n/]+)~|<(u|mark|kbd|sup|sub|strong|b|em|i|s|del)>([^<\n]+)<\/\15>|<a\b[^>]*?\bhref\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))[^>]*>([^<\n]+)<\/a>/gi;
+      /!\[([^[\]\n]*)\]\((?!\))([^()\n]*(?:\([^()\n]*\)[^()\n]*)*)\)|\[([^[\]\n]+)\]\((?!\))([^()\n]*(?:\([^()\n]*\)[^()\n]*)*)\)|(?<!`)(`+)(?!`)([^\n]+?)(?<!`)\5(?!`)|(\bhttps?:\/\/[^\s<>()[\]"']+)|\$(?!\s|\$)([^\n$]*?[^\s\\$])\$(?![0-9a-zA-Z\\$])|\*\*([^*\n]+)\*\*|==([^=\n]+)==|~~([^~\n]+)~~|\*([^*\s][^*\n]*?)\*|\^([^\s^\n[\]]+)\^|~([^\s~\n/]+)~|<(u|mark|kbd|sup|sub|strong|b|em|i|s|del)>([^<\n]+)<\/\15>|(<a\b(?:"[^"<>]*"|'[^'<>]*'|[^"'<>])*?>)([^<\n]+)<\/a>/gi;
     let last = 0;
     let m: RegExpExecArray | null;
     while ((m = tokenRe.exec(seg)) !== null) {
@@ -4207,26 +3768,27 @@ function appendSafeCellMarkdown(host: HTMLElement, raw: string): void {
       if (m[2] !== undefined) {
         const src = resolveIRImageSrc(parseMarkdownImageTarget(m[2]));
         if (src) {
-          const img = document.createElement("img");
+          const img = mkEl("img");
           img.src = src;
           img.alt = m[1] || "";
           img.style.maxHeight = "64px";
           host.appendChild(img);
         }
       } else if (m[3] !== undefined && m[4] !== undefined) {
-        const a = document.createElement("a");
-        const href = parseMarkdownImageTarget(m[4]);
-        if (!/^(?:javascript|vbscript|data):/i.test(href)) a.href = href;
+        const a = mkEl("a");
+        const href = safeHref(parseMarkdownImageTarget(m[4]), { allowMailto: true });
+        if (href) a.href = href;
         appendSafeCellMarkdown(a, m[3]);
         host.appendChild(a);
       } else if (m[6] !== undefined) {
-        const c = document.createElement("code");
-        c.className = "cm-ir-inline-code";
         const codeTxt = m[6];
-        c.textContent =
+        const c = mkEl(
+          "code",
+          "cm-ir-inline-code",
           codeTxt.length >= 2 && codeTxt.startsWith(" ") && codeTxt.endsWith(" ") && codeTxt.trim()
             ? codeTxt.slice(1, -1)
-            : codeTxt;
+            : codeTxt
+        );
         host.appendChild(c);
       } else if (m[7] !== undefined) {
         let urlStr = m[7];
@@ -4235,17 +3797,19 @@ function appendSafeCellMarkdown(host: HTMLElement, raw: string): void {
           trail = urlStr[urlStr.length - 1] + trail;
           urlStr = urlStr.slice(0, -1);
         }
-        const a = document.createElement("a");
-        a.href = urlStr;
-        a.textContent = urlStr;
-        host.appendChild(a);
+        const safeAuto = safeHref(urlStr, { allowRelative: false });
+        if (safeAuto) {
+          const a = mkEl("a", undefined, urlStr);
+          a.href = safeAuto;
+          host.appendChild(a);
+        } else {
+          host.appendChild(document.createTextNode(urlStr));
+        }
         if (trail) host.appendChild(document.createTextNode(trail));
       } else if (m[8] !== undefined) {
         const expr = m[8].trim();
         if (isLikelyInlineMath(expr)) {
-          const mathSpan = document.createElement("span");
-          mathSpan.className = "cm-ir-math-inline";
-          mathSpan.textContent = expr;
+          const mathSpan = mkEl("span", "cm-ir-math-inline", expr);
           void ensureEditorKaTeX()
             .then((katex) => {
               if (katex && mathSpan.isConnected) {
@@ -4258,39 +3822,30 @@ function appendSafeCellMarkdown(host: HTMLElement, raw: string): void {
           host.appendChild(document.createTextNode(m[0]));
         }
       } else if (m[9] !== undefined) {
-        const b = document.createElement("strong");
+        const b = mkEl("strong");
         appendSafeCellMarkdown(b, m[9]);
         host.appendChild(b);
       } else if (m[10] !== undefined) {
-        const mk = document.createElement("mark");
+        const mk = mkEl("mark");
         appendSafeCellMarkdown(mk, m[10]);
         host.appendChild(mk);
       } else if (m[11] !== undefined) {
-        const del = document.createElement("del");
-        del.textContent = m[11];
-        host.appendChild(del);
+        host.appendChild(mkEl("del", undefined, m[11]));
       } else if (m[12] !== undefined) {
-        const em = document.createElement("em");
-        em.textContent = m[12];
-        host.appendChild(em);
+        host.appendChild(mkEl("em", undefined, m[12]));
       } else if (m[13] !== undefined) {
-        const sup = document.createElement("sup");
-        sup.textContent = m[13];
-        host.appendChild(sup);
+        host.appendChild(mkEl("sup", undefined, m[13]));
       } else if (m[14] !== undefined) {
-        const sub = document.createElement("sub");
-        sub.textContent = m[14];
-        host.appendChild(sub);
+        host.appendChild(mkEl("sub", undefined, m[14]));
       } else if (m[15] !== undefined && m[16] !== undefined) {
         const tag = m[15].toLowerCase();
-        const el = document.createElement(tag === "b" ? "strong" : tag === "i" ? "em" : tag === "s" ? "del" : tag);
-        el.textContent = m[16];
-        host.appendChild(el);
-      } else if (m[20] !== undefined) {
-        const href = (m[17] || m[18] || m[19] || "").trim();
-        const a = document.createElement("a");
-        if (href && !/^(?:javascript|vbscript|data):/i.test(href)) a.href = href;
-        a.textContent = m[20];
+        host.appendChild(
+          mkEl((tag === "b" ? "strong" : tag === "i" ? "em" : tag === "s" ? "del" : tag) as keyof HTMLElementTagNameMap, undefined, m[16])
+        );
+      } else if (m[18] !== undefined) {
+        const href = safeHref(readHtmlAttr(m[17], "href"), { allowMailto: true });
+        const a = mkEl("a", undefined, m[18]);
+        if (href) a.href = href;
         host.appendChild(a);
       }
       last = m.index + m[0].length;
@@ -4362,8 +3917,8 @@ function cloneSanitizedTableNode(node: Node, rowCounter: { idx: number }): Node 
     if (rs && /^\d{1,2}$/.test(rs)) out.setAttribute("rowspan", rs);
     if (al === "left" || al === "center" || al === "right") out.style.textAlign = al;
   } else if (tag === "a") {
-    const href = (srcEl.getAttribute("href") || "").trim();
-    if (href && !/^(?:javascript|vbscript|data):/i.test(href)) {
+    const href = safeHref(srcEl.getAttribute("href") || "", { allowMailto: true });
+    if (href) {
       out.setAttribute("href", href);
     }
   } else if (tag === "img") {
@@ -4384,7 +3939,13 @@ function cloneSanitizedTableNode(node: Node, rowCounter: { idx: number }): Node 
   return out;
 }
 
-class TableIRWidget extends WidgetType {
+abstract class BaseIRWidget extends WidgetType {
+  ignoreEvent(): boolean {
+    return true;
+  }
+}
+
+class TableIRWidget extends BaseIRWidget {
   constructor(
     readonly raw: string,
     readonly kind: "html" | "md",
@@ -4409,10 +3970,8 @@ class TableIRWidget extends WidgetType {
     return Math.min(520, rows * 38 + 16);
   }
   toDOM(view: EditorView): HTMLElement {
-    const host = document.createElement("div");
-    host.className = "cm-ir-table-host";
-    const scroller = document.createElement("div");
-    scroller.className = "volo-table-scroll";
+    const host = mkEl("div", "cm-ir-table-host");
+    const scroller = mkEl("div", "volo-table-scroll");
 
     if (this.kind === "html") {
       const parsed = new DOMParser().parseFromString(this.raw, "text/html");
@@ -4423,42 +3982,33 @@ class TableIRWidget extends WidgetType {
       }
     } else {
       const lines = this.raw.split("\n");
-      const tbl = document.createElement("table");
+      const tbl = mkEl("table");
       const headCells = splitGfmTableRow(lines[0] || "");
       const sepCells = splitGfmTableRow(lines[1] || "");
       const aligns = sepCells.map((c) => {
         const tStr = c.trim();
-        if (tStr.startsWith(":") && tStr.endsWith(":")) return "center";
-        if (tStr.endsWith(":")) return "right";
-        return "left";
+        return tStr.startsWith(":") && tStr.endsWith(":") ? "center" : tStr.endsWith(":") ? "right" : "left";
       });
       const cols = Math.max(1, headCells.length, aligns.length);
-
-      const thead = document.createElement("thead");
-      const headTr = document.createElement("tr");
-      headTr.setAttribute("data-row-idx", "0");
-      for (let ci = 0; ci < cols; ci++) {
-        const th = document.createElement("th");
-        if (aligns[ci]) th.style.textAlign = aligns[ci];
-        appendSafeCellMarkdown(th, headCells[ci] || "");
-        headTr.appendChild(th);
-      }
-      thead.appendChild(headTr);
+      const buildRow = (tag: "th" | "td", cells: string[], rowIdx: number) => {
+        const tr = mkEl("tr");
+        tr.setAttribute("data-row-idx", String(rowIdx));
+        for (let ci = 0; ci < cols; ci++) {
+          const cell = mkEl(tag);
+          if (aligns[ci]) cell.style.textAlign = aligns[ci];
+          appendSafeCellMarkdown(cell, cells[ci] || "");
+          tr.appendChild(cell);
+        }
+        return tr;
+      };
+      const thead = mkEl("thead");
+      thead.appendChild(buildRow("th", headCells, 0));
       tbl.appendChild(thead);
 
       if (lines.length > 2) {
-        const tbody = document.createElement("tbody");
+        const tbody = mkEl("tbody");
         for (let ri = 2; ri < lines.length; ri++) {
-          const rowCells = splitGfmTableRow(lines[ri]);
-          const tr = document.createElement("tr");
-          tr.setAttribute("data-row-idx", String(ri - 1));
-          for (let ci = 0; ci < cols; ci++) {
-            const td = document.createElement("td");
-            if (aligns[ci]) td.style.textAlign = aligns[ci];
-            appendSafeCellMarkdown(td, rowCells[ci] || "");
-            tr.appendChild(td);
-          }
-          tbody.appendChild(tr);
+          tbody.appendChild(buildRow("td", splitGfmTableRow(lines[ri]), ri - 1));
         }
         tbl.appendChild(tbody);
       }
@@ -4473,14 +4023,13 @@ class TableIRWidget extends WidgetType {
       const linkEl = targetEl?.closest("a[href]") as HTMLAnchorElement | null;
       if (linkEl && (e.metaKey || e.ctrlKey)) {
         e.preventDefault();
-        const href = linkEl.getAttribute("href") || "";
-        if (/^(?:https?:\/\/|\/)/i.test(href)) {
+        const href = safeHref(linkEl.getAttribute("href") || "");
+        if (href) {
           window.open(href, "_blank", "noopener,noreferrer");
         }
         return;
       }
       e.preventDefault();
-      pendingIRClickClientY = e.clientY;
       const trEl = targetEl?.closest("tr[data-row-idx]") as HTMLElement | null;
       const rowIdx = trEl ? Math.max(0, Number(trEl.getAttribute("data-row-idx") || 0)) : 0;
 
@@ -4503,22 +4052,14 @@ class TableIRWidget extends WidgetType {
         }
       }
 
-      view.dispatch({
-        selection: { anchor: targetPos },
-        effects: irFocusEffect.of(true),
-        userEvent: "select.pointer",
-      });
-      view.focus();
+      focusIRWidgetPos(view, targetPos, e.clientY);
     });
 
     return host;
   }
-  ignoreEvent(): boolean {
-    return true;
-  }
 }
 
-class ImageIRWidget extends WidgetType {
+class ImageIRWidget extends BaseIRWidget {
   readonly boxKey: string;
   constructor(
     readonly src: string,
@@ -4547,34 +4088,20 @@ class ImageIRWidget extends WidgetType {
     return (box ? box.h : DEFAULT_IR_IMG_PENDING_H) + 10;
   }
   toDOM(view: EditorView): HTMLElement {
-    const wrap = document.createElement("span");
-    wrap.className = "cm-ir-img-wrap";
+    const wrap = mkEl("span", "cm-ir-img-wrap");
     wrap.title = this.alt ? `${this.alt} (${this.rawSrc})` : this.rawSrc;
 
-    const fb = document.createElement("span");
-    fb.className = "cm-ir-img-fallback";
-    fb.textContent = this.alt ? `🖼 ${this.alt} · ${this.rawSrc}` : `🖼 ${this.rawSrc}`;
+    const fb = mkEl("span", "cm-ir-img-fallback", this.alt ? `🖼 ${this.alt} · ${this.rawSrc}` : `🖼 ${this.rawSrc}`);
 
     if (irImageBroken.has(this.src)) {
       fb.hidden = false;
       wrap.appendChild(fb);
-      wrap.addEventListener("mousedown", (e) => {
-        if (e.button !== 0) return;
-        e.preventDefault();
-        pendingIRClickClientY = e.clientY;
-        const safePos = Math.min(this.endPos, view.state.doc.length);
-        view.dispatch({
-          selection: { anchor: safePos },
-          userEvent: "select.pointer",
-        });
-        view.focus();
-      });
+      bindIRFocusMouseDown(wrap, view, this.endPos);
       return wrap;
     }
 
     fb.hidden = true;
-    const img = document.createElement("img");
-    img.className = "cm-ir-img";
+    const img = mkEl("img", "cm-ir-img");
     if (this.src && !/^(?:\/(?!\/)|data:|blob:)/i.test(this.src)) {
       img.referrerPolicy = "no-referrer";
     }
@@ -4672,28 +4199,15 @@ class ImageIRWidget extends WidgetType {
       }
     };
 
-    wrap.addEventListener("mousedown", (e) => {
-      if (e.button !== 0) return;
-      e.preventDefault();
-      pendingIRClickClientY = e.clientY;
-      const safePos = Math.min(this.endPos, view.state.doc.length);
-      view.dispatch({
-        selection: { anchor: safePos },
-        userEvent: "select.pointer",
-      });
-      view.focus();
-    });
+    bindIRFocusMouseDown(wrap, view, this.endPos);
 
     wrap.appendChild(img);
     wrap.appendChild(fb);
     return wrap;
   }
-  ignoreEvent(): boolean {
-    return true;
-  }
 }
 
-class FenceLangIRWidget extends WidgetType {
+class FenceLangIRWidget extends BaseIRWidget {
   constructor(
     readonly openLineNo: number,
     readonly explicitLang: string,
@@ -4709,30 +4223,10 @@ class FenceLangIRWidget extends WidgetType {
     );
   }
   toDOM(view: EditorView): HTMLElement {
-    const wrap = document.createElement("span");
-    const select = document.createElement("select");
-    select.className = "cm-ir-fence-lang-select";
+    const wrap = mkEl("span");
+    const select = mkEl("select", "cm-ir-fence-lang-select");
     select.setAttribute("aria-label", t("ed.code_lang_ph"));
-    const seen = new Set<string>();
-    for (const item of CODE_BLOCK_LANGS) {
-      seen.add(item.value);
-      const opt = document.createElement("option");
-      opt.value = item.value;
-      opt.textContent =
-        item.value === ""
-          ? this.autoLang
-            ? `${this.autoLang.toUpperCase()} · auto`
-            : t("ed.code_plain")
-          : item.label;
-      select.appendChild(opt);
-    }
-    if (this.explicitLang && !seen.has(this.explicitLang)) {
-      const custom = document.createElement("option");
-      custom.value = this.explicitLang;
-      custom.textContent = this.explicitLang.toUpperCase();
-      select.insertBefore(custom, select.firstChild);
-    }
-    select.value = this.explicitLang;
+    populateCodeLangSelect(select, this.explicitLang, this.autoLang, t("ed.code_plain"));
     select.addEventListener("mousedown", (e) => {
       e.stopPropagation();
     });
@@ -4754,12 +4248,9 @@ class FenceLangIRWidget extends WidgetType {
     wrap.appendChild(select);
     return wrap;
   }
-  ignoreEvent(): boolean {
-    return true;
-  }
 }
 
-class FenceCopyIRWidget extends WidgetType {
+class FenceCopyIRWidget extends BaseIRWidget {
   constructor(
     readonly openLineNo: number,
     readonly closeLineNo: number
@@ -4770,14 +4261,11 @@ class FenceCopyIRWidget extends WidgetType {
     return this.openLineNo === other.openLineNo && this.closeLineNo === other.closeLineNo;
   }
   toDOM(view: EditorView): HTMLElement {
-    const bar = document.createElement("span");
-    bar.className = "cm-ir-fence-bar";
-    const btn = document.createElement("button");
-    btn.type = "button";
-    btn.className = "cm-ir-fence-btn";
+    const bar = mkEl("span", "cm-ir-fence-bar");
     const copyTxt = t("ed.copy_code");
     const copiedTxt = t("ed.copied");
-    btn.textContent = copyTxt;
+    const btn = mkEl("button", "cm-ir-fence-btn", copyTxt);
+    btn.type = "button";
     btn.addEventListener("mousedown", (e) => {
       e.preventDefault();
       e.stopPropagation();
@@ -4788,27 +4276,23 @@ class FenceCopyIRWidget extends WidgetType {
       const doc = view.state.doc;
       const startLn = this.openLineNo + 1;
       const endLn = Math.min(doc.lines, this.closeLineNo - 1);
-      const code =
-        startLn <= endLn && startLn >= 1 ? doc.sliceString(doc.line(startLn).from, doc.line(endLn).to) : "";
-      void copyTextToClipboard(code).then(() => {
-        const prev = (btn as any)._copyTimer;
-        if (prev) window.clearTimeout(prev);
-        btn.setAttribute("data-copied", "true");
-        btn.textContent = `✓ ${copiedTxt}`;
-        (btn as any)._copyTimer = window.setTimeout(() => {
-          (btn as any)._copyTimer = 0;
-          if (btn.isConnected) {
-            btn.removeAttribute("data-copied");
-            btn.textContent = copyTxt;
+      const qDepth = getIRDocScan(doc).quoteDepth[this.openLineNo] || 0;
+      let code = "";
+      if (startLn <= endLn && startLn >= 1) {
+        if (qDepth > 0) {
+          const outLines: string[] = [];
+          for (let ln = startLn; ln <= endLn; ln++) {
+            outLines.push(stripQuotePrefix(doc.line(ln).text, qDepth).stripped);
           }
-        }, 1400);
-      });
+          code = outLines.join("\n");
+        } else {
+          code = doc.sliceString(doc.line(startLn).from, doc.line(endLn).to);
+        }
+      }
+      triggerCopyBtnFeedback(btn, code, copyTxt, copiedTxt);
     });
     bar.appendChild(btn);
     return bar;
-  }
-  ignoreEvent(): boolean {
-    return true;
   }
 }
 
@@ -4820,7 +4304,7 @@ const CALLOUT_PILL_ICONS: Record<string, string> = {
   caution: "⛔",
 };
 
-class CalloutPillIRWidget extends WidgetType {
+class CalloutPillIRWidget extends BaseIRWidget {
   constructor(
     readonly kind: string,
     readonly endPos: number
@@ -4831,28 +4315,15 @@ class CalloutPillIRWidget extends WidgetType {
     return this.kind === other.kind && this.endPos === other.endPos;
   }
   toDOM(view: EditorView): HTMLElement {
-    const pill = document.createElement("span");
-    pill.className = "cm-ir-callout-pill";
     const icon = CALLOUT_PILL_ICONS[this.kind] || "ℹ";
-    pill.textContent = `${icon} ${t(`ed.callout_${this.kind}`)}`;
-    pill.addEventListener("mousedown", (e) => {
-      if (e.button !== 0) return;
-      e.preventDefault();
-      view.dispatch({
-        selection: { anchor: Math.min(this.endPos, view.state.doc.length) },
-        userEvent: "select.pointer",
-      });
-      view.focus();
-    });
+    const pill = mkEl("span", "cm-ir-callout-pill", `${icon} ${t(`ed.callout_${this.kind}`)}`);
+    bindIRFocusMouseDown(pill, view, this.endPos, false);
     return pill;
-  }
-  ignoreEvent(): boolean {
-    return true;
   }
 }
 
 /** Compact "↗ host" chip that stands in for the hidden `](href)` tail of a linked image `[![alt](src)](href)`. */
-class LinkedImageBadgeIRWidget extends WidgetType {
+class LinkedImageBadgeIRWidget extends BaseIRWidget {
   constructor(
     readonly href: string,
     readonly endPos: number
@@ -4863,30 +4334,17 @@ class LinkedImageBadgeIRWidget extends WidgetType {
     return this.href === other.href && this.endPos === other.endPos;
   }
   toDOM(view: EditorView): HTMLElement {
-    const chip = document.createElement("span");
-    chip.className = "cm-ir-img-link-badge";
-    chip.title = this.href;
     let label = this.href;
     const hm = /^(?:https?:)?\/\/([^/?#]+)(.*)$/i.exec(this.href);
     if (hm) {
-      const rest = hm[2].replace(/\/+$/, "");
+      const rest = trimEndChars(hm[2], "/");
       label = hm[1].replace(/^www\./i, "") + rest;
     }
     if (label.length > 42) label = label.slice(0, 41) + "…";
-    chip.textContent = `↗ ${label}`;
-    chip.addEventListener("mousedown", (e) => {
-      if (e.button !== 0) return;
-      e.preventDefault();
-      view.dispatch({
-        selection: { anchor: Math.min(this.endPos, view.state.doc.length) },
-        userEvent: "select.pointer",
-      });
-      view.focus();
-    });
+    const chip = mkEl("span", "cm-ir-img-link-badge", `↗ ${label}`);
+    chip.title = this.href;
+    bindIRFocusMouseDown(chip, view, this.endPos, false);
     return chip;
-  }
-  ignoreEvent(): boolean {
-    return true;
   }
 }
 
@@ -4948,115 +4406,88 @@ function matchStandaloneEmbedVideo(text: string): StandaloneEmbedInfo | null {
   return null;
 }
 
-class AudioIRWidget extends WidgetType {
-  constructor(
-    readonly src: string,
-    readonly pos: number,
-    readonly endPos: number
-  ) {
-    super();
-  }
-  eq(other: AudioIRWidget): boolean {
-    return this.src === other.src && this.pos === other.pos && this.endPos === other.endPos;
-  }
-  get estimatedHeight(): number {
-    return 52;
-  }
-  toDOM(view: EditorView): HTMLElement {
-    const wrap = document.createElement("span");
-    wrap.className = "cm-ir-media-wrap cm-ir-media-wrap--audio";
-    const el = document.createElement("audio");
-    el.controls = true;
-    el.preload = "metadata";
-    el.src = this.src;
-    el.className = "cm-ir-audio";
-    const editChip = document.createElement("button");
-    editChip.type = "button";
-    editChip.className = "cm-ir-media-edit";
-    editChip.textContent = "✎";
-    editChip.title = this.src;
-    wrap.appendChild(el);
-    wrap.appendChild(editChip);
-    wrap.addEventListener("mousedown", (e) => {
-      if (e.button !== 0) return;
-      const target = e.target as HTMLElement | null;
-      if (target === el && !e.altKey && !e.metaKey && !e.ctrlKey) {
-        return;
-      }
-      e.preventDefault();
-      pendingIRClickClientY = e.clientY;
-      const safePos = Math.min(this.endPos, view.state.doc.length);
+function focusIRWidgetPos(view: EditorView, pos: number, clientY: number): void {
+  pendingIRClickClientY = clientY;
+  view.dispatch({
+    selection: { anchor: Math.min(pos, view.state.doc.length) },
+    effects: irFocusEffect.of(true),
+    userEvent: "select.pointer",
+  });
+  view.focus();
+}
+
+function bindIRFocusMouseDown(el: HTMLElement, view: EditorView, pos: number, useClickY = true): void {
+  el.addEventListener("mousedown", (e) => {
+    if (e.button !== 0) return;
+    e.preventDefault();
+    if (useClickY) {
+      focusIRWidgetPos(view, pos, e.clientY);
+    } else {
       view.dispatch({
-        selection: { anchor: safePos },
-        effects: irFocusEffect.of(true),
+        selection: { anchor: Math.min(pos, view.state.doc.length) },
         userEvent: "select.pointer",
       });
       view.focus();
-    });
-    return wrap;
-  }
-  ignoreEvent(): boolean {
-    return true;
-  }
+    }
+  });
 }
 
-class VideoIRWidget extends WidgetType {
+function renderKatexIRWidget(el: HTMLElement, expr: string, displayMode: boolean, view: EditorView): void {
+  void ensureEditorKaTeX()
+    .then((katex) => {
+      if (!katex || !el.isConnected) return;
+      try {
+        katex.render(expr, el, { displayMode, throwOnError: false });
+        view.requestMeasure();
+      } catch {
+        /* keep raw formula text */
+      }
+    })
+    .catch(() => {});
+}
+
+class MediaIRWidget extends BaseIRWidget {
   constructor(
+    readonly kind: "audio" | "video",
     readonly src: string,
     readonly pos: number,
     readonly endPos: number
   ) {
     super();
   }
-  eq(other: VideoIRWidget): boolean {
-    return this.src === other.src && this.pos === other.pos && this.endPos === other.endPos;
+  eq(other: MediaIRWidget): boolean {
+    return this.kind === other.kind && this.src === other.src && this.pos === other.pos && this.endPos === other.endPos;
   }
   get estimatedHeight(): number {
-    return 220;
+    return this.kind === "video" ? 220 : 52;
   }
   toDOM(view: EditorView): HTMLElement {
-    const wrap = document.createElement("span");
-    wrap.className = "cm-ir-media-wrap cm-ir-media-wrap--video";
-    const el = document.createElement("video");
+    const isVideo = this.kind === "video";
+    const wrap = mkEl("span", `cm-ir-media-wrap cm-ir-media-wrap--${this.kind}`);
+    const el = mkEl(this.kind, `cm-ir-${this.kind}`);
     el.controls = true;
     el.preload = "metadata";
-    el.playsInline = true;
+    if (isVideo) (el as HTMLVideoElement).playsInline = true;
     el.src = this.src;
-    el.className = "cm-ir-video";
-    const editChip = document.createElement("button");
+    const editChip = mkEl("button", "cm-ir-media-edit", "✎");
     editChip.type = "button";
-    editChip.className = "cm-ir-media-edit";
-    editChip.textContent = "✎";
     editChip.title = this.src;
-    wrap.appendChild(el);
-    wrap.appendChild(editChip);
+    wrap.append(el, editChip);
     wrap.addEventListener("mousedown", (e) => {
       if (e.button !== 0) return;
-      const target = e.target as HTMLElement | null;
-      if (target === el && !e.altKey && !e.metaKey && !e.ctrlKey) {
+      if (e.target === el && !e.altKey && !e.metaKey && !e.ctrlKey) {
+        if (!isVideo) return;
         const rect = el.getBoundingClientRect();
-        if (rect.height > 60 && e.clientY >= rect.bottom - 44) {
-          return;
-        }
+        if (rect.height > 60 && e.clientY >= rect.bottom - 44) return;
       }
       e.preventDefault();
-      pendingIRClickClientY = e.clientY;
-      const safePos = Math.min(this.endPos, view.state.doc.length);
-      view.dispatch({
-        selection: { anchor: safePos },
-        effects: irFocusEffect.of(true),
-        userEvent: "select.pointer",
-      });
-      view.focus();
+      focusIRWidgetPos(view, this.endPos, e.clientY);
     });
     return wrap;
   }
-  ignoreEvent(): boolean {
-    return true;
-  }
 }
 
-class TocIRWidget extends WidgetType {
+class TocIRWidget extends BaseIRWidget {
   constructor(
     readonly pos: number,
     readonly endPos: number
@@ -5070,36 +4501,15 @@ class TocIRWidget extends WidgetType {
     return 44;
   }
   toDOM(view: EditorView): HTMLElement {
-    const wrap = document.createElement("span");
-    wrap.className = "cm-ir-toc-widget";
-    const badge = document.createElement("span");
-    badge.className = "cm-ir-toc-widget__badge";
-    badge.textContent = "TOC";
-    const title = document.createElement("span");
-    title.className = "cm-ir-toc-widget__title";
-    title.textContent = t("ed.insert_toc");
-    wrap.appendChild(badge);
-    wrap.appendChild(title);
-    wrap.addEventListener("mousedown", (e) => {
-      if (e.button !== 0) return;
-      e.preventDefault();
-      pendingIRClickClientY = e.clientY;
-      const safePos = Math.min(this.endPos, view.state.doc.length);
-      view.dispatch({
-        selection: { anchor: safePos },
-        effects: irFocusEffect.of(true),
-        userEvent: "select.pointer",
-      });
-      view.focus();
-    });
+    const wrap = mkEl("span", "cm-ir-toc-widget");
+    wrap.appendChild(mkEl("span", "cm-ir-toc-widget__badge", "TOC"));
+    wrap.appendChild(mkEl("span", "cm-ir-toc-widget__title", t("ed.insert_toc")));
+    bindIRFocusMouseDown(wrap, view, this.endPos);
     return wrap;
-  }
-  ignoreEvent(): boolean {
-    return true;
   }
 }
 
-class EmbedVideoIRWidget extends WidgetType {
+class EmbedVideoIRWidget extends BaseIRWidget {
   constructor(
     readonly info: StandaloneEmbedInfo,
     readonly pos: number,
@@ -5120,43 +4530,33 @@ class EmbedVideoIRWidget extends WidgetType {
     return 48;
   }
   toDOM(view: EditorView): HTMLElement {
-    const wrap = document.createElement("span");
-    wrap.className = `cm-ir-embed-widget cm-ir-embed-widget--${this.info.provider.toLowerCase()}`;
-    const badge = document.createElement("span");
-    badge.className = "cm-ir-embed-widget__badge";
-    badge.textContent = `▶ ${this.info.provider}`;
-    const title = document.createElement("span");
-    title.className = "cm-ir-embed-widget__title";
-    title.textContent =
+    const wrap = mkEl("span", `cm-ir-embed-widget cm-ir-embed-widget--${this.info.provider.toLowerCase()}`);
+    const badge = mkEl("span", "cm-ir-embed-widget__badge", `▶ ${this.info.provider}`);
+    const title = mkEl(
+      "span",
+      "cm-ir-embed-widget__title",
       this.info.label && this.info.label !== this.info.url && this.info.label !== this.info.videoId
         ? `${this.info.label} · ${this.info.videoId}`
-        : this.info.videoId;
-    wrap.appendChild(badge);
-    wrap.appendChild(title);
+        : this.info.videoId
+    );
+    wrap.append(badge, title);
     wrap.addEventListener("mousedown", (e) => {
       if (e.button !== 0) return;
       e.preventDefault();
       if (e.metaKey || e.ctrlKey) {
-        window.open(this.info.url, "_blank", "noopener,noreferrer");
+        const safeUrl = safeHref(this.info.url, { allowRelative: false });
+        if (safeUrl) {
+          window.open(safeUrl, "_blank", "noopener,noreferrer");
+        }
         return;
       }
-      pendingIRClickClientY = e.clientY;
-      const safePos = Math.min(this.endPos, view.state.doc.length);
-      view.dispatch({
-        selection: { anchor: safePos },
-        effects: irFocusEffect.of(true),
-        userEvent: "select.pointer",
-      });
-      view.focus();
+      focusIRWidgetPos(view, this.endPos, e.clientY);
     });
     return wrap;
   }
-  ignoreEvent(): boolean {
-    return true;
-  }
 }
 
-class TaskCheckboxIRWidget extends WidgetType {
+class TaskCheckboxIRWidget extends BaseIRWidget {
   constructor(
     readonly checked: boolean,
     readonly from: number,
@@ -5168,10 +4568,9 @@ class TaskCheckboxIRWidget extends WidgetType {
     return this.checked === other.checked && this.from === other.from && this.to === other.to;
   }
   toDOM(view: EditorView): HTMLElement {
-    const cb = document.createElement("input");
+    const cb = mkEl("input", "cm-ir-task-cb");
     cb.type = "checkbox";
     cb.checked = this.checked;
-    cb.className = "cm-ir-task-cb";
     cb.setAttribute("aria-label", "Toggle task");
     cb.addEventListener("mousedown", (e) => {
       if (e.button !== 0) return;
@@ -5186,12 +4585,9 @@ class TaskCheckboxIRWidget extends WidgetType {
     });
     return cb;
   }
-  ignoreEvent(): boolean {
-    return true;
-  }
 }
 
-class MermaidIRWidget extends WidgetType {
+class MermaidIRWidget extends BaseIRWidget {
   constructor(
     readonly code: string,
     readonly startPos: number
@@ -5202,29 +4598,14 @@ class MermaidIRWidget extends WidgetType {
     return this.code === other.code && this.startPos === other.startPos;
   }
   toDOM(view: EditorView): HTMLElement {
-    const wrap = document.createElement("div");
-    wrap.className = "cm-ir-mermaid";
+    const wrap = mkEl("div", "cm-ir-mermaid");
     renderMermaidSvg(this.code, wrap, () => view.requestMeasure());
-    wrap.addEventListener("mousedown", (e) => {
-      if (e.button !== 0) return;
-      e.preventDefault();
-      pendingIRClickClientY = e.clientY;
-      const safePos = Math.min(this.startPos, view.state.doc.length);
-      view.dispatch({
-        selection: { anchor: safePos },
-        effects: irFocusEffect.of(true),
-        userEvent: "select.pointer",
-      });
-      view.focus();
-    });
+    bindIRFocusMouseDown(wrap, view, this.startPos);
     return wrap;
-  }
-  ignoreEvent(): boolean {
-    return true;
   }
 }
 
-class MathBlockIRWidget extends WidgetType {
+class MathBlockIRWidget extends BaseIRWidget {
   constructor(
     readonly expr: string,
     readonly startPos: number
@@ -5235,40 +4616,14 @@ class MathBlockIRWidget extends WidgetType {
     return this.expr === other.expr && this.startPos === other.startPos;
   }
   toDOM(view: EditorView): HTMLElement {
-    const wrap = document.createElement("div");
-    wrap.className = "cm-ir-math-block";
-    wrap.textContent = this.expr;
-    void ensureEditorKaTeX()
-      .then((katex) => {
-        if (!katex || !wrap.isConnected) return;
-        try {
-          katex.render(this.expr, wrap, { displayMode: true, throwOnError: false });
-          view.requestMeasure();
-        } catch {
-          /* keep raw formula text */
-        }
-      })
-      .catch(() => {});
-    wrap.addEventListener("mousedown", (e) => {
-      if (e.button !== 0) return;
-      e.preventDefault();
-      pendingIRClickClientY = e.clientY;
-      const safePos = Math.min(this.startPos, view.state.doc.length);
-      view.dispatch({
-        selection: { anchor: safePos },
-        effects: irFocusEffect.of(true),
-        userEvent: "select.pointer",
-      });
-      view.focus();
-    });
+    const wrap = mkEl("div", "cm-ir-math-block", this.expr);
+    renderKatexIRWidget(wrap, this.expr, true, view);
+    bindIRFocusMouseDown(wrap, view, this.startPos);
     return wrap;
-  }
-  ignoreEvent(): boolean {
-    return true;
   }
 }
 
-class MathInlineIRWidget extends WidgetType {
+class MathInlineIRWidget extends BaseIRWidget {
   constructor(
     readonly expr: string,
     readonly startPos: number,
@@ -5280,36 +4635,10 @@ class MathInlineIRWidget extends WidgetType {
     return this.expr === other.expr && this.startPos === other.startPos && this.endPos === other.endPos;
   }
   toDOM(view: EditorView): HTMLElement {
-    const span = document.createElement("span");
-    span.className = "cm-ir-math-inline";
-    span.textContent = this.expr;
-    void ensureEditorKaTeX()
-      .then((katex) => {
-        if (!katex || !span.isConnected) return;
-        try {
-          katex.render(this.expr, span, { displayMode: false, throwOnError: false });
-          view.requestMeasure();
-        } catch {
-          /* keep raw formula text */
-        }
-      })
-      .catch(() => {});
-    span.addEventListener("mousedown", (e) => {
-      if (e.button !== 0) return;
-      e.preventDefault();
-      pendingIRClickClientY = e.clientY;
-      const safePos = Math.min(this.endPos, view.state.doc.length);
-      view.dispatch({
-        selection: { anchor: safePos },
-        effects: irFocusEffect.of(true),
-        userEvent: "select.pointer",
-      });
-      view.focus();
-    });
+    const span = mkEl("span", "cm-ir-math-inline", this.expr);
+    renderKatexIRWidget(span, this.expr, false, view);
+    bindIRFocusMouseDown(span, view, this.endPos);
     return span;
-  }
-  ignoreEvent(): boolean {
-    return true;
   }
 }
 
@@ -5348,17 +4677,16 @@ function isNonEditableWysiwygBlock(el: Element): boolean {
 }
 
 function createWysiwygPad(): HTMLParagraphElement {
-  const p = document.createElement("p");
+  const p = mkEl("p");
   p.setAttribute("data-volo-pad", "1");
-  p.appendChild(document.createElement("br"));
+  p.appendChild(mkEl("br"));
   return p;
 }
 
 function createWysiwygMediaBlock(mediaEl: HTMLAudioElement | HTMLVideoElement, delLabel: string): HTMLDivElement {
   const isVideo = mediaEl.tagName.toLowerCase() === "video";
   const src = (mediaEl.getAttribute("src") || mediaEl.querySelector("source")?.getAttribute("src") || "").trim();
-  const wrap = document.createElement("div");
-  wrap.className = "volo-wysiwyg-audio-block";
+  const wrap = mkEl("div", "volo-wysiwyg-audio-block");
   wrap.contentEditable = "false";
   if (src) {
     wrap.setAttribute(isVideo ? "data-video-src" : "data-audio-src", src);
@@ -5369,12 +4697,10 @@ function createWysiwygMediaBlock(mediaEl: HTMLAudioElement | HTMLVideoElement, d
   if (!clone.getAttribute("preload")) clone.preload = "metadata";
   wrap.appendChild(clone);
 
-  const delBtn = document.createElement("button");
+  const delBtn = mkEl("button", "volo-wysiwyg-audio-del", "×");
   delBtn.type = "button";
-  delBtn.className = "volo-wysiwyg-audio-del";
   delBtn.title = delLabel;
   delBtn.setAttribute("aria-label", delLabel);
-  delBtn.textContent = "×";
   wrap.appendChild(delBtn);
 
   return wrap;
@@ -5434,8 +4760,8 @@ function normalizeWysiwygDOM(root: HTMLElement, delLabel: string): void {
   // 4. Ensure at least one editable paragraph when document is empty or has only pads
   const hasNonEditable = Array.from(root.children).some(isNonEditableWysiwygBlock);
   if (root.children.length === 0) {
-    const p = document.createElement("p");
-    p.appendChild(document.createElement("br"));
+    const p = mkEl("p");
+    p.appendChild(mkEl("br"));
     root.appendChild(p);
     return;
   }
@@ -5464,7 +4790,7 @@ function placeCaretInBlock(block: HTMLElement, atStart: boolean): void {
   if (!sel) return;
   const range = document.createRange();
   if (isEmptyWysiwygBlock(block)) {
-    if (!block.firstChild) block.appendChild(document.createElement("br"));
+    if (!block.firstChild) block.appendChild(mkEl("br"));
     range.setStart(block, 0);
     range.collapse(true);
   } else {
@@ -5492,10 +4818,10 @@ function isCaretAtBlockEnd(block: HTMLElement, range: Range): boolean {
 }
 
 function wrapInlineMarker(raw: string, marker: string): string {
-  if (!raw || !raw.trim()) return raw;
-  const m = /^(\s*)([\s\S]*?)(\s*)$/.exec(raw);
-  if (!m) return `${marker}${raw}${marker}`;
-  return `${m[1]}${marker}${m[2]}${marker}${m[3]}`;
+  const trimmed = raw.trim();
+  if (!trimmed) return raw;
+  const start = raw.indexOf(trimmed);
+  return `${raw.slice(0, start)}${marker}${trimmed}${marker}${raw.slice(start + trimmed.length)}`;
 }
 
 function escapeTableCellPipes(s: string): string {
@@ -5630,7 +4956,7 @@ function isHighlightBackgroundColor(raw: string): boolean {
   return false;
 }
 
-function decodeUtf8Base64(b64: string): string {
+function decodeUtf8Base64(b64: string): string | null {
   try {
     const bin = atob(b64.replace(/\s+/g, ""));
     const bytes = new Uint8Array(bin.length);
@@ -5639,8 +4965,29 @@ function decodeUtf8Base64(b64: string): string {
     }
     return new TextDecoder().decode(bytes);
   } catch {
-    return "";
+    return null;
   }
+}
+
+function escapeClipboardHtml(s: string): string {
+  return s
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function nodeNbspText(n: Node | null | undefined): string {
+  return (n?.textContent || "").replace(/\u00a0/g, " ");
+}
+
+function serializeFencedCodeHost(host: Element, lang: string): string {
+  const srcNode = host.cloneNode(true) as HTMLElement;
+  srcNode.querySelectorAll(".ln, .lnt, .volo-code-head, button, select").forEach((n) => n.remove());
+  const raw = nodeNbspText(srcNode).replace(/\n$/, "");
+  const fence = computeFenceDelim(raw);
+  return `\n${fence}${lang}\n${raw}\n${fence}\n\n`;
 }
 
 function serializeNodesToMarkdown(nodes: Node[], listDepth: number): string {
@@ -5652,7 +4999,11 @@ function serializeNodesToMarkdown(nodes: Node[], listDepth: number): string {
       // Goldmark WithHardWraps() emits `<br>\n`; strip single leading newline on adjacent text node
       const next = nodes[i + 1];
       if (next && next.nodeType === Node.TEXT_NODE) {
-        out += (next.textContent || "").replace(/^\r?\n/, "").replace(/\u00a0/g, " ");
+        const raw = nodeNbspText(next).replace(/^\r?\n/, "");
+        const inRaw = !!next.parentElement?.closest(
+          "pre, code, kbd, .mermaid, .volo-math-inline, .volo-math-block, .katex, math, [data-math-src], [data-volo-md-b64], [data-raw-md]"
+        );
+        out += inRaw ? raw : escapeMarkdownProseText(raw, true);
         i++;
       }
       continue;
@@ -5697,8 +5048,7 @@ function serializeListItemChildren(
 
   const flushInline = () => {
     if (inlineBuf.length === 0) return;
-    const txt = serializeNodesToMarkdown(inlineBuf, 0)
-      .replace(/[ \t]+\n/g, "\n")
+    const txt = stripHorizWsBeforeNewline(serializeNodesToMarkdown(inlineBuf, 0))
       .replace(/\n{2,}/g, "\n")
       .trim();
     inlineBuf = [];
@@ -5706,25 +5056,28 @@ function serializeListItemChildren(
   };
 
   for (const child of Array.from(li.childNodes)) {
-    if (child instanceof HTMLElement) {
-      const cTag = child.tagName.toLowerCase();
+    if (child.nodeType === 1) {
+      const cTag = (child as Element).tagName.toLowerCase();
       if (cTag === "input" && (child as HTMLInputElement).type === "checkbox") continue;
       if (LI_BLOCK_CHILD_TAGS.has(cTag)) {
         flushInline();
         if (cTag === "ul" || cTag === "ol") {
-          const sub = serializeNodeToMarkdown(child, 0).replace(/^\n+|\n+$/g, "");
+          const sub = trimEndChars(serializeNodeToMarkdown(child, 0), "\n", true);
           if (sub) chunks.push({ kind: "list", text: sub });
           continue;
         }
-        if (cTag === "p" && pCb && child.contains(pCb)) {
+        if (cTag === "p" && pCb && (child as Element).contains?.(pCb)) {
           const cloneP = child.cloneNode(true) as HTMLElement;
           cloneP.querySelector('input[type="checkbox"]')?.remove();
           const pTxt = serializeChildrenToMarkdown(cloneP, 0).trim();
           if (pTxt) chunks.push({ kind: "inline", text: pTxt });
           continue;
         }
-        const blk = serializeNodeToMarkdown(child, 0).replace(/^\n+|\n+$/g, "");
-        if (blk) chunks.push({ kind: cTag === "p" ? "inline" : "block", text: blk });
+        const isInlineDiv =
+          cTag === "div" &&
+          !(child as Element).querySelector("p,div,section,article,aside,pre,figure,blockquote,ul,ol,table,details,dl,h1,h2,h3,h4,h5,h6,hr");
+        const blk = trimEndChars(serializeNodeToMarkdown(child, 0), "\n", true);
+        if (blk) chunks.push({ kind: cTag === "p" || isInlineDiv ? "inline" : "block", text: blk });
         continue;
       }
     }
@@ -5738,7 +5091,23 @@ let activeWysiwygSourceMD = "";
 
 function serializeNodeToMarkdown(node: Node, listDepth = 0): string {
   if (node.nodeType === Node.TEXT_NODE) {
-    return (node.textContent || "").replace(/\u00a0/g, " ");
+    const raw = nodeNbspText(node);
+    const pEl = node.parentElement;
+    if (
+      pEl?.closest(
+        "pre, code, kbd, .mermaid, .volo-math-inline, .volo-math-block, .katex, math, [data-math-src], [data-volo-md-b64], [data-raw-md]"
+      )
+    ) {
+      return raw;
+    }
+    const prev = node.previousSibling;
+    const isBlockParent =
+      !!pEl && /^(?:p|div|li|blockquote|td|th|h[1-6]|section|article|aside|figcaption|summary|dd|dt)$/i.test(pEl.tagName);
+    const atLineStart =
+      (prev === null && isBlockParent) ||
+      (prev?.nodeType === 1 && (prev as Element).tagName.toLowerCase() === "br") ||
+      (prev?.nodeType === 3 && /\n$/.test(prev.textContent || ""));
+    return escapeMarkdownProseText(raw, atLineStart);
   }
   if (node.nodeType !== Node.ELEMENT_NODE) return "";
   const el = node as HTMLElement;
@@ -5752,7 +5121,7 @@ function serializeNodeToMarkdown(node: Node, listDepth = 0): string {
   // FIRST check: Lossless protected directive blocks (:::lock, :::book, :::bookshelf, :::plugin, [toc])
   const mdB64 = el.getAttribute("data-volo-md-b64");
   if (mdB64) {
-    const decoded = decodeUtf8Base64(mdB64).trim();
+    const decoded = (decodeUtf8Base64(mdB64) || "").trim();
     if (decoded) return `\n\n${decoded}\n\n`;
   }
 
@@ -5814,34 +5183,21 @@ function serializeNodeToMarkdown(node: Node, listDepth = 0): string {
     if (tex) return `$${tex}$`;
   }
 
-  const escHtmlAttr = (val: string): string =>
-    val
-      .replace(/&/g, "&amp;")
-      .replace(/</g, "&lt;")
-      .replace(/>/g, "&gt;")
-      .replace(/"/g, "&quot;")
-      .replace(/'/g, "&#39;");
+  const serializeMediaEl = (kind: "audio" | "video", rawSrc: string): string => {
+    const safe = safeMediaSrc(rawSrc);
+    return safe ? `\n<${kind} controls preload="metadata" src="${escapeClipboardHtml(safe)}"></${kind}>\n\n` : "";
+  };
 
   // Wrapped WYSIWYG audio/video card
   if (el.classList.contains("volo-wysiwyg-audio-block")) {
-    const vSrc = (
-      el.getAttribute("data-video-src") ||
-      el.querySelector("video")?.getAttribute("src") ||
-      el.querySelector("video source")?.getAttribute("src") ||
-      ""
-    ).trim();
-    if (vSrc && !/^(?:javascript|vbscript|data):/i.test(vSrc)) {
-      return `\n<video controls preload="metadata" src="${escHtmlAttr(vSrc)}"></video>\n\n`;
-    }
-    const aSrc = (
-      el.getAttribute("data-audio-src") ||
-      el.querySelector("audio")?.getAttribute("src") ||
-      el.querySelector("audio source")?.getAttribute("src") ||
-      ""
-    ).trim();
-    return aSrc && !/^(?:javascript|vbscript|data):/i.test(aSrc)
-      ? `\n<audio controls preload="metadata" src="${escHtmlAttr(aSrc)}"></audio>\n\n`
-      : "";
+    const readMedia = (kind: "audio" | "video") =>
+      (
+        el.getAttribute(`data-${kind}-src`) ||
+        el.querySelector(kind)?.getAttribute("src") ||
+        el.querySelector(`${kind} source`)?.getAttribute("src") ||
+        ""
+      ).trim();
+    return serializeMediaEl("video", readMedia("video")) || serializeMediaEl("audio", readMedia("audio"));
   }
 
   // Preserve custom directive blocks if present
@@ -5856,7 +5212,7 @@ function serializeNodeToMarkdown(node: Node, listDepth = 0): string {
     const bodyNodes = bodyEl
       ? Array.from(bodyEl.childNodes)
       : Array.from(el.childNodes).filter(
-          (n) => !(n instanceof HTMLElement && n.classList.contains("volo-callout__title"))
+          (n) => !(n.nodeType === 1 && (n as Element).classList.contains("volo-callout__title"))
         );
     const bodyMd = serializeNodesToMarkdown(bodyNodes, 0).trim().replace(/\n{3,}/g, "\n\n");
     if (!bodyMd) return `\n> [!${kind}]\n\n`;
@@ -5870,7 +5226,8 @@ function serializeNodeToMarkdown(node: Node, listDepth = 0): string {
   // Mermaid diagram blocks (<pre class="mermaid"> or <div class="mermaid">)
   if (el.classList.contains("mermaid") && (tag === "pre" || tag === "div")) {
     const raw = (el.getAttribute("data-mermaid-src") || el.textContent || "").replace(/\n$/, "");
-    return `\n\`\`\`mermaid\n${raw}\n\`\`\`\n\n`;
+    const fence = computeFenceDelim(raw);
+    return `\n${fence}mermaid\n${raw}\n${fence}\n\n`;
   }
 
   // Unwrap .volo-table-scroll wrapper directly to its inner <table>
@@ -5881,19 +5238,11 @@ function serializeNodeToMarkdown(node: Node, listDepth = 0): string {
 
   const inner = () => serializeChildrenToMarkdown(el, listDepth);
 
+  if (/^h([1-6])$/.test(tag)) {
+    return `\n${"#".repeat(Number(tag[1]))} ${collapseNewlines(inner(), " ").trim()}\n\n`;
+  }
+
   switch (tag) {
-    case "h1":
-      return `\n# ${inner().replace(/\s*\n+\s*/g, " ").trim()}\n\n`;
-    case "h2":
-      return `\n## ${inner().replace(/\s*\n+\s*/g, " ").trim()}\n\n`;
-    case "h3":
-      return `\n### ${inner().replace(/\s*\n+\s*/g, " ").trim()}\n\n`;
-    case "h4":
-      return `\n#### ${inner().replace(/\s*\n+\s*/g, " ").trim()}\n\n`;
-    case "h5":
-      return `\n##### ${inner().replace(/\s*\n+\s*/g, " ").trim()}\n\n`;
-    case "h6":
-      return `\n###### ${inner().replace(/\s*\n+\s*/g, " ").trim()}\n\n`;
     case "center":
     case "p":
     case "div":
@@ -5929,7 +5278,7 @@ function serializeNodeToMarkdown(node: Node, listDepth = 0): string {
     case "mark":
       return wrapInlineMarker(inner(), "==");
     case "kbd":
-      return `<kbd>${inner()}</kbd>`;
+      return `<kbd>${escapeClipboardHtml(nodeNbspText(el))}</kbd>`;
     case "sup": {
       if (el.id.startsWith("fnref") || el.classList.contains("footnote-ref")) {
         const fnA = el.querySelector('a[href^="#fn"]');
@@ -5980,7 +5329,7 @@ function serializeNodeToMarkdown(node: Node, listDepth = 0): string {
       for (const child of Array.from(el.children)) {
         const cTag = child.tagName.toLowerCase();
         if (cTag === "dt") {
-          const dtTxt = serializeChildrenToMarkdown(child, 0).replace(/\s*\n+\s*/g, " ").trim();
+          const dtTxt = collapseNewlines(serializeChildrenToMarkdown(child, 0), " ").trim();
           if (dtTxt) parts.push(dtTxt);
         } else if (cTag === "dd") {
           const ddTxt = serializeChildrenToMarkdown(child, 0).trim();
@@ -5993,7 +5342,7 @@ function serializeNodeToMarkdown(node: Node, listDepth = 0): string {
       return parts.length > 0 ? `\n${parts.join("\n")}\n\n` : "";
     }
     case "dt":
-      return `${inner().replace(/\s*\n+\s*/g, " ").trim()}\n`;
+      return `${collapseNewlines(inner(), " ").trim()}\n`;
     case "dd":
       return `: ${inner().trim()}\n`;
     case "figure": {
@@ -6009,10 +5358,8 @@ function serializeNodeToMarkdown(node: Node, listDepth = 0): string {
           codeEl?.getAttribute("data-lang") ||
           (langMatch ? langMatch[1] : "") ||
           (explicitSpan?.textContent || "").trim().toLowerCase();
-        const srcNode = (codeEl || preEl || el).cloneNode(true) as HTMLElement;
-        srcNode.querySelectorAll(".ln, .lnt, .volo-code-head, button, select").forEach((n) => n.remove());
-        const raw = (srcNode.textContent || "").replace(/\u00a0/g, " ");
-        return `\n\`\`\`${lang}\n${raw.replace(/\n$/, "")}\n\`\`\`\n\n`;
+        const srcNode = codeEl || preEl || el;
+        return serializeFencedCodeHost(srcNode, lang);
       }
       return inner();
     }
@@ -6020,9 +5367,9 @@ function serializeNodeToMarkdown(node: Node, listDepth = 0): string {
       if (el.parentElement?.tagName.toLowerCase() === "pre") {
         const clone = el.cloneNode(true) as HTMLElement;
         clone.querySelectorAll(".ln, .lnt").forEach((n) => n.remove());
-        return (clone.textContent || "").replace(/\u00a0/g, " ");
+        return nodeNbspText(clone);
       }
-      const codeTxt = (el.textContent || "").replace(/\u00a0/g, " ").replace(/\r?\n/g, " ");
+      const codeTxt = nodeNbspText(el).replace(/\r?\n/g, " ");
       if (!codeTxt) return "";
       let maxTicks = 0;
       for (const m of codeTxt.matchAll(/`+/g)) {
@@ -6048,10 +5395,7 @@ function serializeNodeToMarkdown(node: Node, listDepth = 0): string {
         el.closest("figure[data-lang]")?.getAttribute("data-lang") ||
         "";
       const lang = attrLang || (langMatch ? langMatch[1] : /\bmermaid\b/i.test(cls) ? "mermaid" : "");
-      const srcNode = (codeEl || el).cloneNode(true) as HTMLElement;
-      srcNode.querySelectorAll(".ln, .lnt, .volo-code-head, button, select").forEach((n) => n.remove());
-      const raw = (srcNode.textContent || "").replace(/\u00a0/g, " ");
-      return `\n\`\`\`${lang}\n${raw.replace(/\n$/, "")}\n\`\`\`\n\n`;
+      return serializeFencedCodeHost(codeEl || el, lang);
     }
     case "blockquote": {
       const bqBody = inner().trim().replace(/\n{3,}/g, "\n\n");
@@ -6116,10 +5460,10 @@ function serializeNodeToMarkdown(node: Node, listDepth = 0): string {
         return "";
       }
       const rawHref = el.getAttribute("href") || "";
-      const href = cleanClipboardUrl(rawHref);
+      const href = cleanClipboardUrl(rawHref, "href");
       const explicitWiki = (el.getAttribute("data-wiki-link") || el.getAttribute("data-wiki-slug") || "").trim();
       if (explicitWiki) {
-        const label = inner().replace(/\s*\n+\s*/g, " ").trim();
+        const label = collapseNewlines(inner(), " ").trim();
         return label && label !== explicitWiki ? `[[${explicitWiki}|${label}]]` : `[[${explicitWiki}]]`;
       }
       const postSlugM = /^\/posts\/([a-zA-Z0-9._%-]+)$/.exec(href);
@@ -6130,7 +5474,7 @@ function serializeNodeToMarkdown(node: Node, listDepth = 0): string {
             /^[a-zA-Z0-9._-]+$/.test(slug) &&
             (activeWysiwygSourceMD.includes(`[[${slug}]]`) || activeWysiwygSourceMD.includes(`[[${slug}|`))
           ) {
-            const label = inner().replace(/\s*\n+\s*/g, " ").trim();
+            const label = collapseNewlines(inner(), " ").trim();
             return label && label !== slug ? `[[${slug}|${label}]]` : `[[${slug}]]`;
           }
         } catch {
@@ -6138,7 +5482,7 @@ function serializeNodeToMarkdown(node: Node, listDepth = 0): string {
         }
       }
       if (!href) {
-        return inner().replace(/\s*\n+\s*/g, " ").trim();
+        return collapseNewlines(inner(), " ").trim();
       }
 
       const aTitle = el.getAttribute("title");
@@ -6149,14 +5493,16 @@ function serializeNodeToMarkdown(node: Node, listDepth = 0): string {
         const imgMds: string[] = [];
         for (const im of Array.from(el.querySelectorAll("img"))) {
           const imSrc = cleanClipboardUrl(
-            im.getAttribute("data-actualsrc") ||
+            im.getAttribute("data-volo-img-src") ||
+              im.getAttribute("data-actualsrc") ||
               im.getAttribute("data-original") ||
               im.getAttribute("data-lazy-src") ||
               im.getAttribute("data-src") ||
               im.getAttribute("src") ||
-              ""
+              "",
+            "src"
           );
-          if (!imSrc || imSrc.startsWith("data:image/svg+xml")) continue;
+          if (!imSrc) continue;
           const alt = escapeMdLinkLabel((im.getAttribute("alt") || "").replace(/[\r\n]+/g, " ").trim());
           imgMds.push(`[![${alt}](${formatMdLinkDest(imSrc, im.getAttribute("title"))})](${dest})`);
         }
@@ -6191,17 +5537,16 @@ function serializeNodeToMarkdown(node: Node, listDepth = 0): string {
         }
       }
 
-      const label = inner().replace(/\s*\n+\s*/g, " ").trim();
+      const label = collapseNewlines(inner(), " ").trim();
       if (!label || label === href) {
         return `[${escapeMdLinkLabel(href)}](${dest})`;
       }
       return `[${escapeMdLinkLabel(label)}](${dest})`;
     }
     case "img": {
-      const rawSrc = el.getAttribute("src") || "";
-      const src = cleanClipboardUrl(rawSrc) || rawSrc.trim();
-      const isSafeDataImg = /^data:image\/(?:png|jpe?g|gif|webp|avif|bmp|x-icon);base64,/i.test(src);
-      if (!src || (!isSafeDataImg && /^(?:javascript|vbscript|data):/i.test(src))) return "";
+      const rawSrc = el.getAttribute("data-volo-img-src") || el.getAttribute("src") || "";
+      const src = cleanClipboardUrl(rawSrc, "src");
+      if (!src) return "";
       const alt = escapeMdLinkLabel((el.getAttribute("alt") || "").replace(/[\r\n]+/g, " ").trim());
       const wAttr = (el.getAttribute("width") || el.style?.width || "").trim();
       const hAttr = (el.getAttribute("height") || el.style?.height || "").trim();
@@ -6209,24 +5554,17 @@ function serializeNodeToMarkdown(node: Node, listDepth = 0): string {
         Boolean(wAttr || hAttr) &&
         (/[%a-z]/i.test(wAttr + hAttr) || (activeWysiwygSourceMD.includes("<img") && activeWysiwygSourceMD.includes(src)));
       if (wasExplicitHtmlImg) {
-        const escSrc = escHtmlAttr(src);
-        const escAlt = escHtmlAttr(alt);
-        const escW = escHtmlAttr(wAttr);
-        const escH = escHtmlAttr(hAttr);
+        const escSrc = escapeClipboardHtml(src);
+        const escAlt = escapeClipboardHtml(alt);
+        const escW = escapeClipboardHtml(wAttr);
+        const escH = escapeClipboardHtml(hAttr);
         return `<img src="${escSrc}"${escAlt ? ` alt="${escAlt}"` : ""}${escW ? ` width="${escW}"` : ""}${escH ? ` height="${escH}"` : ""} />`;
       }
       return `![${alt}](${formatMdLinkDest(src, el.getAttribute("title"))})`;
     }
-    case "audio": {
-      const src = (el.getAttribute("src") || el.querySelector("source")?.getAttribute("src") || "").trim();
-      if (!src || /^(?:javascript|vbscript|data):/i.test(src)) return "";
-      return `\n<audio controls preload="metadata" src="${escHtmlAttr(src)}"></audio>\n\n`;
-    }
-    case "video": {
-      const src = (el.getAttribute("src") || el.querySelector("source")?.getAttribute("src") || "").trim();
-      if (!src || /^(?:javascript|vbscript|data):/i.test(src)) return "";
-      return `\n<video controls preload="metadata" src="${escHtmlAttr(src)}"></video>\n\n`;
-    }
+    case "audio":
+    case "video":
+      return serializeMediaEl(tag, el.getAttribute("src") || el.querySelector("source")?.getAttribute("src") || "");
     case "hr":
       return `\n---\n\n`;
     case "table": {
@@ -6245,10 +5583,7 @@ function serializeNodeToMarkdown(node: Node, listDepth = 0): string {
       const matrix = rows.map((tr) =>
         Array.from(tr.querySelectorAll(":scope > th, :scope > td")).map((cell) =>
           escapeTableCellPipes(
-            serializeChildrenToMarkdown(cell, 0)
-              .trim()
-              .replace(/\s*\n+\s*/g, "<br>")
-              .trim()
+            collapseNewlines(serializeChildrenToMarkdown(cell, 0).trim(), "<br>").trim()
           )
         )
       );
@@ -6274,22 +5609,42 @@ function htmlToMarkdown(root: HTMLElement): string {
     .trim();
 }
 
+function parseBlockquoteLine(line: string): { depth: number; body: string } {
+  let s = line;
+  let depth = 0;
+  while (true) {
+    const m = /^ {0,3}> ?(.*)$/.exec(s);
+    if (!m) break;
+    depth++;
+    s = m[1];
+  }
+  return { depth, body: s };
+}
+
 function isCursorInFencedCode(state: EditorState): boolean {
   const cursorLine = state.doc.lineAt(state.selection.main.from).number;
   let fenceChar = "";
   let fenceLen = 0;
+  let fenceQuoteDepth = 0;
   for (let ln = 1; ln <= cursorLine; ln++) {
-    const text = state.doc.line(ln).text;
+    const { depth, body } = parseBlockquoteLine(state.doc.line(ln).text);
+    if (fenceChar && depth < fenceQuoteDepth) {
+      fenceChar = "";
+      fenceLen = 0;
+      fenceQuoteDepth = 0;
+    }
     if (!fenceChar) {
-      const open = matchFenceOpen(text);
+      const open = matchFenceOpen(body);
       if (open) {
         if (ln === cursorLine) return false;
         fenceChar = open.fenceChar;
         fenceLen = open.fenceLen;
+        fenceQuoteDepth = depth;
       }
-    } else if (matchFenceClose(text, fenceChar, fenceLen)) {
+    } else if (depth === fenceQuoteDepth && matchFenceClose(body, fenceChar, fenceLen)) {
       fenceChar = "";
       fenceLen = 0;
+      fenceQuoteDepth = 0;
     }
   }
   return fenceChar !== "";
@@ -6325,16 +5680,16 @@ function extractPreCodeLines(container: HTMLElement): string {
   // WeChat (.code-snippet_outer / .code-snippet__line), Shiki/Prism (.line), and block-wrapped lines
   const wechatLines = Array.from(clone.querySelectorAll(".code-snippet_outer, .code-snippet__line"));
   if (wechatLines.length > 0 && !(clone.textContent || "").includes("\n")) {
-    return wechatLines.map((el) => (el.textContent || "").replace(/\u00a0/g, " ")).join("\n");
+    return wechatLines.map(nodeNbspText).join("\n");
   }
 
   const lineEls = Array.from(
     clone.querySelectorAll(":scope > .line, :scope > code > .line, :scope > div, :scope > code > div, :scope > p, :scope > code > p")
   );
   if (lineEls.length > 1 && !(clone.textContent || "").includes("\n")) {
-    return lineEls.map((el) => (el.textContent || "").replace(/\u00a0/g, " ")).join("\n");
+    return lineEls.map(nodeNbspText).join("\n");
   }
-  return (clone.textContent || "").replace(/\u00a0/g, " ").replace(/\n$/, "");
+  return nodeNbspText(clone).replace(/\n$/, "");
 }
 
 function isTerminalOrIdeClipboardDOM(doc: Document, body: HTMLElement): boolean {
@@ -6398,27 +5753,16 @@ function encodeVoloClipboardSource(md: string): string {
   }
 }
 
-function decodeVoloClipboardSource(b64: string): string | null {
-  try {
-    const bin = atob(b64.trim());
-    const bytes = new Uint8Array(bin.length);
-    for (let i = 0; i < bin.length; i++) {
-      bytes[i] = bin.charCodeAt(i);
-    }
-    return new TextDecoder("utf-8").decode(bytes);
-  } catch {
-    return null;
-  }
-}
-
-function escapeClipboardHtml(s: string): string {
-  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
-}
-
 function formatClipboardInlineMd(text: string): string {
   let out = escapeClipboardHtml(text);
-  out = out.replace(/!\[([^\]\n]*)\]\(([^)\s]+)\)/g, (_, alt, url) => `<img src="${escapeClipboardHtml(cleanClipboardUrl(url) || url)}" alt="${alt}" />`);
-  out = out.replace(/\[([^\]\n]+)\]\(([^)\s]+)\)/g, (_, label, url) => `<a href="${escapeClipboardHtml(cleanClipboardUrl(url) || url)}">${label}</a>`);
+  out = out.replace(/!\[([^[\]\n]*)\]\(([^()\s]+)\)/g, (m, alt, url) => {
+    const safe = cleanClipboardUrl(url, "src");
+    return safe ? `<img src="${escapeClipboardHtml(safe)}" alt="${alt}" />` : m;
+  });
+  out = out.replace(/\[([^[\]\n]+)\]\(([^()\s]+)\)/g, (_m, label, url) => {
+    const safe = cleanClipboardUrl(url, "href");
+    return safe ? `<a href="${escapeClipboardHtml(safe)}">${label}</a>` : label;
+  });
   out = out.replace(/`([^`\n]+)`/g, "<code>$1</code>");
   out = out.replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>");
   out = out.replace(/==([^=\n]+)==/g, "<mark>$1</mark>");
@@ -6434,8 +5778,8 @@ function markdownSelectionToClipboardHTML(md: string): string {
   let i = 0;
   while (i < lines.length) {
     const line = lines[i];
-    const fenceM = /^(`{3,}|~{3,})(.*)$/.exec(line);
-    if (fenceM) {
+    const fenceM = /^(`{3,}|~{3,})([^\n\r\u2028\u2029]*)/.exec(line);
+    if (fenceM && fenceM[0].length === line.length) {
       const ch = fenceM[1][0];
       const fLen = fenceM[1].length;
       const lang = fenceM[2].trim().split(/\s+/)[0] || "";
@@ -6443,7 +5787,7 @@ function markdownSelectionToClipboardHTML(md: string): string {
       i++;
       while (i < lines.length) {
         const cl = lines[i];
-        if (new RegExp(`^${ch === "`" ? "`" : "~"}{${fLen},}\\s*$`).test(cl)) {
+        if (new RegExp(`^${ch}{${fLen},}\\s*$`).test(cl)) {
           i++;
           break;
         }
@@ -6454,7 +5798,7 @@ function markdownSelectionToClipboardHTML(md: string): string {
       blocks.push(`<pre><code${cls}>${escapeClipboardHtml(codeLines.join("\n"))}</code></pre>`);
       continue;
     }
-    const hm = /^(#{1,6})\s+(.+)$/.exec(line);
+    const hm = /^(#{1,6})[ \t]+(\S[^\n\r\u2028\u2029]*)$/.exec(line);
     if (hm) {
       const lvl = hm[1].length;
       blocks.push(`<h${lvl}>${formatClipboardInlineMd(hm[2])}</h${lvl}>`);
@@ -6579,12 +5923,12 @@ function shouldHandlePasteAsBinaryMedia(dt: DataTransfer, files: File[], rawPlai
   }
   if (!rawHTML.trim()) return true;
   try {
-    const d = new DOMParser().parseFromString(rawHTML, "text/html");
-    const imgs = Array.from(d.body?.querySelectorAll("img") || []);
+    const d = parseClipboardHtml(rawHTML);
+    const imgs = d.body.querySelectorAll("img");
     const onlyLocalImgs =
       imgs.length > 0 &&
       imgs.every((im) => /^(?:file:|webkit-fake-url:)/i.test((im.getAttribute("src") || "").trim()));
-    const textLeft = (d.body?.textContent || "").trim();
+    const textLeft = (d.body.textContent || "").trim();
     return onlyLocalImgs || !textLeft;
   } catch {
     return false;
@@ -6610,7 +5954,7 @@ function extractWysiwygSelectionClipboard(
   const startPre = startEl?.closest("pre");
   const endPre = endEl?.closest("pre");
   if (startPre && startPre === endPre) {
-    const wrap = document.createElement("div");
+    const wrap = mkEl("div");
     wrap.appendChild(range.cloneContents());
     if (!wrap.querySelector(".volo-code-head")) {
       const codeText = extractPreCodeLines(wrap);
@@ -6623,23 +5967,21 @@ function extractWysiwygSelectionClipboard(
     }
   }
 
-  const wrap = document.createElement("div");
+  const wrap = mkEl("div");
   wrap.appendChild(range.cloneContents());
   wrap
     .querySelectorAll(".ln, .lnt, .volo-code-head, .volo-ed-code-copy, button, select, .volo-ed-empty-hint")
     .forEach((n) => n.remove());
   wrap.querySelectorAll("pre").forEach((pre) => {
     const codeText = extractPreCodeLines(pre as HTMLElement);
-    const replacement = document.createElement("pre");
-    const code = document.createElement("code");
+    const replacement = mkEl("pre");
     const lang = pre.closest("[data-lang]")?.getAttribute("data-lang") || "";
-    if (lang) code.className = `language-${lang}`;
-    code.textContent = codeText;
+    const code = mkEl("code", lang ? `language-${lang}` : undefined, codeText);
     replacement.appendChild(code);
     pre.replaceWith(replacement);
   });
   const md = htmlToMarkdown(wrap).trim();
-  const plain = md || (wrap.textContent || "").replace(/\u00a0/g, " ");
+  const plain = md || nodeNbspText(wrap);
   if (!plain) return null;
   const b64 = encodeVoloClipboardSource(plain);
   const attr = b64 ? ` data-volo-source-md="${escapeClipboardHtml(b64)}"` : "";
@@ -6664,11 +6006,12 @@ function unwrapSearchHighlightEm(body: HTMLElement, doc: Document): void {
     let tightCjkSearch = false;
     const prev = em.previousSibling;
     const next = em.nextSibling;
-    const prevTxt = prev?.nodeType === Node.TEXT_NODE ? prev.textContent || "" : "";
-    const nextTxt = next?.nodeType === Node.TEXT_NODE ? next.textContent || "" : "";
+    const prevTxt = prev?.nodeType === 3 ? prev.textContent || "" : "";
+    const nextTxt = next?.nodeType === 3 ? next.textContent || "" : "";
     const emTxt = (em.textContent || "").trim();
     const touchesAnotherEm =
-      (prev instanceof Element && prev.tagName === "EM") || (next instanceof Element && next.tagName === "EM");
+      (prev?.nodeType === 1 && (prev as Element).tagName === "EM") ||
+      (next?.nodeType === 1 && (next as Element).tagName === "EM");
     if (touchesAnotherEm) {
       tightCjkSearch = true;
     } else if (emTxt && /[\u3400-\u9fff]/.test(emTxt)) {
@@ -6693,8 +6036,9 @@ function clipboardHtmlToMarkdown(
   const trimmed = rawHTML.trim();
   if (!trimmed) return null;
 
-  const doc = new DOMParser().parseFromString(trimmed, "text/html");
-  const body = doc.body;
+  const vDoc = parseClipboardHtml(trimmed);
+  const doc = vDoc as unknown as Document;
+  const body = vDoc.body as unknown as HTMLElement;
   if (!body) return null;
 
   // 0a. Exact lossless round-trip when pasting selection copied inside Volo Studio
@@ -6703,7 +6047,7 @@ function clipboardHtmlToMarkdown(
     const check = body.cloneNode(true) as HTMLElement;
     check.querySelectorAll("[data-volo-source-md]").forEach((n) => n.remove());
     if (!(check.textContent || "").trim()) {
-      const restored = decodeVoloClipboardSource(voloCarrier.getAttribute("data-volo-source-md") || "");
+      const restored = decodeUtf8Base64(voloCarrier.getAttribute("data-volo-source-md") || "");
       if (restored !== null) {
         return { markdown: restored, pendingUploads: [] };
       }
@@ -6759,6 +6103,14 @@ function clipboardHtmlToMarkdown(
     while (neC.firstChild) c.appendChild(neC.firstChild);
     neC.replaceWith(c);
   }
+  const replaceWithPre = (target: Element, codeText: string, lang = "") => {
+    const pre = doc.createElement("pre");
+    const code = doc.createElement("code");
+    if (lang && lang !== "plain" && lang !== "plaintext") code.className = `language-${lang}`;
+    code.textContent = codeText;
+    pre.appendChild(code);
+    target.replaceWith(pre);
+  };
   for (const card of Array.from(body.querySelectorAll<HTMLElement>('div[data-lake-card="codeblock"], [ne-card="codeblock"]'))) {
     let lang = card.getAttribute("data-language") || card.getAttribute("data-lang") || "";
     let codeTxt = "";
@@ -6776,15 +6128,10 @@ function clipboardHtmlToMarkdown(
       const cmLines = Array.from(card.querySelectorAll(".cm-line, .CodeMirror-line"));
       codeTxt =
         cmLines.length > 0
-          ? cmLines.map((l) => (l.textContent || "").replace(/\u00a0/g, " ")).join("\n")
+          ? cmLines.map(nodeNbspText).join("\n")
           : extractPreCodeLines(card);
     }
-    const pre = doc.createElement("pre");
-    const code = doc.createElement("code");
-    if (lang && lang !== "plain" && lang !== "plaintext") code.className = `language-${lang}`;
-    code.textContent = codeTxt;
-    pre.appendChild(code);
-    card.replaceWith(pre);
+    replaceWithPre(card, codeTxt, lang);
   }
 
   // Feishu / Lark code blocks (.ace-code-block or containers of div[data-ace-line])
@@ -6796,27 +6143,18 @@ function clipboardHtmlToMarkdown(
       extractToolbarCodeLang((aceBlock.querySelector("[class*='header'], [class*='lang']") as HTMLElement) || doc.createElement("span"));
     const codeTxt =
       aceLines.length > 0
-        ? aceLines.map((l) => (l.textContent || "").replace(/\u00a0/g, " ").replace(/\r?\n$/, "")).join("\n")
+        ? aceLines.map((l) => nodeNbspText(l).replace(/\r?\n$/, "")).join("\n")
         : extractPreCodeLines(aceBlock);
-    const pre = doc.createElement("pre");
-    const code = doc.createElement("code");
-    if (lang && lang !== "plain" && lang !== "plaintext") code.className = `language-${lang}`;
-    code.textContent = codeTxt;
-    pre.appendChild(code);
-    aceBlock.replaceWith(pre);
+    replaceWithPre(aceBlock, codeTxt, lang);
   }
   const strayAceLines = Array.from(body.querySelectorAll<HTMLElement>("div[data-ace-line]"));
   if (strayAceLines.length > 0) {
     const parent = strayAceLines[0].parentElement;
     if (parent && parent !== body && !parent.closest("pre")) {
       const lines = Array.from(parent.querySelectorAll("div[data-ace-line]")).map((l) =>
-        (l.textContent || "").replace(/\u00a0/g, " ").replace(/\r?\n$/, "")
+        nodeNbspText(l).replace(/\r?\n$/, "")
       );
-      const pre = doc.createElement("pre");
-      const code = doc.createElement("code");
-      code.textContent = lines.join("\n");
-      pre.appendChild(code);
-      parent.replaceWith(pre);
+      replaceWithPre(parent, lines.join("\n"));
     }
   }
 
@@ -6830,11 +6168,7 @@ function clipboardHtmlToMarkdown(
       const lines = Array.from(container.querySelectorAll<HTMLElement>(".react-code-text")).map((el) =>
         (el.getAttribute("data-code-text") ?? el.textContent ?? "").replace(/\u00a0/g, " ").replace(/\r?\n/g, "")
       );
-      const pre = doc.createElement("pre");
-      const code = doc.createElement("code");
-      code.textContent = lines.join("\n");
-      pre.appendChild(code);
-      container.replaceWith(pre);
+      replaceWithPre(container, lines.join("\n"));
     }
   }
 
@@ -6872,13 +6206,7 @@ function clipboardHtmlToMarkdown(
     const lntds = hl.querySelectorAll(":scope table td.lntd");
     if (lntds.length >= 2) lntds[0].remove();
     const codeHost = (hl.querySelector(".code pre, td.rouge-code pre, td.lntd pre, pre, code") || hl) as HTMLElement;
-    const codeText = extractPreCodeLines(codeHost);
-    const pre = doc.createElement("pre");
-    const code = doc.createElement("code");
-    if (lang && lang !== "plain" && lang !== "plaintext") code.className = `language-${lang}`;
-    code.textContent = codeText;
-    pre.appendChild(code);
-    hl.replaceWith(pre);
+    replaceWithPre(hl, extractPreCodeLines(codeHost), lang);
   }
 
   for (const tbl of Array.from(body.querySelectorAll<HTMLTableElement>("table"))) {
@@ -6887,12 +6215,8 @@ function clipboardHtmlToMarkdown(
       codeCells = Array.from(tbl.querySelectorAll<HTMLElement>("td.blob-code-inner"));
     }
     if (codeCells.length > 0) {
-      const lines = codeCells.map((c) => (c.textContent || "").replace(/\u00a0/g, " ").replace(/\r?\n/g, ""));
-      const pre = doc.createElement("pre");
-      const code = doc.createElement("code");
-      code.textContent = lines.join("\n");
-      pre.appendChild(code);
-      tbl.replaceWith(pre);
+      const lines = codeCells.map((c) => nodeNbspText(c).replace(/\r?\n/g, ""));
+      replaceWithPre(tbl, lines.join("\n"));
     }
   }
 
@@ -6959,12 +6283,12 @@ function clipboardHtmlToMarkdown(
       const firstSet = (img.getAttribute("srcset") || "").split(",")[0]?.trim().split(/\s+/)[0] || "";
       if (firstSet) realSrc = firstSet;
     }
-    realSrc = cleanClipboardUrl(realSrc) || realSrc;
-    if (!realSrc || realSrc.startsWith("data:image/svg+xml")) {
+    realSrc = cleanClipboardUrl(realSrc, "src");
+    if (!realSrc) {
       img.remove();
       continue;
     }
-    img.setAttribute("src", realSrc);
+    img.setAttribute("data-volo-img-src", realSrc);
   }
 
   // 7. Convert semantic inline CSS spans (Word / Google Docs / Notion / Feishu / WeChat)
@@ -7007,7 +6331,7 @@ function clipboardHtmlToMarkdown(
   // 8. Only hijack paste when the clipboard HTML genuinely carries rich structure/formatting
   const hasRichSemantics = Boolean(
     body.querySelector(
-      "h1, h2, h3, h4, h5, h6, strong, b, em, i, del, s, strike, u, mark, code, pre, kbd, sup, sub, a[href], img[src], table, ul, ol, dl, blockquote, hr, details, figure, audio, video, math, .katex"
+      "h1, h2, h3, h4, h5, h6, strong, b, em, i, del, s, strike, u, mark, code, pre, kbd, sup, sub, a[href], img[src], img[data-volo-img-src], table, ul, ol, dl, blockquote, hr, details, figure, audio, video, math, .katex"
     )
   );
   const hasFontColor = Array.from(body.querySelectorAll<HTMLElement>("font[color]")).some((f) => {
@@ -7028,12 +6352,12 @@ function clipboardHtmlToMarkdown(
   crypto.getRandomValues(randWords);
   const batchTag = `${Date.now().toString(36)}${randWords[0].toString(36)}`;
   let imgIdx = 0;
-  for (const img of Array.from(body.querySelectorAll<HTMLImageElement>("img[src^='data:image/']"))) {
-    const src = img.getAttribute("src") || "";
+  for (const img of Array.from(body.querySelectorAll<HTMLImageElement>("img[data-volo-img-src^='data:image/'], img[src^='data:image/']"))) {
+    const src = img.getAttribute("data-volo-img-src") || img.getAttribute("src") || "";
     const file = dataUrlToFile(src, ++imgIdx);
     if (file && file.size > 0 && file.size <= 15 * 1024 * 1024) {
       const placeholder = `/__volo_paste_img_${batchTag}_${imgIdx}__`;
-      img.setAttribute("src", placeholder);
+      img.setAttribute("data-volo-img-src", placeholder);
       pendingUploads.push({ placeholder, file });
     } else {
       img.remove();
@@ -7109,15 +6433,7 @@ interface OutlineItem {
   line: number;
 }
 
-const EDITOR_SWATCHES = [
-  { color: "#ff0000", label: "#FF0000" },
-  { color: "#ea580c", label: "#EA580C" },
-  { color: "#ca8a04", label: "#CA8A04" },
-  { color: "#16a34a", label: "#16A34A" },
-  { color: "#2563eb", label: "#2563EB" },
-  { color: "#7c3aed", label: "#7C3AED" },
-  { color: "#64748b", label: "#64748B" },
-] as const;
+const EDITOR_SWATCHES = ["#ff0000", "#ea580c", "#ca8a04", "#16a34a", "#2563eb", "#7c3aed", "#64748b"] as const;
 
 const EDITOR_CALLOUTS = [
   { kind: "NOTE", color: "#2563eb" },
@@ -7257,9 +6573,10 @@ export function CM6EditorCore({ value, onChange, quickInserts = [], onSave, hasA
     localStorage.setItem("volo_editor_mode", next);
   };
 
-  // Word, char, line stats + live outline
+  // Word, char, line stats + live outline (debounced to avoid re-scanning large docs every keystroke)
+  const debouncedStatsValue = useDebouncedValue(value, 200);
   const { stats, outline } = useMemo(() => {
-    const raw = value || "";
+    const raw = debouncedStatsValue || "";
     const linesArr = raw.split("\n");
     const cjk = (raw.match(/[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]/g) || []).length;
     const latin = (
@@ -7287,7 +6604,7 @@ export function CM6EditorCore({ value, onChange, quickInserts = [], onSave, hasA
         return;
       }
       if (fenceChar) return;
-      const m = /^(#{1,4})\s+(.+)$/.exec(ln);
+      const m = /^(#{1,4})[ \t]+(\S[^\n\r\u2028\u2029]*)$/.exec(ln);
       if (m) {
         toc.push({
           level: m[1].length,
@@ -7300,16 +6617,121 @@ export function CM6EditorCore({ value, onChange, quickInserts = [], onSave, hasA
       stats: { words: cjk + latin, chars: raw.length, lines: linesArr.length },
       outline: toc,
     };
-  }, [value]);
+  }, [debouncedStatsValue]);
 
   const wysiwygForceSyncRef = useRef<boolean>(false);
+  const wysiwygAwaitingInitialSyncRef = useRef<boolean>(false);
+  const [wysiwygHydrating, setWysiwygHydrating] = useState<boolean>(false);
+  const wysiwygHydratingRef = useRef<boolean>(false);
+  wysiwygHydratingRef.current = wysiwygHydrating;
+  const previewSourceRef = useRef<string | null>(null);
   const wysiwygDirtyRef = useRef<boolean>(false);
   const wysiwygComposingRef = useRef<boolean>(false);
   const wysiwygEmitQueuedRef = useRef<boolean>(false);
   const wysiwygPlaceCaretRef = useRef<boolean>(false);
+  const wysiwygEditSeqRef = useRef<number>(0);
+  const propSyncRef = useRef(createPropSyncTracker());
+  const wysiwygHistoryRef = useRef<{
+    stack: Array<{ frag: DocumentFragment; sig: string; ts: number }>;
+    idx: number;
+  }>({ stack: [], idx: -1 });
+  const wysiwygApplyingHistoryRef = useRef<boolean>(false);
   const lastWysiwygRangeRef = useRef<Range | null>(null);
   const activeWysiwygCellRef = useRef<HTMLTableCellElement | null>(null);
   const [wysiwygTblActive, setWysiwygTblActive] = useState<boolean>(false);
+
+  const markWysiwygDirty = (dirty = true) => {
+    if (dirty) wysiwygDirtyRef.current = true;
+    wysiwygEditSeqRef.current += 1;
+    wysiwygForceSyncRef.current = false;
+    wysiwygAwaitingInitialSyncRef.current = false;
+  };
+
+  const commitWysiwygEdit = (root: HTMLElement, saveSel = true) => {
+    if (saveSel) saveWysiwygSelection(root);
+    pushWysiwygHistory(root, true);
+    onChangeRef.current(htmlToMarkdown(root));
+  };
+
+  const dispatchRange = (
+    from: number,
+    to: number,
+    insert: string,
+    anchor: number,
+    head?: number,
+    extra?: { userEvent?: string; scrollIntoView?: boolean },
+    focus = true
+  ) => {
+    const view = viewRef.current;
+    if (!view) return;
+    view.dispatch({
+      changes: { from, to, insert },
+      selection: head !== undefined ? { anchor, head } : { anchor },
+      ...extra,
+    });
+    if (focus) view.focus();
+  };
+
+  const pushWysiwygHistory = (root: HTMLElement | null, force = false, reset = false) => {
+    if (!root || wysiwygApplyingHistoryRef.current) return;
+    const h = wysiwygHistoryRef.current;
+    const sig = root.innerHTML;
+    const now = Date.now();
+    const frag = document.createDocumentFragment();
+    for (const child of Array.from(root.childNodes)) {
+      frag.appendChild(child.cloneNode(true));
+    }
+    if (reset) {
+      h.stack = [{ frag, sig, ts: now }];
+      h.idx = 0;
+      return;
+    }
+    if (h.idx < h.stack.length - 1) {
+      h.stack = h.stack.slice(0, h.idx + 1);
+    }
+    const top = h.stack[h.idx];
+    if (top && top.sig === sig) return;
+    if (!force && top && h.idx > 0 && now - top.ts < 400) {
+      h.stack[h.idx] = { frag, sig, ts: now };
+      return;
+    }
+    h.stack.push({ frag, sig, ts: now });
+    if (h.stack.length > 100) {
+      h.stack.shift();
+    }
+    h.idx = h.stack.length - 1;
+  };
+
+  const applyWysiwygHistoryStep = (delta: -1 | 1): boolean => {
+    if (wysiwygHydratingRef.current) return false;
+    const root = wysiwygRef.current;
+    if (!root) return false;
+    const h = wysiwygHistoryRef.current;
+    const nextIdx = h.idx + delta;
+    if (nextIdx < 0 || nextIdx >= h.stack.length) return false;
+    const entry = h.stack[nextIdx];
+    if (!entry) return false;
+    h.idx = nextIdx;
+    wysiwygApplyingHistoryRef.current = true;
+    try {
+      markWysiwygDirty();
+      root.replaceChildren(entry.frag.cloneNode(true));
+      normalizeWysiwygDOM(root, t("common.delete"));
+      root.querySelectorAll<HTMLButtonElement>(".volo-copy-btn[data-copied]").forEach((btn) => {
+        btn.removeAttribute("data-copied");
+        btn.textContent = t("ed.copy_code");
+      });
+      root.querySelectorAll<HTMLSelectElement>(".volo-code-lang-select").forEach((sel) => {
+        sel.value = sel.closest("figure.volo-codeblock, .volo-code-block")?.getAttribute("data-lang") || "";
+      });
+      root.focus();
+      placeCaretInBlock(root, false);
+      commitWysiwygEdit(root);
+    } finally {
+      wysiwygApplyingHistoryRef.current = false;
+    }
+    return true;
+  };
 
   const saveWysiwygSelection = (root?: HTMLElement | null) => {
     const host = root || wysiwygRef.current;
@@ -7336,7 +6758,7 @@ export function CM6EditorCore({ value, onChange, quickInserts = [], onSave, hasA
     const tr = cell.closest("tr") as HTMLTableRowElement | null;
     const table = cell.closest("table") as HTMLTableElement | null;
     if (!tr || !table || !root.contains(table)) return;
-    wysiwygDirtyRef.current = true;
+    markWysiwygDirty();
     const allRows = Array.from(table.querySelectorAll("tr"));
     const colCount = Math.max(1, tr.children.length);
     const colIdx = Math.max(0, Array.from(tr.children).indexOf(cell));
@@ -7346,7 +6768,7 @@ export function CM6EditorCore({ value, onChange, quickInserts = [], onSave, hasA
       activeWysiwygCellRef.current = null;
       setWysiwygTblActive(false);
       normalizeWysiwygDOM(root, t("common.delete"));
-      onChangeRef.current(htmlToMarkdown(root));
+      commitWysiwygEdit(root, false);
     };
     if (op === "del_table") {
       removeWholeTable();
@@ -7357,24 +6779,28 @@ export function CM6EditorCore({ value, onChange, quickInserts = [], onSave, hasA
       const inHead = tr.parentElement?.tagName === "THEAD";
       let tbody = table.querySelector("tbody");
       if (!tbody) {
-        tbody = document.createElement("tbody");
+        tbody = mkEl("tbody");
         table.appendChild(tbody);
       }
       if (inHead && op === "row_above") {
-        const demoted = document.createElement("tr");
+        const demoted = mkEl("tr");
         for (const ch of Array.from(tr.children)) {
-          const td = document.createElement("td");
-          td.innerHTML = ch.innerHTML || "<br>";
+          const td = mkEl("td");
+          if (ch.hasChildNodes()) {
+            td.replaceChildren(...Array.from(ch.childNodes));
+          } else {
+            td.appendChild(mkEl("br"));
+          }
           demoted.appendChild(td);
-          ch.innerHTML = "<br>";
+          ch.replaceChildren(mkEl("br"));
         }
         tbody.insertBefore(demoted, tbody.firstChild);
         focusTarget = (tr.children[colIdx] as HTMLElement) || cell;
       } else {
-        const newTr = document.createElement("tr");
+        const newTr = mkEl("tr");
         for (let i = 0; i < colCount; i++) {
-          const td = document.createElement("td");
-          td.appendChild(document.createElement("br"));
+          const td = mkEl("td");
+          td.appendChild(mkEl("br"));
           newTr.appendChild(td);
         }
         if (inHead) {
@@ -7396,7 +6822,12 @@ export function CM6EditorCore({ value, onChange, quickInserts = [], onSave, hasA
       if (inHead && tbody && tbody.rows.length > 0) {
         const nextRow = tbody.rows[0];
         Array.from(tr.children).forEach((th, idx) => {
-          th.innerHTML = nextRow.children[idx]?.innerHTML || "<br>";
+          const srcCell = nextRow.children[idx];
+          if (srcCell && srcCell.hasChildNodes()) {
+            th.replaceChildren(...Array.from(srcCell.childNodes));
+          } else {
+            th.replaceChildren(mkEl("br"));
+          }
         });
         nextRow.remove();
         focusTarget = (tr.children[colIdx] as HTMLElement) || null;
@@ -7413,8 +6844,8 @@ export function CM6EditorCore({ value, onChange, quickInserts = [], onSave, hasA
       for (const r of allRows) {
         const refC = r.children[Math.min(colIdx, Math.max(0, r.children.length - 1))];
         const tag = r.parentElement?.tagName === "THEAD" || refC?.tagName === "TH" ? "th" : "td";
-        const nc = document.createElement(tag);
-        nc.appendChild(document.createElement("br"));
+        const nc = mkEl(tag);
+        nc.appendChild(mkEl("br"));
         if (!refC) r.appendChild(nc);
         else if (op === "col_left") refC.before(nc);
         else refC.after(nc);
@@ -7435,7 +6866,7 @@ export function CM6EditorCore({ value, onChange, quickInserts = [], onSave, hasA
       placeCaretInBlock(focusTarget, true);
       saveWysiwygSelection(root);
     }
-    onChangeRef.current(htmlToMarkdown(root));
+    commitWysiwygEdit(root, false);
   };
 
   const restoreWysiwygSelection = (root: HTMLElement): Range | null => {
@@ -7472,7 +6903,7 @@ export function CM6EditorCore({ value, onChange, quickInserts = [], onSave, hasA
   }, [mode]);
 
   const scheduleWysiwygEmit = (root: HTMLElement, placeEmptyCaret = false) => {
-    wysiwygDirtyRef.current = true;
+    markWysiwygDirty();
     if (placeEmptyCaret) wysiwygPlaceCaretRef.current = true;
     if (wysiwygEmitQueuedRef.current) return;
     wysiwygEmitQueuedRef.current = true;
@@ -7486,6 +6917,7 @@ export function CM6EditorCore({ value, onChange, quickInserts = [], onSave, hasA
       if (shouldPlace && wasEmpty && root.firstElementChild instanceof HTMLElement) {
         placeCaretInBlock(root.firstElementChild, true);
       }
+      pushWysiwygHistory(root);
       const md = htmlToMarkdown(root);
       if (md !== (valueRef.current || "")) {
         onChangeRef.current(md);
@@ -7494,6 +6926,8 @@ export function CM6EditorCore({ value, onChange, quickInserts = [], onSave, hasA
   };
 
   const spliceMarkdownAtWysiwygCaret = (root: HTMLElement, mdSnippet: string) => {
+    wysiwygEditSeqRef.current += 1;
+    wysiwygAwaitingInitialSyncRef.current = false;
     const range = restoreWysiwygSelection(root);
     if (!range) {
       wysiwygForceSyncRef.current = true;
@@ -7572,7 +7006,7 @@ export function CM6EditorCore({ value, onChange, quickInserts = [], onSave, hasA
   };
 
   const removeWysiwygAudioBlock = (root: HTMLElement, block: HTMLElement, preferBlock?: HTMLElement | null) => {
-    wysiwygDirtyRef.current = true;
+    markWysiwygDirty();
     const fallback = (preferBlock || block.nextElementSibling || block.previousElementSibling) as HTMLElement | null;
     block.remove();
     normalizeWysiwygDOM(root, t("common.delete"));
@@ -7585,15 +7019,18 @@ export function CM6EditorCore({ value, onChange, quickInserts = [], onSave, hasA
       placeCaretInBlock(target, false);
       saveWysiwygSelection(root);
     }
-    onChangeRef.current(htmlToMarkdown(root));
+    commitWysiwygEdit(root, false);
   };
 
   const insertSnippet = (snippet: string) => {
+    if (modeRef.current === "wysiwyg" && wysiwygHydratingRef.current) return;
     if (mode === "wysiwyg" && wysiwygRef.current) {
       spliceMarkdownAtWysiwygCaret(wysiwygRef.current, snippet);
       return;
     }
     if (mode === "wysiwyg") {
+      wysiwygEditSeqRef.current += 1;
+      wysiwygAwaitingInitialSyncRef.current = false;
       wysiwygForceSyncRef.current = true;
       const next = `${value}${value.endsWith("\n") || !value ? "" : "\n"}${snippet}`;
       onChangeRef.current(next);
@@ -7602,14 +7039,11 @@ export function CM6EditorCore({ value, onChange, quickInserts = [], onSave, hasA
     const view = viewRef.current;
     if (!view) return;
     const sel = view.state.selection.main;
-    view.dispatch({
-      changes: { from: sel.from, to: sel.to, insert: snippet },
-      selection: { anchor: sel.from + snippet.length },
-    });
-    view.focus();
+    dispatchRange(sel.from, sel.to, snippet, sel.from + snippet.length);
   };
 
   const wrapSelection = (before: string, after: string, fallback: string) => {
+    if (modeRef.current === "wysiwyg" && wysiwygHydratingRef.current) return;
     if (mode === "wysiwyg" && wysiwygRef.current) {
       const root = wysiwygRef.current;
       const rawSelected = getSelectedText() || fallback;
@@ -7621,12 +7055,10 @@ export function CM6EditorCore({ value, onChange, quickInserts = [], onSave, hasA
         spliceMarkdownAtWysiwygCaret(root, `${before}${rawSelected}${after}`);
         return;
       }
-      wysiwygDirtyRef.current = true;
+      markWysiwygDirty();
       restoreWysiwygSelection(root);
       root.focus();
-      const escHtml = (s: string) =>
-        s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
-      const selTxt = escHtml(rawSelected);
+      const selTxt = escapeClipboardHtml(rawSelected);
       if (before === "**") document.execCommand("bold");
       else if (before === "*") document.execCommand("italic");
       else if (before === "~~") document.execCommand("strikeThrough");
@@ -7635,13 +7067,13 @@ export function CM6EditorCore({ value, onChange, quickInserts = [], onSave, hasA
       else if (before === "^") document.execCommand("insertHTML", false, `<sup>${selTxt}</sup>`);
       else if (before === "~") document.execCommand("insertHTML", false, `<sub>${selTxt}</sub>`);
       else if (before === "[" && after.startsWith("](") && after.endsWith(")")) {
-        const url = escHtml(after.slice(2, -1) || "https://");
+        const rawHref = after.slice(2, -1) || "https://";
+        const url = escapeClipboardHtml(safeHref(rawHref) || "https://");
         document.execCommand("insertHTML", false, `<a href="${url}">${selTxt}</a>`);
       } else {
         document.execCommand("insertHTML", false, `<code>${selTxt}</code>`);
       }
-      saveWysiwygSelection(root);
-      onChangeRef.current(htmlToMarkdown(root));
+      commitWysiwygEdit(root);
       return;
     }
     const view = viewRef.current;
@@ -7658,12 +7090,7 @@ export function CM6EditorCore({ value, onChange, quickInserts = [], onSave, hasA
       !(isSingleStar && rawSel.startsWith("**") && rawSel.endsWith("**") && !rawSel.startsWith("***"))
     ) {
       const inner = rawSel.slice(before.length, rawSel.length - after.length);
-      view.dispatch({
-        changes: { from: sel.from, to: sel.to, insert: inner },
-        selection: { anchor: sel.from, head: sel.from + inner.length },
-        userEvent: "input",
-      });
-      view.focus();
+      dispatchRange(sel.from, sel.to, inner, sel.from, sel.from + inner.length, { userEvent: "input" });
       return;
     }
 
@@ -7680,61 +7107,64 @@ export function CM6EditorCore({ value, onChange, quickInserts = [], onSave, hasA
         !(sel.from >= 3 && view.state.sliceDoc(sel.from - 3, sel.from) === "***")
       )
     ) {
-      view.dispatch({
-        changes: { from: sel.from - before.length, to: sel.to + after.length, insert: rawSel },
-        selection: { anchor: sel.from - before.length, head: sel.from - before.length + rawSel.length },
-        userEvent: "input",
-      });
-      view.focus();
+      dispatchRange(
+        sel.from - before.length,
+        sel.to + after.length,
+        rawSel,
+        sel.from - before.length,
+        sel.from - before.length + rawSel.length,
+        { userEvent: "input" }
+      );
       return;
     }
 
     const selected = rawSel || fallback;
-    const insert = `${before}${selected}${after}`;
-    view.dispatch({
-      changes: { from: sel.from, to: sel.to, insert },
-      selection: { anchor: sel.from + before.length, head: sel.from + before.length + selected.length },
-    });
-    view.focus();
+    dispatchRange(
+      sel.from,
+      sel.to,
+      `${before}${selected}${after}`,
+      sel.from + before.length,
+      sel.from + before.length + selected.length
+    );
   };
 
   const insertCodeBlock = (lang: string) => {
+    if (modeRef.current === "wysiwyg" && wysiwygHydratingRef.current) return;
     if (modeRef.current === "wysiwyg" && wysiwygRef.current) {
-      const selTxt = getSelectedText().replace(/^\n+|\n+$/g, "");
-      spliceMarkdownAtWysiwygCaret(wysiwygRef.current, `\n\`\`\`${lang}\n${selTxt}\n\`\`\`\n`);
+      const selTxt = trimEndChars(getSelectedText(), "\n", true);
+      const fence = computeFenceDelim(selTxt);
+      spliceMarkdownAtWysiwygCaret(wysiwygRef.current, `\n${fence}${lang}\n${selTxt}\n${fence}\n`);
       return;
     }
     const view = viewRef.current;
     if (!view) return;
     const sel = view.state.selection.main;
-    const rawSel = view.state.sliceDoc(sel.from, sel.to).replace(/^\n+|\n+$/g, "");
+    const rawSel = trimEndChars(view.state.sliceDoc(sel.from, sel.to), "\n", true);
     const startLine = view.state.doc.lineAt(sel.from);
     const endLine = view.state.doc.lineAt(sel.to);
     const needLeadNl = sel.from > startLine.from ? "\n" : "";
     const needTrailNl = sel.to < endLine.to ? "\n" : "";
-    const openFence = `${needLeadNl}\`\`\`${lang}\n`;
-    const closeFence = `\n\`\`\`${needTrailNl}`;
+    const fence = computeFenceDelim(rawSel);
+    const openFence = `${needLeadNl}${fence}${lang}\n`;
+    const closeFence = `\n${fence}${needTrailNl}`;
     const insert = `${openFence}${rawSel}${closeFence}`;
     const cursorStart = sel.from + openFence.length;
-    view.dispatch({
-      changes: { from: sel.from, to: sel.to, insert },
-      selection: { anchor: cursorStart, head: cursorStart + rawSel.length },
+    dispatchRange(sel.from, sel.to, insert, cursorStart, cursorStart + rawSel.length, {
       scrollIntoView: true,
       userEvent: "input",
     });
-    view.focus();
   };
   const insertCodeBlockRef = useRef(insertCodeBlock);
   insertCodeBlockRef.current = insertCodeBlock;
 
   const applyColorStyle = (color: string) => {
+    if (modeRef.current === "wysiwyg" && wysiwygHydratingRef.current) return;
     if (mode === "wysiwyg" && wysiwygRef.current) {
-      wysiwygDirtyRef.current = true;
+      markWysiwygDirty();
       restoreWysiwygSelection(wysiwygRef.current);
       wysiwygRef.current.focus();
       document.execCommand("foreColor", false, color);
-      saveWysiwygSelection(wysiwygRef.current);
-      onChangeRef.current(htmlToMarkdown(wysiwygRef.current));
+      commitWysiwygEdit(wysiwygRef.current);
       return;
     }
     const view = viewRef.current;
@@ -7745,66 +7175,77 @@ export function CM6EditorCore({ value, onChange, quickInserts = [], onSave, hasA
     let prevUnwrapped: string;
     do {
       prevUnwrapped = unwrapped;
-      unwrapped = unwrapped.replace(/^<(?:font|span)\b[^>]*>([\s\S]*?)<\/(?:font|span)\b[^>]*>$/i, "$1");
+      unwrapped = unwrapped.replace(/^<(?:font|span)\b[^<>]*>([\s\S]*?)<\/(?:font|span)\b[^<>]*>$/i, "$1");
     } while (unwrapped !== prevUnwrapped);
     const before = `<font color="${color}">`;
-    const after = `</font>`;
-    const insert = `${before}${unwrapped}${after}`;
-    view.dispatch({
-      changes: { from: sel.from, to: sel.to, insert },
-      selection: { anchor: sel.from + before.length, head: sel.from + before.length + unwrapped.length },
-    });
-    view.focus();
+    dispatchRange(sel.from, sel.to, `${before}${unwrapped}</font>`, sel.from + before.length, sel.from + before.length + unwrapped.length);
+  };
+
+  const stripStyledSpans = (s: string): string => {
+    const re = /<(span\b[^<>]*|\/span\b[^<>]*)>/gi;
+    const stack: Array<{ os: number; oe: number; styled: boolean }> = [];
+    const drop: Array<[number, number]> = [];
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(s)) !== null) {
+      if (m[1][0] === "/") {
+        const top = stack.pop();
+        if (top && top.styled) {
+          drop.push([top.os, top.oe], [m.index, m.index + m[0].length]);
+        }
+      } else {
+        stack.push({
+          os: m.index,
+          oe: m.index + m[0].length,
+          styled: /^<span\s+style\s*=\s*(?:"[^"<>]*"|'[^'<>]*')\s*>$/i.test(m[0]),
+        });
+      }
+    }
+    if (drop.length === 0) return s;
+    drop.sort((a, b) => a[0] - b[0]);
+    let out = "";
+    let pos = 0;
+    for (const [a, b] of drop) {
+      if (a > pos) out += s.slice(pos, a);
+      if (b > pos) pos = b;
+    }
+    return out + s.slice(pos);
   };
 
   const clearInlineStyle = () => {
+    if (modeRef.current === "wysiwyg" && wysiwygHydratingRef.current) return;
     if (mode === "wysiwyg" && wysiwygRef.current) {
-      wysiwygDirtyRef.current = true;
+      markWysiwygDirty();
       restoreWysiwygSelection(wysiwygRef.current);
       wysiwygRef.current.focus();
       document.execCommand("removeFormat");
-      saveWysiwygSelection(wysiwygRef.current);
-      onChangeRef.current(htmlToMarkdown(wysiwygRef.current));
+      commitWysiwygEdit(wysiwygRef.current);
       return;
     }
     const view = viewRef.current;
     if (!view) return;
     const sel = view.state.selection.main;
-    const stripTags = (s: string) => {
-      let out = s;
-      let prev: string;
-      do {
-        prev = out;
-        out = out
-          .replace(/<\/?(?:font|mark|u|sup|sub)\b[^>]*>/gi, "")
-          .replace(/==([^=\n]+)==/g, "$1")
-          .replace(/<span\s+style\s*=\s*(?:"[^"]*"|'[^']*')\s*>([\s\S]*?)<\/span\b[^>]*>/gi, "$1");
-      } while (out !== prev);
-      return out;
-    };
+    const stripTags = (s: string) =>
+      stripStyledSpans(s.replace(/<\/?(?:font|mark|u|sup|sub)\b[^<>]*>/gi, ""))
+        .replace(/==([^=\n]+)==/g, "$1");
     if (!sel.empty) {
       const cleaned = stripTags(view.state.sliceDoc(sel.from, sel.to));
-      view.dispatch({
-        changes: { from: sel.from, to: sel.to, insert: cleaned },
-        selection: { anchor: sel.from, head: sel.from + cleaned.length },
-      });
+      dispatchRange(sel.from, sel.to, cleaned, sel.from, sel.from + cleaned.length);
     } else {
       const line = view.state.doc.lineAt(sel.head);
       const cleaned = stripTags(line.text);
       if (cleaned !== line.text) {
-        view.dispatch({
-          changes: { from: line.from, to: line.to, insert: cleaned },
-          selection: { anchor: Math.min(line.from + cleaned.length, sel.head) },
-        });
+        dispatchRange(line.from, line.to, cleaned, Math.min(line.from + cleaned.length, sel.head));
+      } else {
+        view.focus();
       }
     }
-    view.focus();
   };
 
   const prefixCurrentLine = (prefix: string) => {
+    if (modeRef.current === "wysiwyg" && wysiwygHydratingRef.current) return;
     if (mode === "wysiwyg" && wysiwygRef.current) {
       const root = wysiwygRef.current;
-      wysiwygDirtyRef.current = true;
+      markWysiwygDirty();
       restoreWysiwygSelection(root);
       root.focus();
       if (prefix.startsWith("#")) {
@@ -7833,7 +7274,7 @@ export function CM6EditorCore({ value, onChange, quickInserts = [], onSave, hasA
           if (existingCb) {
             existingCb.remove();
           } else {
-            const cb = document.createElement("input");
+            const cb = mkEl("input");
             cb.type = "checkbox";
             li.insertBefore(document.createTextNode(" "), li.firstChild);
             li.insertBefore(cb, li.firstChild);
@@ -7845,8 +7286,7 @@ export function CM6EditorCore({ value, onChange, quickInserts = [], onSave, hasA
       } else if (prefix === "> ") {
         document.execCommand("formatBlock", false, "BLOCKQUOTE");
       }
-      saveWysiwygSelection(root);
-      onChangeRef.current(htmlToMarkdown(root));
+      commitWysiwygEdit(root);
       return;
     }
     const view = viewRef.current;
@@ -7854,11 +7294,7 @@ export function CM6EditorCore({ value, onChange, quickInserts = [], onSave, hasA
     const line = view.state.doc.lineAt(view.state.selection.main.from);
     const cleaned = line.text.replace(/^(?:#{1,6}\s+|>\s+|-\s+\[[ xX]\]\s+|-\s+|\d+\.\s+)/, "");
     const nextText = `${prefix}${cleaned}`;
-    view.dispatch({
-      changes: { from: line.from, to: line.to, insert: nextText },
-      selection: { anchor: line.from + nextText.length },
-    });
-    view.focus();
+    dispatchRange(line.from, line.to, nextText, line.from + nextText.length);
   };
 
   const uploadMediaFile = async (file: File) => {
@@ -7870,7 +7306,11 @@ export function CM6EditorCore({ value, onChange, quickInserts = [], onSave, hasA
         "/api/admin/media/upload",
         { method: "POST", body: fd }
       );
-      const url = res.asset.public_url;
+      const url = safeMediaSrc(res.asset.public_url);
+      if (!url) {
+        showToast(t("ed.upload_failed"));
+        return;
+      }
       const name = res.asset.orig_filename || "asset";
       const mime = res.asset.mime_type || file.type || "";
       if (isVideoMedia(mime, url)) {
@@ -7885,6 +7325,13 @@ export function CM6EditorCore({ value, onChange, quickInserts = [], onSave, hasA
       showToast(err?.message || t("ed.upload_failed"));
     } finally {
       setUploading(false);
+    }
+  };
+
+  const uploadMediaFiles = async (files: Iterable<File>, sequential = false) => {
+    for (const f of files) {
+      if (sequential) await uploadMediaFile(f);
+      else void uploadMediaFile(f);
     }
   };
 
@@ -7998,8 +7445,7 @@ export function CM6EditorCore({ value, onChange, quickInserts = [], onSave, hasA
         cleanupRecordingTracks();
         if (chunks.length === 0) return;
         const actualMime = (recorder.mimeType || chosen.blobType).toLowerCase();
-        let ext = chosen.ext;
-        let blobType = chosen.blobType;
+        let ext: string, blobType: string;
         if (actualMime.includes("ogg")) {
           ext = "ogg";
           blobType = "audio/ogg";
@@ -8052,7 +7498,7 @@ export function CM6EditorCore({ value, onChange, quickInserts = [], onSave, hasA
             method: "POST",
             body: fd,
           });
-          const uploadedUrl = res?.asset?.public_url;
+          const uploadedUrl = safeMediaSrc(res?.asset?.public_url, { allowDataImage: false });
           if (!uploadedUrl) continue;
 
           // Update live WYSIWYG DOM <img> elements first so subsequent keystrokes never revert to placeholder
@@ -8069,10 +7515,13 @@ export function CM6EditorCore({ value, onChange, quickInserts = [], onSave, hasA
           }
           if (modeRef.current === "wysiwyg" && wRoot) {
             if (updatedWysiwygDom) {
-              onChangeRef.current(htmlToMarkdown(wRoot));
+              markWysiwygDirty(false);
+              commitWysiwygEdit(wRoot, false);
             } else {
               const curVal = valueRef.current || "";
               if (curVal.includes(item.placeholder)) {
+                wysiwygEditSeqRef.current += 1;
+                wysiwygAwaitingInitialSyncRef.current = false;
                 wysiwygForceSyncRef.current = true;
                 onChangeRef.current(curVal.split(item.placeholder).join(uploadedUrl));
               }
@@ -8104,6 +7553,55 @@ export function CM6EditorCore({ value, onChange, quickInserts = [], onSave, hasA
     }
   };
 
+  const handleRichPaste = (
+    event: ClipboardEvent,
+    inCode: () => boolean,
+    insertMd: (md: string, forceBlock: boolean) => void,
+    onBeforeConvert?: (rawPlain: string, rawHTML: string) => boolean
+  ): boolean => {
+    const dt = event.clipboardData;
+    if (!dt) return false;
+    const types = Array.from(dt.types || []);
+    const rawPlain = dt.getData("text/plain") || "";
+    const rawHTML = dt.getData("text/html") || "";
+    const mediaFiles = extractClipboardMediaFiles(dt);
+
+    if (shouldHandlePasteAsBinaryMedia(dt, mediaFiles, rawPlain, rawHTML)) {
+      event.preventDefault();
+      void uploadMediaFiles(mediaFiles);
+      return true;
+    }
+    if (types.includes("vscode-editor-data") || types.includes("application/x-jetbrains-editor") || inCode()) {
+      return false;
+    }
+    if (onBeforeConvert?.(rawPlain, rawHTML)) {
+      return true;
+    }
+    if (rawHTML) {
+      const converted = clipboardHtmlToMarkdown(rawHTML);
+      if (converted && converted.markdown) {
+        event.preventDefault();
+        insertMd(converted.markdown, false);
+        if (converted.pendingUploads.length > 0) {
+          void uploadPendingPasteImages(converted.pendingUploads);
+        }
+        return true;
+      }
+    }
+    const tableMd = tsvToMarkdownTable(rawPlain);
+    if (tableMd) {
+      event.preventDefault();
+      insertMd(tableMd, true);
+      return true;
+    }
+    if (mediaFiles.length > 0 && !rawPlain.trim()) {
+      event.preventDefault();
+      void uploadMediaFiles(mediaFiles);
+      return true;
+    }
+    return false;
+  };
+
   const exportEditorDocument = async (kind: "md" | "html" | "rich_copy") => {
     const md = valueRef.current || "";
     const stamp = new Date().toISOString().slice(0, 10);
@@ -8132,35 +7630,7 @@ export function CM6EditorCore({ value, onChange, quickInserts = [], onSave, hasA
     }
 
     if (kind === "html") {
-      const fullDoc = `<!doctype html>
-<html lang="${curLocale || "zh-CN"}">
-<head>
-<meta charset="utf-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1" />
-<meta name="color-scheme" content="light dark" />
-<title>Exported Article</title>
-<style>
-  :root { --bg: #fff; --fg: #1c1917; --surf: #f5f5f4; --quote-bg: #fafaf9; --bd: #e7e5e4; --acc: #d97706; --mark-bg: #fef08a; --mark-fg: #1c1917; --link: #2563eb; }
-  @media (prefers-color-scheme: dark) {
-    :root { --bg: #121211; --fg: #eceae5; --surf: #1e1d1b; --quote-bg: #181716; --bd: #2e2c29; --acc: #f59e0b; --mark-bg: rgba(250, 204, 21, 0.28); --mark-fg: #fef9c3; --link: #60a5fa; }
-    [style*="color: #000"], [style*="color:#000"], [style*="color: #111"], [style*="color: #222"], [style*="color: #333"], [style*="color: black"], font[color="black"], font[color="#000"], font[color="#000000"], font[color="#111111"], font[color="#222222"], font[color="#333333"] { color: var(--fg) !important; }
-  }
-  body { max-width: 780px; margin: 40px auto; padding: 0 20px; font: 16px/1.75 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif; color: var(--fg); background: var(--bg); }
-  a { color: var(--link); }
-  pre { background: var(--surf); padding: 14px 16px; border-radius: 10px; overflow-x: auto; }
-  code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.9em; }
-  blockquote { margin: 1em 0; padding: 0.5em 1em; border-left: 3px solid var(--acc); background: var(--quote-bg); }
-  table { border-collapse: collapse; width: 100%; margin: 1em 0; }
-  th, td { border: 1px solid var(--bd); padding: 8px 12px; text-align: left; }
-  th { background: var(--surf); }
-  img, video, audio { max-width: 100%; border-radius: 8px; }
-  mark { background: var(--mark-bg); color: var(--mark-fg); padding: 0.1em 0.28em; border-radius: 4px; }
-</style>
-</head>
-<body>
-${rendered}
-</body>
-</html>`;
+      const fullDoc = `<!doctype html><html lang="${curLocale || "zh-CN"}"><head><meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" /><meta name="color-scheme" content="light dark" /><title>Exported Article</title><style>:root{--bg:#fff;--fg:#1c1917;--surf:#f5f5f4;--quote-bg:#fafaf9;--bd:#e7e5e4;--acc:#d97706;--mark-bg:#fef08a;--mark-fg:#1c1917;--link:#2563eb}@media(prefers-color-scheme:dark){:root{--bg:#121211;--fg:#eceae5;--surf:#1e1d1b;--quote-bg:#181716;--bd:#2e2c29;--acc:#f59e0b;--mark-bg:rgba(250,204,21,.28);--mark-fg:#fef9c3;--link:#60a5fa}[style*="color: #000"],[style*="color:#000"],[style*="color: #111"],[style*="color: #222"],[style*="color: #333"],[style*="color: black"],font[color="black"],font[color="#000"],font[color="#000000"],font[color="#111111"],font[color="#222222"],font[color="#333333"]{color:var(--fg)!important}}body{max-width:780px;margin:40px auto;padding:0 20px;font:16px/1.75 -apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;color:var(--fg);background:var(--bg)}a{color:var(--link)}pre{background:var(--surf);padding:14px 16px;border-radius:10px;overflow-x:auto}code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:.9em}blockquote{margin:1em 0;padding:.5em 1em;border-left:3px solid var(--acc);background:var(--quote-bg)}table{border-collapse:collapse;width:100%;margin:1em 0}th,td{border:1px solid var(--bd);padding:8px 12px;text-align:left}th{background:var(--surf)}img,video,audio{max-width:100%;border-radius:8px}mark{background:var(--mark-bg);color:var(--mark-fg);padding:.1em .28em;border-radius:4px}</style></head><body>${rendered}</body></html>`;
       triggerDownload(new Blob([fullDoc], { type: "text/html;charset=utf-8" }), `article-${stamp}.html`);
       return;
     }
@@ -8283,12 +7753,7 @@ ${rendered}
     const target = findMatches[safeFindIdx];
     if (!target) return;
     const rep = computeMatchReplacement(view.state.sliceDoc(target.from, target.to));
-    view.dispatch({
-      changes: { from: target.from, to: target.to, insert: rep },
-      selection: { anchor: target.from + rep.length },
-      scrollIntoView: true,
-      userEvent: "input",
-    });
+    dispatchRange(target.from, target.to, rep, target.from + rep.length, undefined, { scrollIntoView: true, userEvent: "input" }, false);
   };
 
   const replaceAllMatches = () => {
@@ -8383,34 +7848,20 @@ ${rendered}
     const leadText = doc.sliceString(line.from, fromPos);
 
     if (item.action === "code") {
-      const ins = "```go\n\n```";
-      view.dispatch({
-        changes: { from: fromPos, to: toPos, insert: ins },
-        selection: { anchor: fromPos + 6 },
-        scrollIntoView: true,
-        userEvent: "input",
-      });
-      view.focus();
+      dispatchRange(fromPos, toPos, "```go\n\n```", fromPos + 6, undefined, { scrollIntoView: true, userEvent: "input" });
       return true;
     }
     if (item.action === "math") {
-      const ins = "$$\n\n$$";
-      view.dispatch({
-        changes: { from: fromPos, to: toPos, insert: ins },
-        selection: { anchor: fromPos + 3 },
-        scrollIntoView: true,
-        userEvent: "input",
-      });
-      view.focus();
+      dispatchRange(fromPos, toPos, "$$\n\n$$", fromPos + 3, undefined, { scrollIntoView: true, userEvent: "input" });
       return true;
     }
     if (item.action === "media") {
-      view.dispatch({ changes: { from: fromPos, to: toPos, insert: "" }, selection: { anchor: fromPos }, userEvent: "input" });
+      dispatchRange(fromPos, toPos, "", fromPos, undefined, { userEvent: "input" }, false);
       setMediaModalOpen(true);
       return true;
     }
     if (item.action === "lock") {
-      view.dispatch({ changes: { from: fromPos, to: toPos, insert: "" }, selection: { anchor: fromPos }, userEvent: "input" });
+      dispatchRange(fromPos, toPos, "", fromPos, undefined, { userEvent: "input" }, false);
       setLockMode("pwd");
       setQiTab("lock");
       setQiOpen(true);
@@ -8418,13 +7869,7 @@ ${rendered}
     }
     const payload = item.payload || "";
     const replaceStart = payload.startsWith("> ") && /^\s*>\s*$/.test(leadText) ? line.from : fromPos;
-    view.dispatch({
-      changes: { from: replaceStart, to: toPos, insert: payload },
-      selection: { anchor: replaceStart + payload.length },
-      scrollIntoView: true,
-      userEvent: "input",
-    });
-    view.focus();
+    dispatchRange(replaceStart, toPos, payload, replaceStart + payload.length, undefined, { scrollIntoView: true, userEvent: "input" });
     return true;
   };
 
@@ -8477,44 +7922,26 @@ ${rendered}
   useEffect(() => {
     if (!hostRef.current) return;
 
+    const writeMdSelectionClipboard = (event: ClipboardEvent, view: EditorView) => {
+      const sel = view.state.selection.main;
+      if (sel.empty || isCursorInFencedCode(view.state)) return null;
+      const selectedMd = view.state.sliceDoc(sel.from, sel.to);
+      const dt = event.clipboardData;
+      if (!selectedMd || !dt) return null;
+      event.preventDefault();
+      dt.setData("text/plain", selectedMd);
+      dt.setData("text/html", markdownSelectionToClipboardHTML(selectedMd));
+      return sel;
+    };
+
     const domHandlers = EditorView.domEventHandlers({
-      compositionstart() {
-        composingRef.current = true;
-        return false;
-      },
-      compositionend(_event, view) {
-        composingRef.current = false;
-        queueMicrotask(() => {
-          if (view.composing || composingRef.current) return;
-          const docStr = view.state.doc.toString();
-          if (docStr !== valueRef.current) {
-            onChangeRef.current(docStr);
-          }
-        });
-        return false;
-      },
+      ...buildCMImeHandlers(composingRef, valueRef, onChangeRef, propSyncRef.current),
       copy(event, view) {
-        const sel = view.state.selection.main;
-        if (sel.empty || isCursorInFencedCode(view.state)) return false;
-        const selectedMd = view.state.sliceDoc(sel.from, sel.to);
-        if (!selectedMd) return false;
-        const dt = event.clipboardData;
-        if (!dt) return false;
-        event.preventDefault();
-        dt.setData("text/plain", selectedMd);
-        dt.setData("text/html", markdownSelectionToClipboardHTML(selectedMd));
-        return true;
+        return Boolean(writeMdSelectionClipboard(event, view));
       },
       cut(event, view) {
-        const sel = view.state.selection.main;
-        if (sel.empty || isCursorInFencedCode(view.state)) return false;
-        const selectedMd = view.state.sliceDoc(sel.from, sel.to);
-        if (!selectedMd) return false;
-        const dt = event.clipboardData;
-        if (!dt) return false;
-        event.preventDefault();
-        dt.setData("text/plain", selectedMd);
-        dt.setData("text/html", markdownSelectionToClipboardHTML(selectedMd));
+        const sel = writeMdSelectionClipboard(event, view);
+        if (!sel) return false;
         if (!view.state.readOnly) {
           view.dispatch({
             changes: { from: sel.from, to: sel.to, insert: "" },
@@ -8525,82 +7952,25 @@ ${rendered}
         return true;
       },
       paste(event, view) {
-        const dt = event.clipboardData;
-        if (!dt) return false;
-        const types = Array.from(dt.types || []);
-        const rawPlain = dt.getData("text/plain") || "";
-        const rawHTML = dt.getData("text/html") || "";
-        const mediaFiles = extractClipboardMediaFiles(dt);
-
-        // 1. Direct binary media paste (screenshot / OS file copy / Copy image)
-        if (shouldHandlePasteAsBinaryMedia(dt, mediaFiles, rawPlain, rawHTML)) {
-          event.preventDefault();
-          for (const f of mediaFiles) {
-            void uploadMediaFile(f);
-          }
-          return true;
-        }
-
-        // 2. Keep IDE code copies & pastes inside fenced code blocks as literal plain text
-        if (types.includes("vscode-editor-data") || types.includes("application/x-jetbrains-editor")) {
-          return false;
-        }
-        if (isCursorInFencedCode(view.state)) {
-          return false;
-        }
-
-        // 3. Rich webpage / Volo HTML -> clean GFM Markdown conversion (+ automatic base64 image upload)
-        if (rawHTML) {
-          const converted = clipboardHtmlToMarkdown(rawHTML);
-          if (converted && converted.markdown) {
-            event.preventDefault();
+        return handleRichPaste(
+          event,
+          () => isCursorInFencedCode(view.state),
+          (md, forceBlock) => {
             const sel = view.state.selection.main;
-            let toInsert = converted.markdown;
-            if (toInsert.includes("\n")) {
+            let toInsert = md;
+            if (forceBlock || toInsert.includes("\n")) {
               const charBefore = sel.from > 0 ? view.state.sliceDoc(sel.from - 1, sel.from) : "\n";
               const charAfter = sel.to < view.state.doc.length ? view.state.sliceDoc(sel.to, sel.to + 1) : "\n";
-              if (charBefore !== "\n" && !toInsert.startsWith("\n")) toInsert = "\n\n" + toInsert;
-              if (charAfter !== "\n" && !toInsert.endsWith("\n")) toInsert = toInsert + "\n\n";
+              if (charBefore !== "\n" && (forceBlock || !toInsert.startsWith("\n"))) toInsert = "\n\n" + toInsert;
+              if (charAfter !== "\n" && (forceBlock || !toInsert.endsWith("\n"))) toInsert = toInsert + "\n\n";
             }
             view.dispatch({
               changes: { from: sel.from, to: sel.to, insert: toInsert },
               selection: { anchor: sel.from + toInsert.length },
               userEvent: "input.paste",
             });
-            if (converted.pendingUploads.length > 0) {
-              void uploadPendingPasteImages(converted.pendingUploads);
-            }
-            return true;
           }
-        }
-
-        // 4. TSV (spreadsheet / database grid) -> GFM table fallback
-        const tableMd = tsvToMarkdownTable(rawPlain);
-        if (tableMd) {
-          event.preventDefault();
-          const sel = view.state.selection.main;
-          let toInsert = tableMd;
-          const charBefore = sel.from > 0 ? view.state.sliceDoc(sel.from - 1, sel.from) : "\n";
-          const charAfter = sel.to < view.state.doc.length ? view.state.sliceDoc(sel.to, sel.to + 1) : "\n";
-          if (charBefore !== "\n") toInsert = "\n\n" + toInsert;
-          if (charAfter !== "\n") toInsert = toInsert + "\n\n";
-          view.dispatch({
-            changes: { from: sel.from, to: sel.to, insert: toInsert },
-            selection: { anchor: sel.from + toInsert.length },
-            userEvent: "input.paste",
-          });
-          return true;
-        }
-
-        // 5. Fallback binary media file paste
-        if (mediaFiles.length > 0 && !rawPlain.trim()) {
-          event.preventDefault();
-          for (const f of mediaFiles) {
-            void uploadMediaFile(f);
-          }
-          return true;
-        }
-        return false;
+        );
       },
       drop(event, view) {
         const files = event.dataTransfer?.files;
@@ -8610,12 +7980,7 @@ ${rendered}
           if (dropPos !== null) {
             view.dispatch({ selection: { anchor: dropPos } });
           }
-          const list = Array.from(files);
-          void (async () => {
-            for (const f of list) {
-              await uploadMediaFile(f);
-            }
-          })();
+          void uploadMediaFiles(Array.from(files), true);
           return true;
         }
         return false;
@@ -8673,106 +8038,31 @@ ${rendered}
       ])
     );
 
+    const cmd = (key: string, fn: () => void) => ({
+      key,
+      run: () => {
+        fn();
+        return true;
+      },
+    });
+    const wrapKeys: Array<[string, string, string, string]> = [
+      ["Mod-b", "**", "**", "bold"],
+      ["Mod-i", "*", "*", "italic"],
+      ["Mod-u", "<u>", "</u>", "text"],
+      ["Mod-Shift-s", "~~", "~~", "text"],
+      ["Mod-e", "`", "`", "code"],
+      ["Mod-Shift-h", "==", "==", "text"],
+    ];
     const shortcutKeymap = keymap.of([
-      {
-        key: "Mod-s",
-        run: () => {
-          if (onSaveRef.current) {
-            onSaveRef.current();
-          } else {
-            window.dispatchEvent(new CustomEvent("volo:save"));
-          }
-          return true;
-        },
-      },
-      {
-        key: "Mod-f",
-        run: () => {
-          openFindBarRef.current(false);
-          return true;
-        },
-      },
-      {
-        key: "Mod-h",
-        run: () => {
-          openFindBarRef.current(true);
-          return true;
-        },
-      },
-      {
-        key: "Mod-/",
-        run: (v) => toggleEditorComment(v, false),
-      },
-      {
-        key: "Mod-Alt-c",
-        run: () => {
-          insertCodeBlockRef.current("bash");
-          return true;
-        },
-      },
-      {
-        key: "Mod-b",
-        run: () => {
-          wrapSelection("**", "**", "bold");
-          return true;
-        },
-      },
-      {
-        key: "Mod-i",
-        run: () => {
-          wrapSelection("*", "*", "italic");
-          return true;
-        },
-      },
-      {
-        key: "Mod-u",
-        run: () => {
-          wrapSelection("<u>", "</u>", "text");
-          return true;
-        },
-      },
-      {
-        key: "Mod-Shift-s",
-        run: () => {
-          wrapSelection("~~", "~~", "text");
-          return true;
-        },
-      },
-      {
-        key: "Mod-e",
-        run: () => {
-          wrapSelection("`", "`", "code");
-          return true;
-        },
-      },
-      {
-        key: "Mod-Shift-h",
-        run: () => {
-          wrapSelection("==", "==", "text");
-          return true;
-        },
-      },
-      {
-        key: "Mod-Shift-m",
-        run: () => {
-          insertSnippet("\n$$\nE = mc^2\n$$\n");
-          return true;
-        },
-      },
-      {
-        key: "Mod-k",
-        run: () => {
-          wrapSelection("[", "](https://)", t("ed.link_text_ph"));
-          return true;
-        },
-      },
-      {
-        key: "Mod-Shift-f",
-        run: () => {
-          setFullscreen((f) => !f);
-          return true;
-        },
-      },
+      cmd("Mod-s", () => (onSaveRef.current ? onSaveRef.current() : window.dispatchEvent(new CustomEvent("volo:save")))),
+      cmd("Mod-f", () => openFindBarRef.current(false)),
+      cmd("Mod-h", () => openFindBarRef.current(true)),
+      { key: "Mod-/", run: (v) => toggleEditorComment(v, false) },
+      cmd("Mod-Alt-c", () => insertCodeBlockRef.current("bash")),
+      ...wrapKeys.map(([key, b, a, fb]) => cmd(key, () => wrapSelection(b, a, fb))),
+      cmd("Mod-Shift-m", () => insertSnippet("\n$$\nE = mc^2\n$$\n")),
+      cmd("Mod-k", () => wrapSelection("[", "](https://)", t("ed.link_text_ph"))),
+      cmd("Mod-Shift-f", () => setFullscreen((f) => !f)),
     ]);
 
     const state = EditorState.create({
@@ -8791,8 +8081,10 @@ ${rendered}
         keymap.of([...voloBaseKeymap, ...historyKeymap]),
         domHandlers,
         EditorView.updateListener.of((update) => {
-          if (update.docChanged && !update.view.composing && !composingRef.current) {
-            onChangeRef.current(update.state.doc.toString());
+          if (update.docChanged && !isPropSyncUpdate(update) && !update.view.composing && !composingRef.current) {
+            const docStr = update.state.doc.toString();
+            recordEditorEmit(propSyncRef.current, docStr);
+            onChangeRef.current(docStr);
           }
           if (
             !update.view.composing &&
@@ -8861,6 +8153,22 @@ ${rendered}
       .catch(() => {});
   }, [quickInserts.length]);
 
+  const handleWysiwygLangChange = () => {
+    const root = wysiwygRef.current;
+    if (!root) return;
+    markWysiwygDirty(false);
+    commitWysiwygEdit(root, false);
+  };
+
+  const enhanceDom = (el: HTMLElement, isWysiwyg: boolean) =>
+    enhanceRenderedPreviewDOM(el, {
+      isWysiwyg,
+      copyLabel: t("ed.copy_code"),
+      copiedLabel: t("ed.copied"),
+      plainLabel: t("ed.code_plain"),
+      ...(isWysiwyg ? { onLangChange: handleWysiwygLangChange } : {}),
+    });
+
   useEffect(() => {
     const view = viewRef.current;
     if (view) {
@@ -8870,20 +8178,28 @@ ${rendered}
     }
     if (mode === "wysiwyg" && wysiwygRef.current) {
       wysiwygDirtyRef.current = false;
-      wysiwygForceSyncRef.current = true;
-      if (!wysiwygRef.current.innerHTML.trim()) {
-        wysiwygRef.current.innerHTML = previewHTML || `<p><br></p>`;
+      const curKey = `${curLocale}:${hasAudio ? 1 : 0}:${valueRef.current}`;
+      const cacheMatches = previewSourceRef.current === curKey && Boolean(previewHTML.trim());
+      if (cacheMatches) {
+        wysiwygForceSyncRef.current = false;
+        wysiwygAwaitingInitialSyncRef.current = false;
+        setWysiwygHydrating(false);
+        if (!wysiwygRef.current.innerHTML.trim()) {
+          wysiwygRef.current.innerHTML = previewHTML || `<p><br></p>`;
+        }
+        normalizeWysiwygDOM(wysiwygRef.current, t("common.delete"));
+        enhanceDom(wysiwygRef.current, true);
+        pushWysiwygHistory(wysiwygRef.current, true, true);
+      } else {
+        wysiwygForceSyncRef.current = true;
+        wysiwygAwaitingInitialSyncRef.current = true;
+        wysiwygRef.current.innerHTML = `<p><br></p>`;
+        wysiwygHistoryRef.current = { stack: [], idx: -1 };
+        setWysiwygHydrating(true);
       }
-      normalizeWysiwygDOM(wysiwygRef.current, t("common.delete"));
-      enhanceRenderedPreviewDOM(wysiwygRef.current, {
-        isWysiwyg: true,
-        copyLabel: t("ed.copy_code"),
-        copiedLabel: t("ed.copied"),
-        plainLabel: t("ed.code_plain"),
-        onLangChange: () => {
-          if (wysiwygRef.current) onChangeRef.current(htmlToMarkdown(wysiwygRef.current));
-        },
-      });
+    } else {
+      wysiwygAwaitingInitialSyncRef.current = false;
+      setWysiwygHydrating(false);
     }
   }, [mode]);
 
@@ -8896,54 +8212,66 @@ ${rendered}
   }, [curLocale]);
 
   useEffect(() => {
-    const view = viewRef.current;
-    if (!view) return;
-    if (view.composing || composingRef.current) return;
-    const cur = view.state.doc.toString();
-    if (cur !== value) {
-      const sel = view.state.selection.main;
-      const anchor = Math.min(sel.anchor, value.length);
-      const head = Math.min(sel.head, value.length);
-      view.dispatch({
-        changes: { from: 0, to: cur.length, insert: value },
-        selection: { anchor, head },
-      });
-    }
+    syncCMViewValue(viewRef.current, composingRef.current, propSyncRef.current, value);
   }, [value]);
 
   // Fetch server-rendered HTML for Split Preview (`sv`) and Visual (`wysiwyg`) modes
   useEffect(() => {
     if (mode === "ir") return;
+    const reqKey = mode === "wysiwyg" ? `${curLocale}:${hasAudio ? 1 : 0}:${value}` : null;
+    if (
+      mode === "wysiwyg" &&
+      previewSourceRef.current === reqKey &&
+      !wysiwygForceSyncRef.current &&
+      Boolean(previewHTML.trim())
+    ) {
+      return;
+    }
+    if (
+      mode === "wysiwyg" &&
+      wysiwygRef.current &&
+      !wysiwygForceSyncRef.current &&
+      Boolean(wysiwygRef.current.contains(document.activeElement))
+    ) {
+      return;
+    }
     const ctrl = new AbortController();
+    const delay = wysiwygAwaitingInitialSyncRef.current ? 0 : value.length > 20000 ? 450 : 180;
     const timer = window.setTimeout(async () => {
+      const reqSeq = wysiwygEditSeqRef.current;
       try {
         const html = await fetchPreviewHTML(value, curLocale, mode === "wysiwyg", Boolean(hasAudio), ctrl.signal);
         if (ctrl.signal.aborted) return;
+        if (mode === "wysiwyg" && reqSeq !== wysiwygEditSeqRef.current) {
+          return;
+        }
+        previewSourceRef.current = reqKey;
         setPreviewHTML(html);
         if (
           mode === "wysiwyg" &&
           wysiwygRef.current &&
           !wysiwygComposingRef.current &&
-          (wysiwygForceSyncRef.current || document.activeElement !== wysiwygRef.current)
+          reqSeq === wysiwygEditSeqRef.current &&
+          (wysiwygForceSyncRef.current || !wysiwygRef.current.contains(document.activeElement))
         ) {
+          const isInitialHydrate = wysiwygAwaitingInitialSyncRef.current;
+          wysiwygAwaitingInitialSyncRef.current = false;
           wysiwygForceSyncRef.current = false;
           wysiwygDirtyRef.current = false;
           wysiwygRef.current.innerHTML = html || `<p><br></p>`;
           normalizeWysiwygDOM(wysiwygRef.current, t("common.delete"));
-          enhanceRenderedPreviewDOM(wysiwygRef.current, {
-            isWysiwyg: true,
-            copyLabel: t("ed.copy_code"),
-            copiedLabel: t("ed.copied"),
-            plainLabel: t("ed.code_plain"),
-            onLangChange: () => {
-              if (wysiwygRef.current) onChangeRef.current(htmlToMarkdown(wysiwygRef.current));
-            },
-          });
+          enhanceDom(wysiwygRef.current, true);
+          pushWysiwygHistory(wysiwygRef.current, true, isInitialHydrate);
+          setWysiwygHydrating(false);
         }
       } catch {
-        // Ignore aborted or transient preview errors while typing
+        if (!ctrl.signal.aborted && mode === "wysiwyg") {
+          wysiwygAwaitingInitialSyncRef.current = false;
+          wysiwygForceSyncRef.current = false;
+          setWysiwygHydrating(false);
+        }
       }
-    }, 180);
+    }, delay);
     return () => {
       window.clearTimeout(timer);
       ctrl.abort();
@@ -8953,12 +8281,7 @@ ${rendered}
   // Enhance Split Preview (`sv`) DOM with KaTeX math, Mermaid diagrams, and code copy buttons
   useEffect(() => {
     if (mode !== "sv" || !previewRef.current) return;
-    enhanceRenderedPreviewDOM(previewRef.current, {
-      isWysiwyg: false,
-      copyLabel: t("ed.copy_code"),
-      copiedLabel: t("ed.copied"),
-      plainLabel: t("ed.code_plain"),
-    });
+    enhanceDom(previewRef.current, false);
   }, [mode, previewHTML, curLocale]);
 
   // Bidirectional heading-anchored + proportional scroll sync in Split Preview (`mode === "sv"`)
@@ -8981,10 +8304,10 @@ ${rendered}
 
     const normHeading = (s: string): string =>
       s
-        .replace(/!\[([^\]]*)\]\([^)]*\)/g, "$1")
-        .replace(/\[([^\]]+)\]\([^)]*\)/g, "$1")
-        .replace(/\[\[([^\]|]+)(?:\|([^\]]+))?\]\]/g, (_, a, b) => b || a)
-        .replace(/<[^>]+>/g, " ")
+        .replace(/!\[([^[\]]*)\]\(([^()\n]*(?:\([^()\n]*\)[^()\n]*)*)\)/g, "$1")
+        .replace(/\[([^[\]]+)\]\(([^()\n]*(?:\([^()\n]*\)[^()\n]*)*)\)/g, "$1")
+        .replace(/\[\[([^[\]|]+)(?:\|([^[\]]+))?\]\]/g, (_, a, b) => b || a)
+        .replace(/<[^<>]+>/g, " ")
         .replace(/[`*_~=^#<>|\\]/g, " ")
         .replace(/\s+/g, " ")
         .trim()
@@ -9025,9 +8348,10 @@ ${rendered}
           continue;
         }
         if (!fenceChar) {
-          const hm = /^ {0,3}(#{1,6})\s+(.+?)\s*#*\s*$/.exec(lineObj.text);
+          const hm = /^ {0,3}(#{1,6})[ \t]+(\S[^\n\r\u2028\u2029]*)$/.exec(lineObj.text);
           if (hm) {
-            mdHeads.push({ offset: lineObj.from, level: hm[1].length, norm: normHeading(hm[2]) });
+            const rawHeading = trimEndChars(hm[2].trimEnd(), "#").trimEnd();
+            mdHeads.push({ offset: lineObj.from, level: hm[1].length, norm: normHeading(rawHeading) });
           }
         }
       }
@@ -9376,22 +8700,7 @@ ${rendered}
         setActivePop("");
         return;
       }
-      const dims =
-        activePop === "heading"
-          ? { minW: 112, maxW: 180, maxH: 260, estH: 228 }
-          : activePop === "color"
-          ? { minW: 224, maxW: 260, maxH: 310, estH: 236 }
-          : activePop === "callout"
-          ? { minW: 196, maxW: 240, maxH: 250, estH: 200 }
-          : activePop === "codeblock"
-          ? { minW: 168, maxW: 220, maxH: 300, estH: 280 }
-          : activePop === "book"
-          ? { minW: 236, maxW: 290, maxH: 180, estH: 112 }
-          : activePop === "math"
-          ? { minW: 224, maxW: 280, maxH: 240, estH: 172 }
-          : activePop === "export"
-          ? { minW: 236, maxW: 300, maxH: 220, estH: 142 }
-          : { minW: 184, maxW: 260, maxH: 200, estH: 120 };
+      const dims = POP_DIMS[activePop] || { minW: 184, maxW: 260, maxH: 200, estH: 120 };
       const estH = popMenuRef.current?.offsetHeight || dims.estH;
       setPopStyle(
         computePortalMenuStyle(rect, {
@@ -9449,62 +8758,61 @@ ${rendered}
 
   // Load Quick Insert data dynamically with server-side search & pagination
   useEffect(() => {
-    if (!qiOpen || qiTab !== "media") return;
-    const params = new URLSearchParams({
-      refs: "0",
-      page: String(qiMediaPage),
-      per_page: "18",
-      page_size: "18",
-    });
-    if (debouncedQiMediaQ.trim()) params.set("q", debouncedQiMediaQ.trim());
-    if (qiMediaMime) params.set("mime", qiMediaMime);
-    apiFetch<{ items?: any[]; media?: any[]; total?: number }>(`/api/admin/media?${params.toString()}`)
+    if (!qiOpen) return;
+    if (qiTab !== "media" && qiTab !== "books" && qiTab !== "cite") return;
+    const isMedia = qiTab === "media";
+    const isBooks = qiTab === "books";
+    const per = isBooks ? "10" : isMedia ? "18" : "20";
+    const page = isMedia ? qiMediaPage : isBooks ? qiBooksPage : qiArtPage;
+    const q = (isMedia ? debouncedQiMediaQ : isBooks ? debouncedQiBookQ : debouncedQiArtQ).trim();
+    const params = new URLSearchParams({ page: String(page), per_page: per, page_size: per });
+    if (isMedia) params.set("refs", "0");
+    if (q) params.set("q", q);
+    if (isMedia && qiMediaMime) params.set("mime", qiMediaMime);
+    const ep = isMedia ? "media" : isBooks ? "books" : "articles";
+    apiFetch<any>(`/api/admin/${ep}?${params.toString()}`)
       .then((r) => {
-        const list = r.items || r.media || [];
-        setQiMedia(list);
-        setQiMediaTotal(typeof r.total === "number" ? r.total : list.length);
+        const rawList = r.items || r[ep] || [];
+        const list = qiTab === "cite" ? rawList.map((it: any) => it.article || it) : rawList;
+        const total = typeof r.total === "number" ? r.total : list.length;
+        if (isMedia) {
+          setQiMedia(list);
+          setQiMediaTotal(total);
+        } else if (isBooks) {
+          setQiBooks(list);
+          setQiBooksTotal(total);
+        } else {
+          setQiArticles(list);
+          setQiArtTotal(total);
+        }
       })
       .catch(() => {});
-  }, [qiOpen, qiTab, qiMediaPage, debouncedQiMediaQ, qiMediaMime]);
-
-  useEffect(() => {
-    if (!qiOpen || qiTab !== "books") return;
-    const params = new URLSearchParams({
-      page: String(qiBooksPage),
-      per_page: "10",
-      page_size: "10",
-    });
-    if (debouncedQiBookQ.trim()) params.set("q", debouncedQiBookQ.trim());
-    apiFetch<{ items?: any[]; books?: any[]; total?: number }>(`/api/admin/books?${params.toString()}`)
-      .then((r) => {
-        const list = r.items || r.books || [];
-        setQiBooks(list);
-        setQiBooksTotal(typeof r.total === "number" ? r.total : list.length);
-      })
-      .catch(() => {});
-  }, [qiOpen, qiTab, qiBooksPage, debouncedQiBookQ]);
-
-  useEffect(() => {
-    if (!qiOpen || qiTab !== "cite") return;
-    const params = new URLSearchParams({
-      page: String(qiArtPage),
-      per_page: "20",
-      page_size: "20",
-    });
-    if (debouncedQiArtQ.trim()) params.set("q", debouncedQiArtQ.trim());
-    apiFetch<{ items?: any[]; articles?: any[]; total?: number }>(`/api/admin/articles?${params.toString()}`)
-      .then((r) => {
-        const list = (r.items || r.articles || []).map((it: any) => it.article || it);
-        setQiArticles(list);
-        setQiArtTotal(typeof r.total === "number" ? r.total : list.length);
-      })
-      .catch(() => {});
-  }, [qiOpen, qiTab, qiArtPage, debouncedQiArtQ]);
+  }, [qiOpen, qiTab, qiMediaPage, debouncedQiMediaQ, qiMediaMime, qiBooksPage, debouncedQiBookQ, qiArtPage, debouncedQiArtQ]);
 
   const jumpToLine = (lineNo: number) => {
     setMobilePane("write");
+    if (mode === "wysiwyg") {
+      const root = wysiwygRef.current;
+      if (!root) return;
+      const targetIdx = outline.findIndex((it) => it.line === lineNo);
+      const headings = Array.from(root.querySelectorAll<HTMLElement>("h1, h2, h3, h4"));
+      const target =
+        (targetIdx >= 0 ? headings[targetIdx] : undefined) ||
+        (() => {
+          const item = outline.find((it) => it.line === lineNo);
+          if (!item) return undefined;
+          const want = item.text.replace(/\s+/g, " ").trim().toLowerCase();
+          return headings.find((h) => (h.textContent || "").replace(/\s+/g, " ").trim().toLowerCase() === want);
+        })();
+      if (target) {
+        target.scrollIntoView({ behavior: "smooth", block: "start" });
+        placeCaretInBlock(target, true);
+        root.focus();
+      }
+      return;
+    }
     const view = viewRef.current;
-    if (!view || mode === "wysiwyg") return;
+    if (!view) return;
     const safe = Math.min(Math.max(1, lineNo), view.state.doc.lines);
     const ln = view.state.doc.line(safe);
     view.dispatch({
@@ -9535,6 +8843,58 @@ ${rendered}
   };
 
   const mergedQuickInserts = quickInserts.length > 0 ? quickInserts : dynQuickInserts || [];
+  const edIco = (d: string, sw?: number) => (
+    <SvgIcon sw={sw}>
+      <path d={d} />
+    </SvgIcon>
+  );
+  const insertMediaAssetSnippet = (asset: {
+    id: string;
+    original_name?: string;
+    orig_filename?: string;
+    mime_type?: string;
+    public_url: string;
+  }) => {
+    const name = asset.orig_filename || asset.original_name || asset.id;
+    const mime = String(asset.mime_type || "");
+    const isImg = mime.startsWith("image/");
+    const safeMedia = safeMediaSrc(asset.public_url, { allowDataImage: isImg });
+    const safeLink = safeHref(asset.public_url);
+    if (isImg) {
+      if (safeMedia) insertSnippet(`![${name}](${safeMedia})`);
+    } else if (isVideoMedia(mime, asset.public_url)) {
+      if (safeMedia) insertSnippet(`\n<video controls preload="metadata" src="${safeMedia}"></video>\n`);
+    } else if (isAudioMedia(mime, asset.public_url)) {
+      if (safeMedia) insertSnippet(`\n<audio controls preload="metadata" src="${safeMedia}"></audio>\n`);
+    } else if (safeLink) {
+      insertSnippet(`[${name}](${safeLink})`);
+    }
+  };
+  const edBtn = (
+    tip: string,
+    onClick: () => void,
+    children: preact.ComponentChildren,
+    extraCls = "",
+    btnRef?: (el: HTMLButtonElement | null) => void
+  ) => (
+    <button
+      ref={btnRef}
+      type="button"
+      class={`volo-ed-btn${extraCls ? " " + extraCls : ""}`}
+      data-tip={tip}
+      aria-label={tip}
+      onClick={onClick}
+    >
+      {children}
+    </button>
+  );
+  const edPopBtn = (id: Exclude<ToolbarPopKind, "">, tip: string, children: preact.ComponentChildren) => (
+    <div class="volo-pop-wrap">
+      {edBtn(tip, () => togglePop(id), children, activePop === id ? "active" : "", (el) => {
+        popBtnRefs.current[id] = el;
+      })}
+    </div>
+  );
 
   return (
     <div
@@ -9551,258 +8911,132 @@ ${rendered}
       >
         <div class="volo-ed-tools">
           {/* Group 1: Undo / Redo */}
-          <button
-            type="button"
-            class="volo-ed-btn"
-            data-tip={t("ed.undo")}
-            aria-label={t("ed.undo")}
-            onClick={() => {
-              if (mode === "wysiwyg") document.execCommand("undo");
+          {edBtn(
+            t("ed.undo"),
+            () => {
+              if (mode === "wysiwyg") applyWysiwygHistoryStep(-1);
               else if (viewRef.current) undo(viewRef.current);
-            }}
-          >
-            <SvgIcon>
-              <path d="M9 14 4 9l5-5" />
-              <path d="M4 9h10.5a5.5 5.5 0 0 1 5.5 5.5v0a5.5 5.5 0 0 1-5.5 5.5H11" />
-            </SvgIcon>
-          </button>
-          <button
-            type="button"
-            class="volo-ed-btn"
-            data-tip={t("ed.redo")}
-            aria-label={t("ed.redo")}
-            onClick={() => {
-              if (mode === "wysiwyg") document.execCommand("redo");
+            },
+            edIco("M9 14 4 9l5-5M4 9h10.5a5.5 5.5 0 0 1 5.5 5.5v0a5.5 5.5 0 0 1-5.5 5.5H11")
+          )}
+          {edBtn(
+            t("ed.redo"),
+            () => {
+              if (mode === "wysiwyg") applyWysiwygHistoryStep(1);
               else if (viewRef.current) redo(viewRef.current);
-            }}
-          >
-            <SvgIcon>
-              <path d="m15 14 5-5-5-5" />
-              <path d="M20 9H9.5A5.5 5.5 0 0 0 4 14.5v0A5.5 5.5 0 0 0 9.5 20H13" />
-            </SvgIcon>
-          </button>
+            },
+            edIco("m15 14 5-5-5-5M20 9H9.5A5.5 5.5 0 0 0 4 14.5v0A5.5 5.5 0 0 0 9.5 20H13")
+          )}
 
           <span class="volo-ed-sep" />
 
           {/* Group 2: Heading, Typography & Color/Highlight */}
-          <div class="volo-pop-wrap">
-            <button
-              ref={(el) => {
-                popBtnRefs.current.heading = el;
-              }}
-              type="button"
-              class={`volo-ed-btn ${activePop === "heading" ? "active" : ""}`}
-              data-tip={t("ed.heading")}
-              aria-label={t("ed.heading")}
-              onClick={() => togglePop("heading")}
-            >
-              <span style={{ fontWeight: 750, fontSize: "12.5px" }}>H▾</span>
-            </button>
-          </div>
+          {edPopBtn("heading", t("ed.heading"), <span style={{ fontWeight: 750, fontSize: "12.5px" }}>H▾</span>)}
 
-          <button
-            type="button"
-            class="volo-ed-btn"
-            data-tip={t("ed.bold")}
-            aria-label={t("ed.bold")}
-            onClick={() => wrapSelection("**", "**", "bold")}
-          >
-            <SvgIcon sw={2.1}>
-              <path d="M6 4h8a4 4 0 0 1 4 4 4 4 0 0 1-4 4H6z" />
-              <path d="M6 12h9a4 4 0 0 1 4 4 4 4 0 0 1-4 4H6z" />
-            </SvgIcon>
-          </button>
-          <button
-            type="button"
-            class="volo-ed-btn"
-            data-tip={t("ed.italic")}
-            aria-label={t("ed.italic")}
-            onClick={() => wrapSelection("*", "*", "italic")}
-          >
-            <SvgIcon sw={2}>
-              <line x1="19" y1="4" x2="10" y2="4" />
-              <line x1="14" y1="20" x2="5" y2="20" />
-              <line x1="15" y1="4" x2="9" y2="20" />
-            </SvgIcon>
-          </button>
-          <button
-            type="button"
-            class="volo-ed-btn"
-            data-tip={t("ed.strike")}
-            aria-label={t("ed.strike")}
-            onClick={() => wrapSelection("~~", "~~", "text")}
-          >
-            <SvgIcon>
-              <path d="M16 4H9a3 3 0 0 0-2.83 4" />
-              <path d="M14 12a4 4 0 0 1 0 8H6" />
-              <line x1="4" y1="12" x2="20" y2="12" />
-            </SvgIcon>
-          </button>
+          {edBtn(
+            t("ed.bold"),
+            () => wrapSelection("**", "**", "bold"),
+            edIco("M6 4h8a4 4 0 0 1 4 4 4 4 0 0 1-4 4H6zM6 12h9a4 4 0 0 1 4 4 4 4 0 0 1-4 4H6z", 2.1)
+          )}
+          {edBtn(
+            t("ed.italic"),
+            () => wrapSelection("*", "*", "italic"),
+            edIco("M19 4H10M14 20H5M15 4 9 20", 2)
+          )}
+          {edBtn(
+            t("ed.strike"),
+            () => wrapSelection("~~", "~~", "text"),
+            edIco("M16 4H9a3 3 0 0 0-2.83 4M14 12a4 4 0 0 1 0 8H6M4 12h16")
+          )}
 
           {/* Text Color, Highlight (<mark>) & Underline (<u>) Popover */}
-          <div class="volo-pop-wrap">
-            <button
-              ref={(el) => {
-                popBtnRefs.current.color = el;
-              }}
-              type="button"
-              class={`volo-ed-btn ${activePop === "color" ? "active" : ""}`}
-              data-tip={t("ed.text_color")}
-              aria-label={t("ed.text_color")}
-              onClick={() => togglePop("color")}
-            >
-              <span class="volo-ed-color-glyph">
-                <span>A</span>
-                <i />
-              </span>
-            </button>
-          </div>
+          {edPopBtn(
+            "color",
+            t("ed.text_color"),
+            <span class="volo-ed-color-glyph">
+              <span>A</span>
+              <i />
+            </span>
+          )}
 
-          <button
-            type="button"
-            class="volo-ed-btn"
-            data-tip={t("ed.code")}
-            aria-label={t("ed.code")}
-            onClick={() => wrapSelection("`", "`", "code")}
-          >
-            <SvgIcon>
-              <polyline points="16 18 22 12 16 6" />
-              <polyline points="8 6 2 12 8 18" />
-            </SvgIcon>
-          </button>
+          {edBtn(t("ed.code"), () => wrapSelection("`", "`", "code"), edIco("M16 18 22 12 16 6M8 6 2 12 8 18"))}
 
           <span class="volo-ed-sep" />
 
           {/* Group 3: Quote, Callout, Bullet / Ordered / Task Lists */}
-          <button
-            type="button"
-            class="volo-ed-btn"
-            data-tip={t("ed.quote")}
-            aria-label={t("ed.quote")}
-            onClick={() => prefixCurrentLine("> ")}
-          >
+          {edBtn(
+            t("ed.quote"),
+            () => prefixCurrentLine("> "),
+            edIco(
+              "M3 21c3 0 7-1 7-8V5c0-1.25-.756-2.017-2-2H4c-1.25 0-2 .75-2 1.972V11c0 1.25.75 2 2 2 1 0 1 0 1 1v1c0 1-1 2-2 2s-1 .008-1 1.031V20c0 1 0 1 1 1zM15 21c3 0 7-1 7-8V5c0-1.25-.757-2.017-2-2h-4c-1.25 0-2 .75-2 1.972V11c0 1.25.75 2 2 2h.75c0 2.25.25 4-2.75 4v3c0 1 0 1 1 1z"
+            )
+          )}
+
+          {edPopBtn(
+            "callout",
+            t("ed.callout"),
             <SvgIcon>
-              <path d="M3 21c3 0 7-1 7-8V5c0-1.25-.756-2.017-2-2H4c-1.25 0-2 .75-2 1.972V11c0 1.25.75 2 2 2 1 0 1 0 1 1v1c0 1-1 2-2 2s-1 .008-1 1.031V20c0 1 0 1 1 1z" />
-              <path d="M15 21c3 0 7-1 7-8V5c0-1.25-.757-2.017-2-2h-4c-1.25 0-2 .75-2 1.972V11c0 1.25.75 2 2 2h.75c0 2.25.25 4-2.75 4v3c0 1 0 1 1 1z" />
+              <circle cx="12" cy="12" r="9" />
+              <path d="M12 8v4M12 16h.01" />
             </SvgIcon>
-          </button>
+          )}
 
-          <div class="volo-pop-wrap">
-            <button
-              ref={(el) => {
-                popBtnRefs.current.callout = el;
-              }}
-              type="button"
-              class={`volo-ed-btn ${activePop === "callout" ? "active" : ""}`}
-              data-tip={t("ed.callout")}
-              aria-label={t("ed.callout")}
-              onClick={() => togglePop("callout")}
-            >
-              <SvgIcon>
-                <circle cx="12" cy="12" r="9" />
-                <line x1="12" y1="8" x2="12" y2="12" />
-                <line x1="12" y1="16" x2="12.01" y2="16" />
-              </SvgIcon>
-            </button>
-          </div>
-
-          <button
-            type="button"
-            class="volo-ed-btn"
-            data-tip={t("ed.ul")}
-            aria-label={t("ed.ul")}
-            onClick={() => prefixCurrentLine("- ")}
-          >
+          {edBtn(
+            t("ed.ul"),
+            () => prefixCurrentLine("- "),
             <SvgIcon>
-              <line x1="8" y1="6" x2="21" y2="6" />
-              <line x1="8" y1="12" x2="21" y2="12" />
-              <line x1="8" y1="18" x2="21" y2="18" />
+              <path d="M8 6h13M8 12h13M8 18h13" />
               <circle cx="4" cy="6" r="1" fill="currentColor" />
               <circle cx="4" cy="12" r="1" fill="currentColor" />
               <circle cx="4" cy="18" r="1" fill="currentColor" />
             </SvgIcon>
-          </button>
-          <button
-            type="button"
-            class="volo-ed-btn"
-            data-tip={t("ed.ol")}
-            aria-label={t("ed.ol")}
-            onClick={() => prefixCurrentLine("1. ")}
-          >
-            <SvgIcon>
-              <line x1="10" y1="6" x2="21" y2="6" />
-              <line x1="10" y1="12" x2="21" y2="12" />
-              <line x1="10" y1="18" x2="21" y2="18" />
-              <path d="M4 6h1v4" />
-              <path d="M4 10h2" />
-              <path d="M6 18H4c0-1 2-2 2-3s-1-1.5-2-1" />
-            </SvgIcon>
-          </button>
-          <button
-            type="button"
-            class="volo-ed-btn"
-            data-tip={t("ed.task")}
-            aria-label={t("ed.task")}
-            onClick={() => prefixCurrentLine("- [ ] ")}
-          >
+          )}
+          {edBtn(
+            t("ed.ol"),
+            () => prefixCurrentLine("1. "),
+            edIco("M10 6h11M10 12h11M10 18h11M4 6h1v4M4 10h2M6 18H4c0-1 2-2 2-3s-1-1.5-2-1")
+          )}
+          {edBtn(
+            t("ed.task"),
+            () => prefixCurrentLine("- [ ] "),
             <SvgIcon>
               <rect x="3" y="5" width="6" height="6" rx="1.2" />
-              <path d="m3 17 2 2 4-4" />
-              <line x1="13" y1="8" x2="21" y2="8" />
-              <line x1="13" y1="17" x2="21" y2="17" />
+              <path d="m3 17 2 2 4-4M13 8h8M13 17h8" />
             </SvgIcon>
-          </button>
+          )}
 
           <span class="volo-ed-sep" />
 
           {/* Group 4: Link, Media, Table, Code Block, Divider */}
-          <button
-            type="button"
-            class="volo-ed-btn"
-            data-tip={t("ed.link")}
-            aria-label={t("ed.link")}
-            onClick={() => wrapSelection("[", "](https://)", t("ed.link_text_ph"))}
-          >
-            <SvgIcon>
-              <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71" />
-              <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71" />
-            </SvgIcon>
-          </button>
+          {edBtn(
+            t("ed.link"),
+            () => wrapSelection("[", "](https://)", t("ed.link_text_ph")),
+            edIco(
+              "M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"
+            )
+          )}
 
-          <div class="volo-pop-wrap">
-            <button
-              ref={(el) => {
-                popBtnRefs.current.media = el;
-              }}
-              type="button"
-              class={`volo-ed-btn ${activePop === "media" ? "active" : ""}`}
-              data-tip={uploading ? t("ed.uploading") : t("ed.upload_media")}
-              aria-label={uploading ? t("ed.uploading") : t("ed.upload_media")}
-              onClick={() => togglePop("media")}
-            >
-              <SvgIcon>
-                <rect x="3" y="3" width="18" height="18" rx="2" />
-                <circle cx="8.5" cy="8.5" r="1.5" />
-                <polyline points="21 15 16 10 5 21" />
-              </SvgIcon>
-            </button>
-            <input
-              ref={fileInputRef}
-              type="file"
-              multiple
-              accept="image/*,audio/*,video/*"
-              style={{ display: "none" }}
-              onChange={(e) => {
-                const files = Array.from((e.currentTarget as HTMLInputElement).files || []);
-                (e.currentTarget as HTMLInputElement).value = "";
-                void (async () => {
-                  for (const f of files) {
-                    await uploadMediaFile(f);
-                  }
-                })();
-              }}
-            />
-          </div>
+          {edPopBtn(
+            "media",
+            uploading ? t("ed.uploading") : t("ed.upload_media"),
+            <SvgIcon>
+              <rect x="3" y="3" width="18" height="18" rx="2" />
+              <circle cx="8.5" cy="8.5" r="1.5" />
+              <path d="M21 15 16 10 5 21" />
+            </SvgIcon>
+          )}
+          <input
+            ref={fileInputRef}
+            type="file"
+            multiple
+            accept="image/*,audio/*,video/*"
+            style={{ display: "none" }}
+            onChange={(e) => {
+              const files = Array.from((e.currentTarget as HTMLInputElement).files || []);
+              (e.currentTarget as HTMLInputElement).value = "";
+              void uploadMediaFiles(files, true);
+            }}
+          />
 
           <button
             type="button"
@@ -9820,150 +9054,85 @@ ${rendered}
             ) : (
               <SvgIcon>
                 <rect x="9" y="2" width="6" height="12" rx="3" />
-                <path d="M5 10a7 7 0 0 0 14 0" />
-                <line x1="12" y1="17" x2="12" y2="21" />
-                <line x1="8" y1="21" x2="16" y2="21" />
+                <path d="M5 10a7 7 0 0 0 14 0M12 17v4M8 21h8" />
               </SvgIcon>
             )}
           </button>
 
-          <button
-            type="button"
-            class="volo-ed-btn"
-            data-tip={t("ed.table")}
-            aria-label={t("ed.table")}
-            onClick={() => insertSnippet(`\n${t("ed.table_tpl")}\n`)}
-          >
+          {edBtn(
+            t("ed.table"),
+            () => insertSnippet(`\n${t("ed.table_tpl")}\n`),
             <SvgIcon>
               <rect x="3" y="3" width="18" height="18" rx="2" />
-              <line x1="3" y1="9" x2="21" y2="9" />
-              <line x1="3" y1="15" x2="21" y2="15" />
-              <line x1="9" y1="3" x2="9" y2="21" />
-              <line x1="15" y1="3" x2="15" y2="21" />
+              <path d="M3 9h18M3 15h18M9 3v18M15 3v18" />
             </SvgIcon>
-          </button>
-          <div class="volo-pop-wrap">
-            <button
-              ref={(el) => {
-                popBtnRefs.current.codeblock = el;
-              }}
-              type="button"
-              class={`volo-ed-btn ${activePop === "codeblock" ? "active" : ""}`}
-              data-tip={t("ed.code_block")}
-              aria-label={t("ed.code_block")}
-              onClick={() => togglePop("codeblock")}
-            >
-              <SvgIcon>
-                <rect x="3" y="4" width="18" height="16" rx="2" />
-                <polyline points="8 10 11 12.5 8 15" />
-                <line x1="13" y1="15" x2="16" y2="15" />
-              </SvgIcon>
-            </button>
-          </div>
-
-          <div class="volo-pop-wrap">
-            <button
-              ref={(el) => {
-                popBtnRefs.current.math = el;
-              }}
-              type="button"
-              class={`volo-ed-btn ${activePop === "math" ? "active" : ""}`}
-              data-tip={t("ed.math_mermaid")}
-              aria-label={t("ed.math_mermaid")}
-              onClick={() => togglePop("math")}
-            >
-              <span style={{ fontWeight: 720, fontSize: "13px", fontFamily: "serif" }}>∑</span>
-            </button>
-          </div>
-
-          <button
-            type="button"
-            class="volo-ed-btn"
-            data-tip={t("ed.hr")}
-            aria-label={t("ed.hr")}
-            onClick={() => insertSnippet("\n---\n")}
-          >
+          )}
+          {edPopBtn(
+            "codeblock",
+            t("ed.code_block"),
             <SvgIcon>
-              <line x1="4" y1="12" x2="20" y2="12" />
+              <rect x="3" y="4" width="18" height="16" rx="2" />
+              <path d="M8 10 11 12.5 8 15M13 15h3" />
             </SvgIcon>
-          </button>
+          )}
+
+          {edPopBtn(
+            "math",
+            t("ed.math_mermaid"),
+            <span style={{ fontWeight: 720, fontSize: "13px", fontFamily: "serif" }}>∑</span>
+          )}
+
+          {edBtn(t("ed.hr"), () => insertSnippet("\n---\n"), edIco("M4 12h16"))}
 
           <span class="volo-ed-sep" />
 
           {/* Group 5: Volo Extension Shortcuts (Reader Lock, Password Lock, Embedded Bookshelf, Quick Insert Hub) */}
-          <button
-            type="button"
-            class="volo-ed-btn"
-            data-tip={t("ed.sc_lock_user")}
-            aria-label={t("ed.sc_lock_user")}
-            onClick={() => {
+          {edBtn(
+            t("ed.sc_lock_user"),
+            () => {
               const sel = getSelectedText().trim();
               if (sel) {
                 wrapSelection(`\n:::lock type="user"\n`, `\n:::\n`, sel);
               } else {
                 insertSnippet(`\n:::lock type="user"\n${t("ed.lock_user_ph")}\n:::\n`);
               }
-            }}
-          >
+            },
             <SvgIcon sw={1.85}>
-              <path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2" />
+              <path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2M17 13v-1.5a1.5 1.5 0 0 1 3 0V13" />
               <circle cx="9" cy="7" r="4" />
               <rect x="15" y="13" width="7" height="6" rx="1.2" />
-              <path d="M17 13v-1.5a1.5 1.5 0 0 1 3 0V13" />
             </SvgIcon>
-          </button>
+          )}
 
-          <button
-            type="button"
-            class="volo-ed-btn"
-            data-tip={t("ed.sc_lock_pwd")}
-            aria-label={t("ed.sc_lock_pwd")}
-            onClick={() => {
+          {edBtn(
+            t("ed.sc_lock_pwd"),
+            () => {
               const sel = getSelectedText().trim();
               if (sel) setLockBody(sel);
               setLockMode("pwd");
               setQiTab("lock");
               setQiOpen(true);
-            }}
-          >
+            },
             <SvgIcon sw={1.85}>
               <rect x="5" y="11" width="14" height="10" rx="2" />
               <path d="M8 11V7a4 4 0 0 1 8 0v4" />
               <circle cx="12" cy="16" r="1" fill="currentColor" />
             </SvgIcon>
-          </button>
+          )}
 
-          <div class="volo-pop-wrap">
-            <button
-              ref={(el) => {
-                popBtnRefs.current.book = el;
-              }}
-              type="button"
-              class={`volo-ed-btn ${activePop === "book" ? "active" : ""}`}
-              data-tip={t("ed.sc_bookshelf")}
-              aria-label={t("ed.sc_bookshelf")}
-              onClick={() => togglePop("book")}
-            >
-              <SvgIcon sw={1.85}>
-                <path d="M2 4h6a4 4 0 0 1 4 4v13a3 3 0 0 0-3-3H2z" />
-                <path d="M22 4h-6a4 4 0 0 0-4 4v13a3 3 0 0 1 3-3h7z" />
-              </SvgIcon>
-            </button>
-          </div>
+          {edPopBtn(
+            "book",
+            t("ed.sc_bookshelf"),
+            edIco("M2 4h6a4 4 0 0 1 4 4v13a3 3 0 0 0-3-3H2zM22 4h-6a4 4 0 0 0-4 4v13a3 3 0 0 1 3-3h7z", 1.85)
+          )}
 
           {/* Quick Insert + Modal Trigger */}
-          <button
-            type="button"
-            class="volo-ed-btn volo-ed-btn-accent"
-            data-tip={t("ed.quick_insert")}
-            aria-label={t("ed.quick_insert")}
-            onClick={() => setQiOpen(true)}
-          >
-            <SvgIcon sw={2.1}>
-              <line x1="12" y1="5" x2="12" y2="19" />
-              <line x1="5" y1="12" x2="19" y2="12" />
-            </SvgIcon>
-          </button>
+          {edBtn(
+            t("ed.quick_insert"),
+            () => setQiOpen(true),
+            edIco("M12 5v14M5 12h14", 2.1),
+            "volo-ed-btn-accent"
+          )}
 
           {mergedQuickInserts.map((qi) => (
             <button
@@ -9980,150 +9149,78 @@ ${rendered}
         {/* Right Controls: 3-Mode Switcher + Sync Scroll (in sv) + Find + Outline + Export + Fullscreen */}
         <div class="volo-ed-right">
           <div class="volo-ed-modes" role="tablist">
-            <button
-              type="button"
-              role="tab"
-              aria-selected={mode === "ir"}
-              class={`volo-ed-mode-btn ${mode === "ir" ? "active" : ""}`}
-              onClick={() => {
-                switchMode("ir");
-                setMobilePane("write");
-              }}
-            >
-              {t("ed.mode_ir")}
-            </button>
-            <button
-              type="button"
-              role="tab"
-              aria-selected={mode === "wysiwyg"}
-              class={`volo-ed-mode-btn ${mode === "wysiwyg" ? "active" : ""}`}
-              onClick={() => {
-                switchMode("wysiwyg");
-                setMobilePane("write");
-              }}
-            >
-              {t("ed.mode_wysiwyg")}
-            </button>
-            <button
-              type="button"
-              role="tab"
-              aria-selected={mode === "sv"}
-              class={`volo-ed-mode-btn ${mode === "sv" ? "active" : ""}`}
-              onClick={() => switchMode("sv")}
-            >
-              {t("ed.mode_sv")}
-            </button>
+            {(["ir", "wysiwyg", "sv"] as const).map((mKey) => (
+              <button
+                key={mKey}
+                type="button"
+                role="tab"
+                aria-selected={mode === mKey}
+                class={`volo-ed-mode-btn ${mode === mKey ? "active" : ""}`}
+                onClick={() => {
+                  switchMode(mKey);
+                  if (mKey !== "sv") setMobilePane("write");
+                }}
+              >
+                {t(`ed.mode_${mKey}`)}
+              </button>
+            ))}
           </div>
 
-          {mode === "sv" && (
-            <button
-              type="button"
-              class={`volo-ed-btn ${syncScroll ? "active" : ""}`}
-              data-tip={t("ed.sync_scroll")}
-              aria-label={t("ed.sync_scroll")}
-              onClick={() =>
+          {mode === "sv" &&
+            edBtn(
+              t("ed.sync_scroll"),
+              () =>
                 setSyncScroll((prev) => {
                   const next = !prev;
                   localStorage.setItem("volo_editor_sync_scroll", next ? "1" : "0");
                   return next;
-                })
-              }
-            >
-              <SvgIcon>
-                <path d="m7 7 3-3 3 3" />
-                <path d="M10 4v11" />
-                <path d="m17 17-3 3-3-3" />
-                <path d="M14 20V9" />
-              </SvgIcon>
-            </button>
+                }),
+              edIco("m7 7 3-3 3 3M10 4v11m7 2-3 3-3-3m3 3V9"),
+              syncScroll ? "active" : ""
+            )}
+
+          {edBtn(
+            t("ed.find_replace"),
+            () => (findOpen ? closeFindBar() : openFindBar(false)),
+            edIco("M18 11a7 7 0 1 1-14 0 7 7 0 0 1 14 0Zm2 9-3.9-3.9"),
+            findOpen ? "active" : ""
           )}
 
-          <button
-            type="button"
-            class={`volo-ed-btn ${findOpen ? "active" : ""}`}
-            data-tip={t("ed.find_replace")}
-            aria-label={t("ed.find_replace")}
-            onClick={() => (findOpen ? closeFindBar() : openFindBar(false))}
-          >
-            <SvgIcon>
-              <circle cx="11" cy="11" r="7" />
-              <line x1="20" y1="20" x2="16.1" y2="16.1" />
-            </SvgIcon>
-          </button>
-
-          <button
-            type="button"
-            class={`volo-ed-btn ${showOutline ? "active" : ""}`}
-            data-tip={t("ed.outline")}
-            aria-label={t("ed.outline")}
-            onClick={() =>
+          {edBtn(
+            t("ed.outline"),
+            () =>
               setShowOutline((v) => {
                 const next = !v;
                 if (next) setMobilePane("outline");
                 else if (mobilePane === "outline") setMobilePane("write");
                 return next;
-              })
-            }
-          >
-            <SvgIcon>
-              <line x1="3" y1="6" x2="21" y2="6" />
-              <line x1="7" y1="12" x2="21" y2="12" />
-              <line x1="11" y1="18" x2="21" y2="18" />
-            </SvgIcon>
-          </button>
+              }),
+            edIco("M3 6h18M7 12h14M11 18h10"),
+            showOutline ? "active" : ""
+          )}
 
-          <div class="volo-pop-wrap">
-            <button
-              ref={(el) => {
-                popBtnRefs.current.export = el;
-              }}
-              type="button"
-              class={`volo-ed-btn ${activePop === "export" ? "active" : ""}`}
-              data-tip={t("ed.export")}
-              aria-label={t("ed.export")}
-              onClick={() => togglePop("export")}
-            >
-              <SvgIcon>
-                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
-                <polyline points="7 10 12 15 17 10" />
-                <line x1="12" y1="15" x2="12" y2="3" />
-              </SvgIcon>
-            </button>
-          </div>
+          {edPopBtn(
+            "export",
+            t("ed.export"),
+            edIco("M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3")
+          )}
 
           {fullscreen && onSave && (
-            <button
-              type="button"
-              class="volo-btn volo-btn-primary volo-btn-sm"
-              onClick={() => onSave()}
-            >
+            <button type="button" class="volo-btn volo-btn-primary volo-btn-sm" onClick={() => onSave()}>
               {t("common.save")}
             </button>
           )}
 
-          <button
-            type="button"
-            class={`volo-ed-btn ${fullscreen ? "active" : ""}`}
-            data-tip={fullscreen ? t("ed.exit_fullscreen") : t("ed.fullscreen")}
-            aria-label={fullscreen ? t("ed.exit_fullscreen") : t("ed.fullscreen")}
-            onClick={toggleFullscreen}
-          >
-            {fullscreen ? (
-              <SvgIcon>
-                <path d="M8 3v3a2 2 0 0 1-2 2H3" />
-                <path d="M21 8h-3a2 2 0 0 1-2-2V3" />
-                <path d="M3 16h3a2 2 0 0 1 2 2v3" />
-                <path d="M16 21v-3a2 2 0 0 1 2-2h3" />
-              </SvgIcon>
-            ) : (
-              <SvgIcon>
-                <polyline points="15 3 21 3 21 9" />
-                <polyline points="9 21 3 21 3 15" />
-                <line x1="21" y1="3" x2="14" y2="10" />
-                <line x1="3" y1="21" x2="10" y2="14" />
-              </SvgIcon>
-            )}
-          </button>
+          {edBtn(
+            fullscreen ? t("ed.exit_fullscreen") : t("ed.fullscreen"),
+            toggleFullscreen,
+            edIco(
+              fullscreen
+                ? "M8 3v3a2 2 0 0 1-2 2H3M21 8h-3a2 2 0 0 1-2-2V3M3 16h3a2 2 0 0 1 2 2v3M16 21v-3a2 2 0 0 1 2-2h3"
+                : "M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"
+            ),
+            fullscreen ? "active" : ""
+          )}
         </div>
       </div>
 
@@ -10150,70 +9247,39 @@ ${rendered}
             {activePop === "color" && (
               <div class="volo-color-pop">
                 <div class="volo-color-swatches">
-                  {EDITOR_SWATCHES.map((sw) => (
+                  {EDITOR_SWATCHES.map((color) => (
                     <button
-                      key={sw.color}
+                      key={color}
                       type="button"
                       class="volo-color-swatch"
-                      title={sw.label}
-                      style={{ background: sw.color }}
+                      title={color.toUpperCase()}
+                      style={{ background: color }}
                       onClick={() => {
-                        applyColorStyle(sw.color);
+                        applyColorStyle(color);
                         setActivePop("");
                       }}
                     />
                   ))}
                 </div>
-                <button
-                  type="button"
-                  class="volo-cselect-item"
-                  onClick={() => {
-                    wrapSelection("==", "==", "text");
-                    setActivePop("");
-                  }}
-                >
-                  <span class="volo-cselect-item-text">{t("ed.color_mark")}</span>
-                </button>
-                <button
-                  type="button"
-                  class="volo-cselect-item"
-                  onClick={() => {
-                    wrapSelection("<u>", "</u>", "text");
-                    setActivePop("");
-                  }}
-                >
-                  <span class="volo-cselect-item-text">{t("ed.underline")}</span>
-                </button>
-                <button
-                  type="button"
-                  class="volo-cselect-item"
-                  onClick={() => {
-                    wrapSelection("^", "^", "2");
-                    setActivePop("");
-                  }}
-                >
-                  <span class="volo-cselect-item-text">{t("ed.sup")}</span>
-                </button>
-                <button
-                  type="button"
-                  class="volo-cselect-item"
-                  onClick={() => {
-                    wrapSelection("~", "~", "2");
-                    setActivePop("");
-                  }}
-                >
-                  <span class="volo-cselect-item-text">{t("ed.sub")}</span>
-                </button>
-                <button
-                  type="button"
-                  class="volo-cselect-item"
-                  onClick={() => {
-                    clearInlineStyle();
-                    setActivePop("");
-                  }}
-                >
-                  <span class="volo-cselect-item-text">{t("ed.color_clear")}</span>
-                </button>
+                {[
+                  [t("ed.color_mark"), () => wrapSelection("==", "==", "text")],
+                  [t("ed.underline"), () => wrapSelection("<u>", "</u>", "text")],
+                  [t("ed.sup"), () => wrapSelection("^", "^", "2")],
+                  [t("ed.sub"), () => wrapSelection("~", "~", "2")],
+                  [t("ed.color_clear"), () => clearInlineStyle()],
+                ].map(([lbl, fn], idx) => (
+                  <button
+                    key={idx}
+                    type="button"
+                    class="volo-cselect-item"
+                    onClick={() => {
+                      (fn as () => void)();
+                      setActivePop("");
+                    }}
+                  >
+                    <span class="volo-cselect-item-text">{lbl as string}</span>
+                  </button>
+                ))}
               </div>
             )}
 
@@ -10269,76 +9335,37 @@ ${rendered}
               </>
             )}
 
-            {activePop === "book" && (
-              <>
+            {(activePop === "book" || activePop === "math" || activePop === "export") &&
+              (activePop === "book"
+                ? [
+                    [t("ed.sc_bookshelf_all"), () => insertSnippet("\n:::bookshelf\n:::\n")],
+                    [t("ed.sc_book_pick"), () => { setQiTab("books"); setQiOpen(true); }],
+                  ]
+                : activePop === "math"
+                ? [
+                    [t("ed.math_inline"), () => wrapSelection("$", "$", "E = mc^2")],
+                    [t("ed.math_block"), () => insertSnippet("\n$$\n\\int_0^\\infty e^{-x^2}\\,dx = \\frac{\\sqrt{\\pi}}{2}\n$$\n")],
+                    [t("ed.mermaid_diagram"), () => insertSnippet("\n```mermaid\nflowchart LR\n  A[Start] --> B[Done]\n```\n")],
+                    [t("ed.insert_toc"), () => insertSnippet("\n[toc]\n")],
+                  ]
+                : [
+                    [t("ed.export_md"), () => void exportEditorDocument("md")],
+                    [t("ed.export_html"), () => void exportEditorDocument("html")],
+                    [t("ed.copy_rich_html"), () => void exportEditorDocument("rich_copy")],
+                  ]
+              ).map(([lbl, fn], idx) => (
                 <button
+                  key={idx}
                   type="button"
                   class="volo-cselect-item"
                   onClick={() => {
                     setActivePop("");
-                    insertSnippet("\n:::bookshelf\n:::\n");
+                    (fn as () => void)();
                   }}
                 >
-                  <span class="volo-cselect-item-text">{t("ed.sc_bookshelf_all")}</span>
+                  <span class="volo-cselect-item-text">{lbl as string}</span>
                 </button>
-                <button
-                  type="button"
-                  class="volo-cselect-item"
-                  onClick={() => {
-                    setActivePop("");
-                    setQiTab("books");
-                    setQiOpen(true);
-                  }}
-                >
-                  <span class="volo-cselect-item-text">{t("ed.sc_book_pick")}</span>
-                </button>
-              </>
-            )}
-
-            {activePop === "math" && (
-              <>
-                <button
-                  type="button"
-                  class="volo-cselect-item"
-                  onClick={() => {
-                    setActivePop("");
-                    wrapSelection("$", "$", "E = mc^2");
-                  }}
-                >
-                  <span class="volo-cselect-item-text">{t("ed.math_inline")}</span>
-                </button>
-                <button
-                  type="button"
-                  class="volo-cselect-item"
-                  onClick={() => {
-                    setActivePop("");
-                    insertSnippet("\n$$\n\\int_0^\\infty e^{-x^2}\\,dx = \\frac{\\sqrt{\\pi}}{2}\n$$\n");
-                  }}
-                >
-                  <span class="volo-cselect-item-text">{t("ed.math_block")}</span>
-                </button>
-                <button
-                  type="button"
-                  class="volo-cselect-item"
-                  onClick={() => {
-                    setActivePop("");
-                    insertSnippet("\n```mermaid\nflowchart LR\n  A[Start] --> B[Done]\n```\n");
-                  }}
-                >
-                  <span class="volo-cselect-item-text">{t("ed.mermaid_diagram")}</span>
-                </button>
-                <button
-                  type="button"
-                  class="volo-cselect-item"
-                  onClick={() => {
-                    setActivePop("");
-                    insertSnippet("\n[toc]\n");
-                  }}
-                >
-                  <span class="volo-cselect-item-text">{t("ed.insert_toc")}</span>
-                </button>
-              </>
-            )}
+              ))}
 
             {activePop === "codeblock" &&
               CODE_BLOCK_LANGS.map((item) => (
@@ -10354,41 +9381,6 @@ ${rendered}
                   <span class="volo-cselect-item-text">{item.value ? item.label : t("ed.code_plain")}</span>
                 </button>
               ))}
-
-            {activePop === "export" && (
-              <>
-                <button
-                  type="button"
-                  class="volo-cselect-item"
-                  onClick={() => {
-                    setActivePop("");
-                    void exportEditorDocument("md");
-                  }}
-                >
-                  <span class="volo-cselect-item-text">{t("ed.export_md")}</span>
-                </button>
-                <button
-                  type="button"
-                  class="volo-cselect-item"
-                  onClick={() => {
-                    setActivePop("");
-                    void exportEditorDocument("html");
-                  }}
-                >
-                  <span class="volo-cselect-item-text">{t("ed.export_html")}</span>
-                </button>
-                <button
-                  type="button"
-                  class="volo-cselect-item"
-                  onClick={() => {
-                    setActivePop("");
-                    void exportEditorDocument("rich_copy");
-                  }}
-                >
-                  <span class="volo-cselect-item-text">{t("ed.copy_rich_html")}</span>
-                </button>
-              </>
-            )}
           </div>,
           document.body
         )}
@@ -10609,40 +9601,43 @@ ${rendered}
             aria-label={t("ed.table")}
             onMouseDown={(e) => e.preventDefault()}
           >
-            <button type="button" class="volo-ed-find-btn" onClick={() => mutateWysiwygTable("row_above")}>
-              +Row ↑
-            </button>
-            <button type="button" class="volo-ed-find-btn" onClick={() => mutateWysiwygTable("row_below")}>
-              +Row ↓
-            </button>
-            <button type="button" class="volo-ed-find-btn" onClick={() => mutateWysiwygTable("del_row")}>
-              -Row
-            </button>
-            <span class="volo-ed-sep" />
-            <button type="button" class="volo-ed-find-btn" onClick={() => mutateWysiwygTable("col_left")}>
-              +Col ←
-            </button>
-            <button type="button" class="volo-ed-find-btn" onClick={() => mutateWysiwygTable("col_right")}>
-              +Col →
-            </button>
-            <button type="button" class="volo-ed-find-btn" onClick={() => mutateWysiwygTable("del_col")}>
-              -Col
-            </button>
-            <span class="volo-ed-sep" />
-            <button type="button" class="volo-ed-find-btn" onClick={() => mutateWysiwygTable("del_table")}>
-              × {t("ed.table")}
-            </button>
+            {(
+              [
+                ["row_above", "+Row ↑"],
+                ["row_below", "+Row ↓"],
+                ["del_row", "-Row"],
+                null,
+                ["col_left", "+Col ←"],
+                ["col_right", "+Col →"],
+                ["del_col", "-Col"],
+                null,
+                ["del_table", `× ${t("ed.table")}`],
+              ] as const
+            ).map((it, idx) =>
+              it ? (
+                <button key={it[0]} type="button" class="volo-ed-find-btn" onClick={() => mutateWysiwygTable(it[0])}>
+                  {it[1]}
+                </button>
+              ) : (
+                <span key={`s${idx}`} class="volo-ed-sep" />
+              )
+            )}
           </div>
         )}
         {mode === "wysiwyg" && (
           <div
             ref={wysiwygRef}
             class="volo-wysiwyg-surface"
-            contentEditable
+            contentEditable={!wysiwygHydrating}
+            aria-busy={wysiwygHydrating || undefined}
             onDragOver={(e) => {
               e.preventDefault();
             }}
             onDrop={(e) => {
+              if (wysiwygHydratingRef.current) {
+                e.preventDefault();
+                return;
+              }
               const files = e.dataTransfer?.files;
               if (!files || files.length === 0) return;
               e.preventDefault();
@@ -10667,12 +9662,7 @@ ${rendered}
                 }
                 lastWysiwygRangeRef.current = dropRange.cloneRange();
               }
-              const list = Array.from(files);
-              void (async () => {
-                for (const f of list) {
-                  await uploadMediaFile(f);
-                }
-              })();
+              void uploadMediaFiles(Array.from(files), true);
             }}
             onMouseDown={(e) => {
               const root = e.currentTarget as HTMLElement;
@@ -10763,8 +9753,35 @@ ${rendered}
                 removeWysiwygAudioBlock(root, selectedBlock);
               }
             }}
+            onBeforeInput={(e) => {
+              if (wysiwygHydratingRef.current) {
+                e.preventDefault();
+                return;
+              }
+              const ie = e as unknown as InputEvent;
+              if (ie.inputType === "historyUndo") {
+                e.preventDefault();
+                applyWysiwygHistoryStep(-1);
+              } else if (ie.inputType === "historyRedo") {
+                e.preventDefault();
+                applyWysiwygHistoryStep(1);
+              }
+            }}
             onKeyDown={(e) => {
               if (e.isComposing || (e as any).keyCode === 229 || wysiwygComposingRef.current) return;
+              if ((e.metaKey || e.ctrlKey) && !e.altKey) {
+                const k = e.key.toLowerCase();
+                if (k === "z" && !e.shiftKey) {
+                  e.preventDefault();
+                  applyWysiwygHistoryStep(-1);
+                  return;
+                }
+                if ((k === "z" && e.shiftKey) || (k === "y" && !e.shiftKey && !e.metaKey)) {
+                  e.preventDefault();
+                  applyWysiwygHistoryStep(1);
+                  return;
+                }
+              }
               if ((e.metaKey || e.ctrlKey) && !e.altKey && !e.shiftKey && (e.key === "f" || e.key === "F" || e.key === "h" || e.key === "H")) {
                 e.preventDefault();
                 openFindBar(e.key.toLowerCase() === "h");
@@ -10883,24 +9900,12 @@ ${rendered}
               }
             }}
             onPaste={(e) => {
+              if (wysiwygHydratingRef.current) {
+                e.preventDefault();
+                return;
+              }
               const root = e.currentTarget as HTMLElement;
               saveWysiwygSelection(root);
-              const dt = e.clipboardData;
-              if (!dt) return;
-              const types = Array.from(dt.types || []);
-              const rawPlain = dt.getData("text/plain") || "";
-              const rawHTML = dt.getData("text/html") || "";
-              const mediaFiles = extractClipboardMediaFiles(dt);
-              if (shouldHandlePasteAsBinaryMedia(dt, mediaFiles, rawPlain, rawHTML)) {
-                e.preventDefault();
-                for (const f of mediaFiles) {
-                  void uploadMediaFile(f);
-                }
-                return;
-              }
-              if (types.includes("vscode-editor-data") || types.includes("application/x-jetbrains-editor")) {
-                return;
-              }
               const sel = window.getSelection();
               const anchorEl =
                 sel && sel.rangeCount > 0
@@ -10908,52 +9913,37 @@ ${rendered}
                     ? (sel.getRangeAt(0).startContainer as Element)
                     : sel.getRangeAt(0).startContainer.parentElement
                   : null;
-              if (anchorEl?.closest("pre")) {
-                return;
-              }
-              if (
-                !rawHTML.trim() &&
-                /^https?:\/\/\S+$/i.test(rawPlain.trim()) &&
-                sel &&
-                !sel.isCollapsed &&
-                !anchorEl?.closest("a, code")
-              ) {
-                const selStr = sel.toString().trim();
-                if (selStr && !selStr.includes("\n")) {
-                  e.preventDefault();
-                  const cleanHref = cleanClipboardUrl(rawPlain.trim()) || rawPlain.trim();
-                  document.execCommand("createLink", false, cleanHref);
-                  saveWysiwygSelection(root);
-                  scheduleWysiwygEmit(root, false);
-                  return;
-                }
-              }
-              if (rawHTML) {
-                const converted = clipboardHtmlToMarkdown(rawHTML);
-                if (converted && converted.markdown) {
-                  e.preventDefault();
-                  spliceMarkdownAtWysiwygCaret(root, converted.markdown);
-                  if (converted.pendingUploads.length > 0) {
-                    void uploadPendingPasteImages(converted.pendingUploads);
+              handleRichPaste(
+                e as unknown as ClipboardEvent,
+                () => Boolean(anchorEl?.closest("pre")),
+                (md) => spliceMarkdownAtWysiwygCaret(root, md),
+                (rawPlain, rawHTML) => {
+                  const trimmedPlain = rawPlain.trim();
+                  const cleanHref =
+                    !rawHTML.trim() && trimmedPlain && !/\s/.test(trimmedPlain)
+                      ? safeHref(cleanClipboardUrl(trimmedPlain, "href"), {
+                          allowRelative: false,
+                          allowHash: false,
+                          allowMailto: false,
+                        })
+                      : "";
+                  if (cleanHref && sel && !sel.isCollapsed && !anchorEl?.closest("a, code")) {
+                    const selStr = sel.toString().trim();
+                    if (selStr && !selStr.includes("\n")) {
+                      e.preventDefault();
+                      document.execCommand("createLink", false, cleanHref);
+                      saveWysiwygSelection(root);
+                      pushWysiwygHistory(root, true);
+                      scheduleWysiwygEmit(root, false);
+                      return true;
+                    }
                   }
-                  return;
+                  return false;
                 }
-              }
-              const tableMd = tsvToMarkdownTable(rawPlain);
-              if (tableMd) {
-                e.preventDefault();
-                spliceMarkdownAtWysiwygCaret(root, tableMd);
-                return;
-              }
-              if (mediaFiles.length > 0 && !rawPlain.trim()) {
-                e.preventDefault();
-                for (const f of mediaFiles) {
-                  void uploadMediaFile(f);
-                }
-              }
+              );
             }}
             onInput={(e) => {
-              if ((e as unknown as InputEvent).isComposing || wysiwygComposingRef.current) return;
+              if (wysiwygHydratingRef.current || (e as unknown as InputEvent).isComposing || wysiwygComposingRef.current) return;
               const root = e.currentTarget as HTMLElement;
               saveWysiwygSelection(root);
               scheduleWysiwygEmit(root, true);
@@ -10978,6 +9968,29 @@ ${rendered}
             <div
               ref={previewRef}
               class="volo-preview-pane"
+              onCopy={(e) => {
+                const sel = window.getSelection();
+                const dt = e.clipboardData;
+                if (!sel || sel.rangeCount === 0 || sel.isCollapsed || !dt) return;
+                const range = sel.getRangeAt(0);
+                const host = e.currentTarget as HTMLElement;
+                const startEl = range.startContainer instanceof Element ? range.startContainer : range.startContainer.parentElement;
+                const endEl = range.endContainer instanceof Element ? range.endContainer : range.endContainer.parentElement;
+                const hasCode =
+                  startEl?.closest("pre, .chroma, code") ||
+                  endEl?.closest("pre, .chroma, code") ||
+                  host.querySelector(".ln, .lnt") !== null;
+                if (!hasCode) return;
+                const frag = range.cloneContents();
+                if (!frag.querySelector(".ln, .lnt, .volo-code-head, button")) return;
+                frag.querySelectorAll(".ln, .lnt, .volo-code-head, button, select").forEach((n) => n.remove());
+                const tmp = document.createElement("div");
+                tmp.appendChild(frag);
+                const plain = nodeNbspText(tmp);
+                e.preventDefault();
+                dt.setData("text/plain", plain);
+                dt.setData("text/html", tmp.innerHTML);
+              }}
               dangerouslySetInnerHTML={{ __html: previewHTML }}
             />
           ) : (
@@ -11024,20 +10037,7 @@ ${rendered}
         open={mediaModalOpen}
         onClose={() => setMediaModalOpen(false)}
         filterKind="all"
-        onSelect={(asset) => {
-          const name = asset.original_name || asset.id;
-          const mime = asset.mime_type || "";
-          const isImg = mime.startsWith("image/");
-          if (isImg) {
-            insertSnippet(`![${name}](${asset.public_url})`);
-          } else if (isVideoMedia(mime, asset.public_url)) {
-            insertSnippet(`\n<video controls preload="metadata" src="${asset.public_url}"></video>\n`);
-          } else if (isAudioMedia(mime, asset.public_url)) {
-            insertSnippet(`\n<audio controls preload="metadata" src="${asset.public_url}"></audio>\n`);
-          } else {
-            insertSnippet(`[${name}](${asset.public_url})`);
-          }
-        }}
+        onSelect={insertMediaAssetSnippet}
       />
 
       {/* Quick Insert 4-Tab AnimatedModal */}
@@ -11056,16 +10056,10 @@ ${rendered}
                 type="button"
                 class="volo-btn volo-btn-primary"
                 onClick={() => {
-                  const fmtAttr = (k: string, raw: unknown) => {
-                    const v = String(raw ?? "").replace(/[\r\n]+/g, " ").trim();
-                    if (!v.includes('"')) return `${k}="${v}"`;
-                    if (!v.includes("'")) return `${k}='${v}'`;
-                    return `${k}="${v.replace(/"/g, "'")}"`;
-                  };
                   const attr =
                     lockMode === "user"
-                      ? `type="user"${lockHint.trim() ? ` ${fmtAttr("hint", lockHint)}` : ""}`
-                      : `${fmtAttr("pwd", lockPwd || "123456")}${lockHint.trim() ? ` ${fmtAttr("hint", lockHint)}` : ""}`;
+                      ? `type="user"${lockHint.trim() ? ` ${formatDirectiveAttr("hint", lockHint)}` : ""}`
+                      : `${formatDirectiveAttr("pwd", lockPwd || "123456")}${lockHint.trim() ? ` ${formatDirectiveAttr("hint", lockHint)}` : ""}`;
                   insertSnippet(`\n:::lock ${attr}\n${lockBody || "..."}\n:::\n`);
                   setQiOpen(false);
                 }}
@@ -11136,28 +10130,21 @@ ${rendered}
                   const mime = String(m.mime_type || "");
                   const isImg = mime.startsWith("image/");
                   const isVid = !isImg && isVideoMedia(mime, m.public_url);
+                  const safeMedia = safeMediaSrc(m.public_url, { allowDataImage: isImg });
                   return (
                     <button
                       key={m.id}
                       type="button"
                       class="volo-qi-media-card"
                       onClick={() => {
-                        if (isImg) {
-                          insertSnippet(`![${name}](${m.public_url})`);
-                        } else if (isVid) {
-                          insertSnippet(`\n<video controls preload="metadata" src="${m.public_url}"></video>\n`);
-                        } else if (isAudioMedia(mime, m.public_url)) {
-                          insertSnippet(`\n<audio controls preload="metadata" src="${m.public_url}"></audio>\n`);
-                        } else {
-                          insertSnippet(`[${name}](${m.public_url})`);
-                        }
+                        insertMediaAssetSnippet(m);
                         setQiOpen(false);
                       }}
                     >
-                      {isImg ? (
-                        <img src={m.public_url} alt={name} loading="lazy" />
-                      ) : isVid ? (
-                        <video src={m.public_url} preload="metadata" muted playsInline />
+                      {isImg && safeMedia ? (
+                        <img src={safeMedia} alt={name} loading="lazy" />
+                      ) : isVid && safeMedia ? (
+                        <video src={safeMedia} preload="metadata" muted playsInline />
                       ) : (
                         <div class="volo-qi-file-badge">{m.mime_type || "FILE"}</div>
                       )}
@@ -11176,105 +10163,166 @@ ${rendered}
           </div>
         )}
 
-        {qiTab === "books" && (
-          <div>
-            <div style={{ marginBottom: "10px", display: "flex", gap: "8px", alignItems: "center", flexWrap: "wrap" }}>
-              <input
-                class="volo-input"
-                style={{ flex: "1 1 200px", minWidth: "150px", height: "34px" }}
-                placeholder={t("ed.qi_search_books")}
-                value={qiBookSearch}
-                onInput={(e) => {
-                  setQiBookSearch((e.currentTarget as HTMLInputElement).value);
-                  setQiBooksPage(1);
-                }}
-              />
-              <button
-                type="button"
-                class="volo-btn volo-btn-sm volo-btn-primary"
-                style={{ flexShrink: 0 }}
-                onClick={() => {
-                  insertSnippet("\n:::bookshelf\n:::\n");
-                  setQiOpen(false);
-                }}
-              >
-                <PlusIcon size={13} /> {t("ed.bookshelf")}
-              </button>
-            </div>
-            {(() => {
-              const q = qiBookSearch.trim().toLowerCase();
-              const filtered =
-                qiBooks.length > 10 && q
-                  ? qiBooks.filter(
-                      (b) =>
-                        String(b.title || "").toLowerCase().includes(q) ||
-                        String(b.author || "").toLowerCase().includes(q) ||
-                        String(b.slug || "").toLowerCase().includes(q)
-                    )
-                  : qiBooks;
-              const rows = filtered.length > 10 ? paginateItems(filtered, qiBooksPage, 10).slice : filtered;
-              if (rows.length === 0) {
-                return <ConsoleEmpty text={t("tbl.empty")} />;
-              }
-              return (
-                <div style={{ display: "flex", flexDirection: "column", gap: "8px", maxHeight: "260px", overflowY: "auto" }}>
-                  {rows.map((b) => (
-                    <div
-                      key={b.id}
-                      class="volo-subcard"
-                      style={{
-                        padding: "10px 12px",
-                        margin: 0,
-                        display: "flex",
-                        justifyContent: "space-between",
-                        alignItems: "center",
-                        gap: "10px",
+        {(() => {
+          const renderQiPickList = <T extends { id: string }>(
+            items: T[],
+            search: string,
+            page: number,
+            pageSize: number,
+            maxH: string,
+            gap: string,
+            pad: string,
+            matchFn: (it: T, q: string) => boolean,
+            renderBody: (it: T) => preact.ComponentChildren,
+            onPick: (it: T) => void
+          ) => {
+            const q = search.trim().toLowerCase();
+            const filtered = items.length > pageSize && q ? items.filter((it) => matchFn(it, q)) : items;
+            const rows = filtered.length > pageSize ? paginateItems(filtered, page, pageSize).slice : filtered;
+            if (rows.length === 0) return <ConsoleEmpty text={t("tbl.empty")} />;
+            return (
+              <div style={{ display: "flex", flexDirection: "column", gap, maxHeight: maxH, overflowY: "auto" }}>
+                {rows.map((it) => (
+                  <div
+                    key={it.id}
+                    class="volo-subcard"
+                    style={{
+                      padding: pad,
+                      margin: 0,
+                      display: "flex",
+                      justifyContent: "space-between",
+                      alignItems: "center",
+                      gap: "10px",
+                    }}
+                  >
+                    <div style={{ minWidth: 0, flex: 1 }}>{renderBody(it)}</div>
+                    <button
+                      type="button"
+                      class="volo-btn volo-btn-sm"
+                      style={{ flexShrink: 0 }}
+                      onClick={() => {
+                        onPick(it);
+                        setQiOpen(false);
                       }}
                     >
-                      <div style={{ minWidth: 0, flex: 1 }}>
-                        <div style={{ fontWeight: 650, fontSize: "13px", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                          {b.title}
+                      {t("ed.qi_insert_btn")}
+                    </button>
+                  </div>
+                ))}
+              </div>
+            );
+          };
+
+          if (qiTab === "books") {
+            return (
+              <div>
+                <div style={{ marginBottom: "10px", display: "flex", gap: "8px", alignItems: "center", flexWrap: "wrap" }}>
+                  <input
+                    class="volo-input"
+                    style={{ flex: "1 1 200px", minWidth: "150px", height: "34px" }}
+                    placeholder={t("ed.qi_search_books")}
+                    value={qiBookSearch}
+                    onInput={(e) => {
+                      setQiBookSearch(e.currentTarget.value);
+                      setQiBooksPage(1);
+                    }}
+                  />
+                  <button
+                    type="button"
+                    class="volo-btn volo-btn-sm volo-btn-primary"
+                    style={{ flexShrink: 0 }}
+                    onClick={() => {
+                      insertSnippet("\n:::bookshelf\n:::\n");
+                      setQiOpen(false);
+                    }}
+                  >
+                    <PlusIcon size={13} /> {t("ed.bookshelf")}
+                  </button>
+                </div>
+                {renderQiPickList(
+                  qiBooks,
+                  qiBookSearch,
+                  qiBooksPage,
+                  10,
+                  "260px",
+                  "8px",
+                  "10px 12px",
+                  (b, q) =>
+                    String(b.title || "").toLowerCase().includes(q) ||
+                    String(b.author || "").toLowerCase().includes(q) ||
+                    String(b.slug || "").toLowerCase().includes(q),
+                  (b) => (
+                    <>
+                      <div style={{ fontWeight: 650, fontSize: "13px", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                        {b.title}
+                      </div>
+                      <div class="volo-help" style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                        {b.description || `/books/${b.slug}`}
+                      </div>
+                    </>
+                  ),
+                  (b) =>
+                    insertSnippet(
+                      b.slug
+                        ? `\n:::book ${formatDirectiveAttr("slug", b.slug)}\n:::\n`
+                        : `\n:::book ${formatDirectiveAttr("title", b.title)} ${formatDirectiveAttr("status", b.reading_status || "reading")}\n:::\n`
+                    )
+                )}
+                <PaginationBar total={qiBooksTotal} page={qiBooksPage} pageSize={10} onChange={(p) => setQiBooksPage(p)} />
+              </div>
+            );
+          }
+          if (qiTab === "cite") {
+            return (
+              <div>
+                <div class="volo-field" style={{ marginBottom: "10px" }}>
+                  <label>{t("ed.qi_cite")}</label>
+                  <input
+                    class="volo-input"
+                    placeholder={t("ed.qi_search_art")}
+                    value={qiArtSearch}
+                    onInput={(e) => {
+                      setQiArtSearch(e.currentTarget.value);
+                      setQiArtPage(1);
+                    }}
+                  />
+                </div>
+                {renderQiPickList(
+                  qiArticles,
+                  qiArtSearch,
+                  qiArtPage,
+                  20,
+                  "240px",
+                  "6px",
+                  "8px 12px",
+                  (a, q) => String(a.title || "").toLowerCase().includes(q) || String(a.slug || "").toLowerCase().includes(q),
+                  (a) => {
+                    const st = String(a.status || "published");
+                    const stClass = st === "published" ? "published" : st === "scheduled" ? "scheduled" : "draft";
+                    return (
+                      <>
+                        <div style={{ display: "flex", alignItems: "center", gap: "6px", minWidth: 0 }}>
+                          <span style={{ fontSize: "13px", fontWeight: 550, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                            {a.title || a.slug}
+                          </span>
+                          <span class={`volo-status-pill ${stClass}`} style={{ flexShrink: 0 }}>
+                            {t(`art.${st}`)}
+                          </span>
                         </div>
                         <div class="volo-help" style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                          {b.description || `/books/${b.slug}`}
+                          /posts/{a.slug}
                         </div>
-                      </div>
-                      <button
-                        type="button"
-                        class="volo-btn volo-btn-sm"
-                        style={{ flexShrink: 0 }}
-                        onClick={() => {
-                          const fmtAttr = (k: string, raw: unknown) => {
-                            const v = String(raw ?? "").replace(/[\r\n]+/g, " ").trim();
-                            if (!v.includes('"')) return `${k}="${v}"`;
-                            if (!v.includes("'")) return `${k}='${v}'`;
-                            return `${k}="${v.replace(/"/g, "'")}"`;
-                          };
-                          if (b.slug) {
-                            insertSnippet(`\n:::book ${fmtAttr("slug", b.slug)}\n:::\n`);
-                          } else {
-                            insertSnippet(
-                              `\n:::book ${fmtAttr("title", b.title)} ${fmtAttr("status", b.reading_status || "reading")}\n:::\n`
-                            );
-                          }
-                          setQiOpen(false);
-                        }}
-                      >
-                        {t("ed.qi_insert_btn")}
-                      </button>
-                    </div>
-                  ))}
-                </div>
-              );
-            })()}
-            <PaginationBar
-              total={qiBooksTotal}
-              page={qiBooksPage}
-              pageSize={10}
-              onChange={(p) => setQiBooksPage(p)}
-            />
-          </div>
-        )}
+                      </>
+                    );
+                  },
+                  (a) => insertSnippet(`[${a.title || a.slug}](/posts/${a.slug})`)
+                )}
+                <PaginationBar total={qiArtTotal} page={qiArtPage} pageSize={20} onChange={(p) => setQiArtPage(p)} />
+              </div>
+            );
+          }
+          return null;
+        })()}
 
         {qiTab === "lock" && (
           <form autoComplete="off" onSubmit={(e) => e.preventDefault()}>
@@ -11333,91 +10381,6 @@ ${rendered}
             </div>
           </form>
         )}
-
-        {qiTab === "cite" && (
-          <div>
-            <div class="volo-field" style={{ marginBottom: "10px" }}>
-              <label>{t("ed.qi_cite")}</label>
-              <input
-                class="volo-input"
-                placeholder={t("ed.qi_search_art")}
-                value={qiArtSearch}
-                onInput={(e) => {
-                  setQiArtSearch((e.currentTarget as HTMLInputElement).value);
-                  setQiArtPage(1);
-                }}
-              />
-            </div>
-            {(() => {
-              const q = qiArtSearch.trim().toLowerCase();
-              const filtered =
-                qiArticles.length > 20 && q
-                  ? qiArticles.filter(
-                      (a) =>
-                        String(a.title || "").toLowerCase().includes(q) ||
-                        String(a.slug || "").toLowerCase().includes(q)
-                    )
-                  : qiArticles;
-              const rows = filtered.length > 20 ? paginateItems(filtered, qiArtPage, 20).slice : filtered;
-              if (rows.length === 0) {
-                return <ConsoleEmpty text={t("tbl.empty")} />;
-              }
-              return (
-                <div style={{ display: "flex", flexDirection: "column", gap: "6px", maxHeight: "240px", overflowY: "auto" }}>
-                  {rows.map((a) => {
-                    const st = String(a.status || "published");
-                    const stClass = st === "published" ? "published" : st === "scheduled" ? "scheduled" : "draft";
-                    return (
-                      <div
-                        key={a.id}
-                        class="volo-subcard"
-                        style={{
-                          padding: "8px 12px",
-                          margin: 0,
-                          display: "flex",
-                          justifyContent: "space-between",
-                          alignItems: "center",
-                          gap: "10px",
-                        }}
-                      >
-                        <div style={{ minWidth: 0, flex: 1 }}>
-                          <div style={{ display: "flex", alignItems: "center", gap: "6px", minWidth: 0 }}>
-                            <span style={{ fontSize: "13px", fontWeight: 550, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                              {a.title || a.slug}
-                            </span>
-                            <span class={`volo-status-pill ${stClass}`} style={{ flexShrink: 0 }}>
-                              {t(`art.${st}`)}
-                            </span>
-                          </div>
-                          <div class="volo-help" style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                            /posts/{a.slug}
-                          </div>
-                        </div>
-                        <button
-                          type="button"
-                          class="volo-btn volo-btn-sm"
-                          style={{ flexShrink: 0 }}
-                          onClick={() => {
-                            insertSnippet(`[${a.title || a.slug}](/posts/${a.slug})`);
-                            setQiOpen(false);
-                          }}
-                        >
-                          {t("ed.qi_insert_btn")}
-                        </button>
-                      </div>
-                    );
-                  })}
-                </div>
-              );
-            })()}
-            <PaginationBar
-              total={qiArtTotal}
-              page={qiArtPage}
-              pageSize={20}
-              onChange={(p) => setQiArtPage(p)}
-            />
-          </div>
-        )}
       </AnimatedModal>
     </div>
   );
@@ -11450,48 +10413,40 @@ function buildCssSyntaxPlugin() {
         if (absS < absE) toks.push({ s: absS, e: absE, cls });
       };
 
-      let m: RegExpExecArray | null;
-      const cmtRe = /\/\*[\s\S]*?\*\//g;
-      while ((m = cmtRe.exec(slice)) !== null) claim(m.index, m.index + m[0].length, "cm");
-
-      const strRe = /"(?:\\.|[^"\\\n])*"|'(?:\\.|[^'\\\n])*'/g;
-      while ((m = strRe.exec(slice)) !== null) claim(m.index, m.index + m[0].length, "s2");
-
-      const atRe = /@[a-zA-Z-]+/g;
-      while ((m = atRe.exec(slice)) !== null) claim(m.index, m.index + m[0].length, "k");
-
-      const impRe = /!important\b/gi;
-      while ((m = impRe.exec(slice)) !== null) claim(m.index, m.index + m[0].length, "kc");
-
-      const varRe = /--[a-zA-Z0-9_-]+/g;
-      while ((m = varRe.exec(slice)) !== null) claim(m.index, m.index + m[0].length, "nv");
-
-      const psRe = /(::?[a-zA-Z-][a-zA-Z0-9_-]*)(?=(?:[^;{}()]|\([^()]*\))*\{)/g;
-      while ((m = psRe.exec(slice)) !== null) claim(m.index, m.index + m[1].length, "nd");
-
-      // Distinguish .class and #id selectors outside `{...}` from #rgb/#rrggbb/#rrggbbaa hex colors inside declarations
-      const clsIdSelRe = /[.#][A-Za-z_-][A-Za-z0-9_-]*(?=(?:[^;{}()]|\([^()]*\))*\{)/g;
-      while ((m = clsIdSelRe.exec(slice)) !== null) claim(m.index, m.index + m[0].length, "nc");
-
-      // Property names only inside `{ prop: val; }` or `@media (prop: val)` — never tag names before `:hover` / `::before`
-      const propRe = /(?:^|[;{\s(])([a-zA-Z-]+)(?=\s*:(?!:)(?:[^;{}()]|\([^()]*\))*?(?:;|\}|\)))/g;
-      while ((m = propRe.exec(slice)) !== null) {
-        const s = m.index + m[0].length - m[1].length;
-        claim(s, s + m[1].length, "na");
+      const cssCtx = computeCssContext(slice);
+      let cPos = 0;
+      while (cPos < slice.length) {
+        const cs = slice.indexOf("/*", cPos);
+        if (cs < 0) break;
+        const ce = slice.indexOf("*/", cs + 2);
+        const end = ce < 0 ? slice.length : ce + 2;
+        claim(cs, end, "cm");
+        cPos = end;
       }
-
-      const fnRe = /\b([a-zA-Z_-][\w-]*)(?=\()/g;
-      while ((m = fnRe.exec(slice)) !== null) claim(m.index, m.index + m[1].length, "nf");
-
-      const hexRe = /#[0-9a-fA-F]{3,8}\b(?=(?:[^;{}()]|\([^()]*\))*?(?:;|\}|\)))/g;
-      while ((m = hexRe.exec(slice)) !== null) claim(m.index, m.index + m[0].length, "mi");
-
-      const numRe = /-?\b\d+(?:\.\d+)?(?:px|rem|em|vh|vw|dvw|svw|dvh|svh|%|s|ms|deg|fr|ch)?\b/g;
-      while ((m = numRe.exec(slice)) !== null) claim(m.index, m.index + m[0].length, "mi");
-
-      const valKwRe =
-        /\b(?:none|auto|inherit|initial|unset|solid|dashed|dotted|flex|grid|block|inline|inline-flex|inline-block|relative|absolute|fixed|sticky|hidden|clip|visible|pointer|center|left|right|top|bottom|space-between|transparent|currentColor|border-box|ease|linear|infinite|both|row|column|wrap|nowrap|bold|normal|italic)\b/g;
-      while ((m = valKwRe.exec(slice)) !== null) claim(m.index, m.index + m[0].length, "kc");
+      let m: RegExpExecArray | null;
+      const scanCss = (re: RegExp, cls: string, grp = 0, ctxFilter = 0) => {
+        re.lastIndex = 0;
+        while ((m = re.exec(slice)) !== null) {
+          if (!ctxFilter || cssCtx[m.index] === ctxFilter) claim(m.index, m.index + m[grp].length, cls);
+        }
+      };
+      for (const [s, e] of findCssStringRanges(slice, used)) {
+        claim(s, e, "s2");
+      }
+      scanCss(CSS_AT_RE, "k");
+      scanCss(CSS_IMP_RE, "kc");
+      scanCss(/--[a-zA-Z0-9_-]+/g, "nv");
+      scanCss(/(::?[a-zA-Z-][a-zA-Z0-9_-]*)/g, "nd", 0, 1);
+      scanCss(/[.#][A-Za-z_-][A-Za-z0-9_-]*/g, "nc", 0, 1);
+      const propRe = /(?:^|[;{\s(])([a-zA-Z-]+)\s*:(?!:)/g;
+      while ((m = propRe.exec(slice)) !== null) {
+        const s = m.index + (m[0][0] === m[1][0] ? 0 : 1);
+        if (cssCtx[s] === 2) claim(s, s + m[1].length, "na");
+      }
+      scanCss(CSS_FN_RE, "nf", 1);
+      scanCss(/#[0-9a-fA-F]{3,8}\b/g, "mi", 0, 2);
+      scanCss(/-?\b\d+(?:\.\d+)?(?:px|rem|em|vh|vw|dvw|svw|dvh|svh|%|s|ms|deg|fr|ch)?\b/g, "mi");
+      scanCss(CSS_VAL_KW_RE, "kc");
 
       toks.sort((a, b) => a.s - b.s || a.e - b.e);
       for (const tk of toks) {
@@ -11537,26 +10492,13 @@ export function CM6CssEditorCore({ value, onChange, placeholder: phText, onSave 
   onChangeRef.current = onChange;
   const onSaveRef = useRef(onSave);
   onSaveRef.current = onSave;
+  const propSyncRef = useRef(createPropSyncTracker());
 
   useEffect(() => {
     if (!hostRef.current) return;
-    const imeHandlers = EditorView.domEventHandlers({
-      compositionstart() {
-        composingRef.current = true;
-        return false;
-      },
-      compositionend(_event, view) {
-        composingRef.current = false;
-        queueMicrotask(() => {
-          if (view.composing || composingRef.current) return;
-          const docStr = view.state.doc.toString();
-          if (docStr !== (valueRef.current || "")) {
-            onChangeRef.current(docStr);
-          }
-        });
-        return false;
-      },
-    });
+    const imeHandlers = EditorView.domEventHandlers(
+      buildCMImeHandlers(composingRef, valueRef, onChangeRef, propSyncRef.current)
+    );
     const state = EditorState.create({
       doc: value || "",
       extensions: [
@@ -11579,18 +10521,7 @@ export function CM6CssEditorCore({ value, onChange, placeholder: phText, onSave 
                 if (st.readOnly || st.selection.ranges.length !== 1 || !st.selection.main.empty) return false;
                 const pos = st.selection.main.head;
                 const ln = st.doc.lineAt(pos);
-                if (pos <= ln.from || pos >= ln.to) return false;
-                const prevCh = st.sliceDoc(pos - 1, pos);
-                const nextCh = st.sliceDoc(pos, pos + 1);
-                if (CODE_AUTO_PAIRS[prevCh] === nextCh) {
-                  v.dispatch({
-                    changes: { from: pos - 1, to: pos + 1, insert: "" },
-                    selection: { anchor: pos - 1 },
-                    userEvent: "delete.backward",
-                  });
-                  return true;
-                }
-                return false;
+                return pos > ln.from ? deleteAutoPair(v, pos, ln.to) : false;
               },
             },
             {
@@ -11613,8 +10544,10 @@ export function CM6CssEditorCore({ value, onChange, placeholder: phText, onSave 
         ]),
         imeHandlers,
         EditorView.updateListener.of((u) => {
-          if (u.docChanged && !u.view.composing && !composingRef.current) {
-            onChangeRef.current(u.state.doc.toString());
+          if (u.docChanged && !isPropSyncUpdate(u) && !u.view.composing && !composingRef.current) {
+            const docStr = u.state.doc.toString();
+            recordEditorEmit(propSyncRef.current, docStr);
+            onChangeRef.current(docStr);
           }
         }),
       ],
@@ -11628,20 +10561,7 @@ export function CM6CssEditorCore({ value, onChange, placeholder: phText, onSave 
   }, []);
 
   useEffect(() => {
-    const view = viewRef.current;
-    if (!view) return;
-    if (view.composing || composingRef.current) return;
-    const nextVal = value || "";
-    const cur = view.state.doc.toString();
-    if (cur !== nextVal) {
-      const sel = view.state.selection.main;
-      const anchor = Math.min(sel.anchor, nextVal.length);
-      const head = Math.min(sel.head, nextVal.length);
-      view.dispatch({
-        changes: { from: 0, to: cur.length, insert: nextVal },
-        selection: { anchor, head },
-      });
-    }
+    syncCMViewValue(viewRef.current, composingRef.current, propSyncRef.current, value || "");
   }, [value]);
 
   useEffect(() => {
